@@ -619,8 +619,8 @@ __global__ static void q4e_matvec_q8_0_narrow_kernel(
     if (threadIdx.x == 0u) out[blockIdx.x] = acc;
 }
 
-/* Q8_0 matmul for a handful of activation rows -- the speculative verify
- * batch, 1 + K tokens.  The single-token kernels above and in ds4_cuda.cu read
+/* Q8_0 matmul for a handful of activation rows (2..16) -- the speculative
+ * verify batch, 1 + K tokens.  The single-token kernels above and in ds4_cuda.cu read
  * a weight once per row they serve; the generic multi-row dispatch falls off
  * that path and was 60% of a verify step.  Both kernels below load each
  * weight block once and dot it with every row's quantized activation, so the
@@ -707,7 +707,7 @@ extern "C" int ds4_gpu_q4e_matmul_q8_0_rows(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_tok) {
-    if (!out || !x || !model_map || n_tok < 2u || n_tok > 8u) return 0;
+    if (!out || !x || !model_map || n_tok < 2u || n_tok > 16u) return 0;
     if ((in_dim & 31u) != 0u || in_dim == 0u || out_dim == 0u || out_dim > UINT32_MAX) return 0;
     const uint64_t blocks = in_dim / 32u;
     const uint64_t weight_bytes = out_dim * blocks * 34u;
@@ -741,7 +741,15 @@ extern "C" int ds4_gpu_q4e_matmul_q8_0_rows(
     case 5u: return q4e_matmul_q8_0_rows_launch<5>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
     case 6u: return q4e_matmul_q8_0_rows_launch<6>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
     case 7u: return q4e_matmul_q8_0_rows_launch<7>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
-    default: return q4e_matmul_q8_0_rows_launch<8>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 8u: return q4e_matmul_q8_0_rows_launch<8>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 9u: return q4e_matmul_q8_0_rows_launch<9>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 10u: return q4e_matmul_q8_0_rows_launch<10>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 11u: return q4e_matmul_q8_0_rows_launch<11>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 12u: return q4e_matmul_q8_0_rows_launch<12>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 13u: return q4e_matmul_q8_0_rows_launch<13>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 14u: return q4e_matmul_q8_0_rows_launch<14>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    case 15u: return q4e_matmul_q8_0_rows_launch<15>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
+    default: return q4e_matmul_q8_0_rows_launch<16>(o, w, xq, xscale, blocks, (uint32_t)out_dim);
     }
 }
 
@@ -2220,6 +2228,7 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
     switch (weight_type) {
     case 12u: block_elems = 256u; block_bytes = 144u; break;   /* Q4_K */
     case 13u: block_elems = 256u; block_bytes = 176u; break;   /* Q5_K */
+    case 8u:  block_elems = 32u;  block_bytes = 34u;  break;   /* Q8_0: the all-Q8 MTP sidecar */
     default:
         fprintf(stderr, "ds4: qwen4exp routed gate/up type %u is not supported\n", weight_type);
         return 0;
@@ -2248,6 +2257,19 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
                                         (int)out_dim, (int)in_dim, (int)n_tok,
                                         (int)n_expert, (int)n_used,
                                         cuda_decode_stream(), /*max_rows_per_expert=*/(int)n_tok);
+        } else if (weight_type == 8u) {
+            brc = ds4_mmq_q8_0_moe(wg, (const float *)x->ptr,
+                                   (const int32_t *)ids->ptr, (float *)gate->ptr,
+                                   (int)out_dim, (int)in_dim, (int)n_tok,
+                                   (int)n_expert, (int)n_used, cuda_decode_stream(),
+                                   /*max_rows_per_expert=*/(int)n_tok);
+            if (brc == 0) {
+                brc = ds4_mmq_q8_0_moe(wu, (const float *)x->ptr,
+                                       (const int32_t *)ids->ptr, (float *)up->ptr,
+                                       (int)out_dim, (int)in_dim, (int)n_tok,
+                                       (int)n_expert, (int)n_used, cuda_decode_stream(),
+                                       /*max_rows_per_expert=*/(int)n_tok);
+            }
         } else {
             brc = ds4_mmq_q5_K_moe(wg, (const float *)x->ptr,
                                    (const int32_t *)ids->ptr, (float *)gate->ptr,
@@ -2278,6 +2300,15 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
                                            (float *)gate->ptr, (float *)up->ptr,
                                            (int)out_dim, (int)in_dim, (int)n_tok,
                                            (int)n_expert, (int)n_used, cuda_decode_stream());
+    } else if (weight_type == 8u) {
+        rc = ds4_mmq_q8_0_moe_vec(wg, (const float *)x->ptr, (const int32_t *)ids->ptr,
+                                  (float *)gate->ptr, (int)out_dim, (int)in_dim,
+                                  (int)n_tok, (int)n_expert, (int)n_used, cuda_decode_stream());
+        if (rc == 0) {
+            rc = ds4_mmq_q8_0_moe_vec(wu, (const float *)x->ptr, (const int32_t *)ids->ptr,
+                                      (float *)up->ptr, (int)out_dim, (int)in_dim,
+                                      (int)n_tok, (int)n_expert, (int)n_used, cuda_decode_stream());
+        }
     } else {
         /* Q5_K has no paired entry; one layer of the shipped mix uses it. */
         rc = ds4_mmq_q5_K_moe_vec(wg, (const float *)x->ptr, (const int32_t *)ids->ptr,

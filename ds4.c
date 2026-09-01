@@ -54695,6 +54695,7 @@ typedef struct {
     ds4_gpu_tensor *mtp_k_cache;
     ds4_gpu_tensor *mtp_v_cache;
     ds4_gpu_tensor *mtp_logits;
+    FILE           *mtp_dump_fp;     /* DS4_QWEN4EXP_MTP_DUMP record awaiting its logits */
 
     /* Target residual rows whose draft-side KV has not been written yet:
      * rows [pend_row0, pend_row0 + pend_n) of `res`, at positions pend_pos0
@@ -65509,11 +65510,14 @@ static int q4e_f32_splitk_enabled(void) {
     return cached;
 }
 
+/* Graph capture of the 1 + K verify rows and the draft flush is on by
+ * default since it stopped aborting (the dense mmq tier ran on the legacy
+ * stream at >= 9 rows); DS4_QWEN4EXP_VERIFY_GRAPHS=0 turns it off. */
 static int q4e_verify_graphs_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_QWEN4EXP_VERIFY_GRAPHS");
-        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+        cached = (env && env[0] == '0') ? 0 : 1;
     }
     return cached;
 }
@@ -65542,7 +65546,7 @@ static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor 
             const int rc = ds4_gpu_q4e_matvec_q8_0_narrow(
                     out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x);
             if (rc != 0) return rc > 0;
-        } else if (n_tok <= 8u && !q4e_rows_matmul_disabled()) {
+        } else if (n_tok <= 16u && !q4e_rows_matmul_disabled()) {
             /* The speculative verify batch: a few rows through weights that
              * are read once for all of them, instead of the generic
              * multi-row dispatch. */
@@ -65949,13 +65953,13 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     /* Graph capture is a decode-only optimization: it needs a fixed launch
      * sequence, which prefill's varying token count breaks, and the tracing
      * and profiling hooks read back device memory mid-island.  A speculative
-     * verify runs a fixed 1 + K rows and captures too when
-     * DS4_QWEN4EXP_VERIFY_GRAPHS=1: every kernel on that path now uses
-     * persistent scratch, but a pool allocation inside a capture aborts the
-     * process rather than failing the capture, so it stays opt-in until it
-     * has run long enough to trust. */
+     * verify runs 1 + K rows for whatever K the drafter produced, and each
+     * row count is its own capture when DS4_QWEN4EXP_VERIFY_GRAPHS=1.  The
+     * abort this used to hit was the dense mmq tier launching on the legacy
+     * stream at >= 9 rows (fixed); it stays opt-in until it has run long
+     * enough to trust. */
     const bool graphs_ok = (n_tok == 1u ||
-                            (g->spec_k && n_tok == 1u + g->spec_k && q4e_verify_graphs_enabled())) &&
+                            (g->spec_k && n_tok <= 1u + g->spec_k && q4e_verify_graphs_enabled())) &&
                            !q4e_trace_enabled() &&
                            !q4e_profile_enabled() &&
                            ds4_gpu_decode_graphs_supported() != 0;
@@ -66092,12 +66096,51 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     if (!ds4_gpu_q4e_hc_init_add(d.res, g->mixed, g->up, DS4_N_EMBD, DS4_N_HC, n)) return 1;
     q4e_trace("mtp_res_init", -1, d.res, (uint64_t)n * Q4E_HC_DIM);
 
-    const bool graphs_ok = n == 1u &&
+    /* The pending-row flush runs 1 + accepted rows; with verify graphs on,
+     * those shapes are captured per row count like the target's. */
+    const bool graphs_ok = (n == 1u || (n <= 1u + g->spec_k && q4e_verify_graphs_enabled())) &&
                            !q4e_trace_enabled() &&
                            !q4e_profile_enabled() &&
                            ds4_gpu_decode_graphs_supported() != 0;
     if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 0u, n, graphs_ok)) return 1;
     if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 1u, n, graphs_ok)) return 1;
+    /* DS4_QWEN4EXP_MTP_DUMP=<dir>: one binary record per draft call, for a
+     * numerical check against vLLM's PyTorch MTP module (and later, training
+     * pairs).  Layout, all little-endian: int32 magic 0x4d545031, n, hc_dim,
+     * n_vocab, has_logits; int32 tokens[n], positions[n]; f32 hidden[n*hc_dim]
+     * (the target residual rows fed in); f32 res[n*hc_dim] (the draft's
+     * multi-stream residual after its layer); then, when has_logits, f32
+     * logits[n_vocab] for the last row.  Diagnostic only: synchronises. */
+    static const char *dump_dir = NULL;
+    static int dump_checked = 0;
+    if (!dump_checked) {
+        dump_dir = getenv("DS4_QWEN4EXP_MTP_DUMP");
+        dump_checked = 1;
+    }
+    if (dump_dir && dump_dir[0]) {
+        static uint32_t dump_seq = 0;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/draft_%05u.bin", dump_dir, dump_seq++);
+        FILE *fp = fopen(path, "wb");
+        if (fp) {
+            const uint64_t rows = (uint64_t)n * Q4E_HC_DIM;
+            float *buf = xmalloc(rows * sizeof(float));
+            const int32_t hdr[5] = { 0x4d545031, (int32_t)n, (int32_t)Q4E_HC_DIM,
+                                     (int32_t)DS4_N_VOCAB, out_argmax ? 1 : 0 };
+            (void)ds4_gpu_synchronize();
+            fwrite(hdr, sizeof(hdr), 1, fp);
+            fwrite(tokens, sizeof(int32_t), n, fp);
+            fwrite(positions, sizeof(int32_t), n, fp);
+            if (ds4_gpu_tensor_read(hidden, 0, buf, rows * sizeof(float))) fwrite(buf, sizeof(float), rows, fp);
+            if (ds4_gpu_tensor_read(d.res, 0, buf, rows * sizeof(float))) fwrite(buf, sizeof(float), rows, fp);
+            free(buf);
+            if (!out_argmax) fclose(fp);
+            else {
+                /* The logits are appended below once the head has run. */
+                g->mtp_dump_fp = fp;
+            }
+        }
+    }
     if (!out_argmax) return 0;
 
     /* The collapsing mixer has no inject; the vocabulary head is the
@@ -66112,6 +66155,16 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     ds4_gpu_tensor_free(last);
     if (!projected) return 1;
     q4e_trace("mtp_result_output", -1, d.logits, (uint64_t)DS4_N_VOCAB);
+    if (g->mtp_dump_fp) {
+        float *lg = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+        (void)ds4_gpu_synchronize();
+        if (ds4_gpu_tensor_read(d.logits, 0, lg, (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+            fwrite(lg, sizeof(float), DS4_N_VOCAB, g->mtp_dump_fp);
+        }
+        free(lg);
+        fclose(g->mtp_dump_fp);
+        g->mtp_dump_fp = NULL;
+    }
     /* Greedy drafts need the argmax alone: 4 bytes back instead of 1 MB. */
     if (!ds4_gpu_q4e_argmax_rows(g->argmax_dev, d.logits, DS4_N_VOCAB, 1u)) return 1;
     if (!ds4_gpu_synchronize()) return 1;

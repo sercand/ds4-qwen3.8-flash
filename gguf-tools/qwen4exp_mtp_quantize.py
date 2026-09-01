@@ -138,7 +138,7 @@ class Raw:
         return bits.view(np.float32).reshape(meta["shape"])
 
 
-def build_plan(raw):
+def build_plan(raw, routed_qtype=None):
     """(gguf_name, float32 array, qtype).  GGUF dim order is reversed from the
     HF [out, in] convention: ne0 is the row length, i.e. the input dim."""
     P = "mtp.layers.0."
@@ -195,8 +195,11 @@ def build_plan(raw):
     gu = raw.f32(M + "experts.gate_up_proj")
     if gu.shape != (N_EXPERT, 2 * N_FF_EXP, N_EMBD):
         fail("gate_up_proj shape %s unexpected" % (gu.shape,))
-    add("blk.0.ffn_gate_exps.weight", gu[:, :N_FF_EXP, :], QTYPE_Q4_K)
-    add("blk.0.ffn_up_exps.weight", gu[:, N_FF_EXP:, :], QTYPE_Q4_K)
+    # Routed gate/up copy the target's Q4_K by default; --routed-q8 builds
+    # the all-Q8_0 variant for the acceptance A/B (about 3.3 GiB).
+    rq = QTYPE_Q4_K if routed_qtype is None else routed_qtype
+    add("blk.0.ffn_gate_exps.weight", gu[:, :N_FF_EXP, :], rq)
+    add("blk.0.ffn_up_exps.weight", gu[:, N_FF_EXP:, :], rq)
 
     dn = raw.f32(M + "experts.down_proj")
     if dn.shape != (N_EXPERT, N_EMBD, N_FF_EXP):
@@ -233,6 +236,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--lib", default=os.path.join(os.path.dirname(__file__),
                                                   "libds4quants.so"))
+    ap.add_argument("--routed-q8", action="store_true",
+                    help="quantize the routed gate/up experts as Q8_0 instead of Q4_K")
     args = ap.parse_args()
 
     if not os.path.exists(args.lib):
@@ -240,7 +245,7 @@ def main():
 
     raw = Raw(args.raw)
     quant = Quantizer(args.lib)
-    plan = build_plan(raw)
+    plan = build_plan(raw, QTYPE_Q8_0 if args.routed_q8 else None)
 
     kv = b"".join([
         kv_string("general.architecture", "qwen4exp-mtp"),

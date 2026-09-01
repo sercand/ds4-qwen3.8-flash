@@ -7,6 +7,7 @@
 // Phase 0: pool is plain cudaMallocAsync / cudaFreeAsync. Phase 4 swaps
 // in ds4's existing cuda_tmp_alloc slab allocator.
 
+#include <execinfo.h>
 #include "common.cuh"   // pulls in ds4_ggml_stubs.h via redirect headers
 
 #if defined(GGML_USE_HIP)
@@ -146,6 +147,18 @@ struct ds4_naive_pool : public ggml_cuda_pool {
     void * alloc(size_t size, size_t * actual_size) override {
         ggml_cuda_set_device(device);
         void * ptr = nullptr;
+        /* DS4_POOL_TRACE=1: who allocates from the pool, and on which stream.
+         * Used to find allocations that land inside a graph capture. */
+        static const bool trace = getenv("DS4_POOL_TRACE") != nullptr;
+        if (trace) {
+            cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+            (void)cudaStreamIsCapturing(t_ds4_pool_stream, &st);
+            fprintf(stderr, "ds4 pool alloc %zu bytes stream=%p capturing=%d\n",
+                    size, (void *)t_ds4_pool_stream, (int)st);
+            void *bt[8];
+            const int n = backtrace(bt, 8);
+            backtrace_symbols_fd(bt, n, 2);
+        }
         CUDA_CHECK(cudaMallocAsync(&ptr, size, t_ds4_pool_stream));
         if (actual_size) *actual_size = size;
         return ptr;

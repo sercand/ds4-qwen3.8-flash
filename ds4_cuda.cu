@@ -897,7 +897,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   2u
-#define CUDA_DECODE_GRAPH_VARIANTS  4u
+#define CUDA_DECODE_GRAPH_VARIANTS 16u   /* 1-token decode, verify at 2..9 rows, draft flushes */
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
@@ -14700,9 +14700,12 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                             ((in_dim % 32u) == 0 && n_tok >= 32);
     if (n_tok > 1 && k_tileable &&
         !g_q8_dequant_gemm_enabled && cuda_use_mmq()) {
+        /* On the decode stream: under a graph capture the legacy stream is
+         * neither captured nor allowed to allocate (the stream-k fixup
+         * buffer comes from the pool), which aborted the 9-row verify. */
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
-                                    (cudaStream_t)0);
+                                    cuda_decode_stream());
         if (rc == 0) return 1;
         fprintf(stderr, "ds4: ds4_mmq_q8_0_dense returned %d (label='%s' in=%llu out=%llu n_tok=%llu); falling back\n",
                 rc, label ? label : "", (unsigned long long)in_dim,

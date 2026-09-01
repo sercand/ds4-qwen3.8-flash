@@ -2377,6 +2377,11 @@ int ds4_mmq_moe_vec_impl(
         g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
+        if (getenv("DS4_POOL_TRACE")) {
+            fprintf(stderr, "%s:%d q81 scratch fallback: enabled=%d ptr=%p bytes=%zu need=%zu\n",
+                    __FILE__, __LINE__, (int)g_q81_scratch_enabled, g_q81_scratch_ptr,
+                    g_q81_scratch_bytes, nbytes_q8_1);
+        }
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
@@ -2921,6 +2926,11 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
+        if (getenv("DS4_POOL_TRACE")) {
+            fprintf(stderr, "%s:%d q81 scratch fallback: enabled=%d ptr=%p bytes=%zu need=%zu\n",
+                    __FILE__, __LINE__, (int)g_q81_scratch_enabled, g_q81_scratch_ptr,
+                    g_q81_scratch_bytes, nbytes_q8_1);
+        }
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
@@ -3526,6 +3536,11 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
+        if (getenv("DS4_POOL_TRACE")) {
+            fprintf(stderr, "%s:%d q81 scratch fallback: enabled=%d ptr=%p bytes=%zu need=%zu\n",
+                    __FILE__, __LINE__, (int)g_q81_scratch_enabled, g_q81_scratch_ptr,
+                    g_q81_scratch_bytes, nbytes_q8_1);
+        }
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
@@ -3774,6 +3789,11 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
+        if (getenv("DS4_POOL_TRACE")) {
+            fprintf(stderr, "%s:%d q81 scratch fallback: enabled=%d ptr=%p bytes=%zu need=%zu\n",
+                    __FILE__, __LINE__, (int)g_q81_scratch_enabled, g_q81_scratch_ptr,
+                    g_q81_scratch_bytes, nbytes_q8_1);
+        }
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
@@ -4585,6 +4605,11 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
                g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
+        if (getenv("DS4_POOL_TRACE")) {
+            fprintf(stderr, "%s:%d q81 scratch fallback: enabled=%d ptr=%p bytes=%zu need=%zu\n",
+                    __FILE__, __LINE__, (int)g_q81_scratch_enabled, g_q81_scratch_ptr,
+                    g_q81_scratch_bytes, nbytes_q8_1);
+        }
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
@@ -4888,6 +4913,11 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
     if (g_q81_scratch_enabled && g_q81_scratch_ptr && g_q81_scratch_bytes >= nbytes_q8_1) {
         src1_q8_1_ptr = (char *)g_q81_scratch_ptr;
     } else {
+        if (getenv("DS4_POOL_TRACE")) {
+            fprintf(stderr, "%s:%d q81 scratch fallback: enabled=%d ptr=%p bytes=%zu need=%zu\n",
+                    __FILE__, __LINE__, (int)g_q81_scratch_enabled, g_q81_scratch_ptr,
+                    g_q81_scratch_bytes, nbytes_q8_1);
+        }
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
