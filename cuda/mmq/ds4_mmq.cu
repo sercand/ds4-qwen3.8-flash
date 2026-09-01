@@ -532,10 +532,14 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
         return -1;
     }
-    if (K % 256 != 0) {
-        // mmq requires K to be a multiple of the largest super-block size
-        // it sees during the inner tile loop, which is QK_K=256.
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
+    // mmq bounds its K loop by ncols_x / qk using the true K -- the
+    // MATRIX_ROW_PADDING padding only sizes the activation buffer -- so the
+    // requirement is a whole number of the type's blocks: 256 for the
+    // K-quants, 32 for the legacy ones.  qwen4exp's Q8_0 projections at
+    // K = 320 and K = 640 need the looser bound.
+    const int k_step = (int)ggml_blck_size(type);
+    if (k_step <= 0 || K % k_step != 0) {
+        fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, k_step);
         return -1;
     }
 
@@ -895,6 +899,7 @@ extern "C" int ds4_mmq_q4_K_dense(
     return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
 }
 
+
 extern "C" int ds4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
@@ -939,7 +944,17 @@ int ds4_mmq_moe_impl(
         /* ds4 (P3): false skips the whole-buffer nonfinite pass; only valid
          * when every consumer sanitizes at read (the routed-MoE swiglu/sum
          * kernels do). */
-        bool            sanitize_out = true) {
+        bool            sanitize_out = true,
+        /* ds4: a caller-supplied upper bound on how many rows any single
+         * expert can receive; 0 means "use the gathered-row total".  mmq sizes
+         * its grid as ceil(ncols_max / tile) tiles per expert, so the default
+         * bound overlaunches empty tiles badly whenever the assignment is a
+         * genuine top-k selection: one token contributes at most one row to
+         * any expert, so n_tokens bounds every bucket.  Callers that flatten
+         * (token, slot) pairs into n_tokens with n_expert_used = 1 must pass
+         * the *original* token count, not the flattened row count.
+         * The bound must hold: rows past it would never be computed. */
+        int64_t         max_rows_per_expert = 0) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -950,9 +965,16 @@ int ds4_mmq_moe_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
-        return -1;
+    // A whole number of the type's blocks, not of a 256-weight super-block:
+    // mmq bounds its K loop by ncols_x / qk with the true K, and
+    // MATRIX_ROW_PADDING only sizes the activation buffer.  qwen4exp's routed
+    // down experts are K = 640, twenty legacy blocks and no super-blocks.
+    {
+        const int k_step = (int)ggml_blck_size(type);
+        if (k_step <= 0 || K % k_step != 0) {
+            fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, k_step);
+            return -1;
+        }
     }
     if (n_expert_used > n_experts) {
         fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
@@ -1151,7 +1173,9 @@ int ds4_mmq_moe_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/ne_get_rows,
+        /* Rows any one expert can hold, not the gathered total. */
+        /*ncols_max=*/((max_rows_per_expert > 0 && max_rows_per_expert < ne_get_rows)
+                       ? max_rows_per_expert : ne_get_rows),
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
     };
@@ -1269,7 +1293,9 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
         bool            sanitize_out = true,
-        const ds4_mmq_fused_down *fused_down = nullptr) {
+        const ds4_mmq_fused_down *fused_down = nullptr,
+        /* ds4: see ds4_mmq_moe_impl. */
+        int64_t         max_rows_per_expert = 0) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -1283,9 +1309,16 @@ int ds4_mmq_moe_pair_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
-        return -1;
+    // A whole number of the type's blocks, not of a 256-weight super-block:
+    // mmq bounds its K loop by ncols_x / qk with the true K, and
+    // MATRIX_ROW_PADDING only sizes the activation buffer.  qwen4exp's routed
+    // down experts are K = 640, twenty legacy blocks and no super-blocks.
+    {
+        const int k_step = (int)ggml_blck_size(type);
+        if (k_step <= 0 || K % k_step != 0) {
+            fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, k_step);
+            return -1;
+        }
     }
     if (n_expert_used > n_experts) {
         fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
@@ -1467,9 +1500,12 @@ int ds4_mmq_moe_pair_impl(
     const bool tight_iq2_ncols =
         type == GGML_TYPE_IQ2_XXS &&
         ds4_mmq_gfx1151_flag("DS4_ROCM_MMQ_TIGHT_NCOLS", cc);
-    const int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
+    int64_t routed_ncols_max = (fused_down || tight_iq2_ncols)
         ? (int64_t)n_tokens
         : ne_get_rows;
+    if (max_rows_per_expert > 0 && max_rows_per_expert < routed_ncols_max) {
+        routed_ncols_max = max_rows_per_expert;
+    }
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
      * down Q8_1. The direct path needs both simultaneously, but writes down
@@ -1888,9 +1924,12 @@ int ds4_mmq_moe_pair_impl(
 extern "C" int ds4_mmq_q8_0_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        cudaStream_t stream, int max_rows_per_expert) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_moe", W, X, ids, out, M, K,
-                                            n_tokens, n_experts, n_expert_used, stream);
+                                            n_tokens, n_experts, n_expert_used, stream,
+                                            /*x_soa=*/NULL, /*soa_blocks=*/0,
+                                            /*sanitize_out=*/true,
+                                            (int64_t)max_rows_per_expert);
 }
 
 extern "C" int ds4_mmq_q2_K_moe(
@@ -1937,6 +1976,32 @@ extern "C" int ds4_mmq_q4_K_moe(
         cudaStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
+}
+
+/* qwen4exp: 43 of the 48 layers store their routed down experts as Q5_1, a
+ * legacy 32-weight block type at K = 640. */
+extern "C" int ds4_mmq_q5_1_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream, int max_rows_per_expert) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q5_1>("ds4_mmq_q5_1_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream,
+                                            /*x_soa=*/NULL, /*soa_blocks=*/0,
+                                            /*sanitize_out=*/true,
+                                            (int64_t)max_rows_per_expert);
+}
+
+/* qwen4exp: one layer of the shipped UD-Q4_K_XL mix stores its routed gate and
+ * up as Q5_K, so the batched prefill path needs this alongside the Q4_K one. */
+extern "C" int ds4_mmq_q5_K_moe(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream, int max_rows_per_expert) {
+    return ds4_mmq_moe_impl<GGML_TYPE_Q5_K>("ds4_mmq_q5_K_moe", W, X, ids, out, M, K,
+                                            n_tokens, n_experts, n_expert_used, stream,
+                                            /*x_soa=*/NULL, /*soa_blocks=*/0,
+                                            /*sanitize_out=*/true,
+                                            (int64_t)max_rows_per_expert);
 }
 
 extern "C" int ds4_mmq_mxfp4_moe(
@@ -2193,10 +2258,13 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        cudaStream_t stream, int max_rows_per_expert) {
     return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
-        M, K, n_tokens, n_experts, n_expert_used, stream);
+        M, K, n_tokens, n_experts, n_expert_used, stream,
+        /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
+        /*sanitize_out=*/true, /*fused_down=*/nullptr,
+        (int64_t)max_rows_per_expert);
 }
 
 extern "C" int ds4_mmq_mxfp4_moe_pair(
@@ -2258,9 +2326,16 @@ int ds4_mmq_moe_vec_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
-        return -1;
+    // A whole number of the type's blocks, not of a 256-weight super-block:
+    // mmq bounds its K loop by ncols_x / qk with the true K, and
+    // MATRIX_ROW_PADDING only sizes the activation buffer.  qwen4exp's routed
+    // down experts are K = 640, twenty legacy blocks and no super-blocks.
+    {
+        const int k_step = (int)ggml_blck_size(type);
+        if (k_step <= 0 || K % k_step != 0) {
+            fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, k_step);
+            return -1;
+        }
     }
     if (n_expert_used > n_experts) {
         fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
@@ -2813,9 +2888,16 @@ int ds4_mmq_moe_pair_raw_vec_impl(
                 tag, M, K, n_tokens, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
-        return -1;
+    // A whole number of the type's blocks, not of a 256-weight super-block:
+    // mmq bounds its K loop by ncols_x / qk with the true K, and
+    // MATRIX_ROW_PADDING only sizes the activation buffer.  qwen4exp's routed
+    // down experts are K = 640, twenty legacy blocks and no super-blocks.
+    {
+        const int k_step = (int)ggml_blck_size(type);
+        if (k_step <= 0 || K % k_step != 0) {
+            fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, k_step);
+            return -1;
+        }
     }
     if (n_expert_used > n_experts) {
         fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
@@ -2958,9 +3040,16 @@ int ds4_mmq_moe_pair_vec_impl(
                 tag, M, K, n_experts, n_expert_used);
         return -1;
     }
-    if (K % 256 != 0) {
-        fprintf(stderr, "%s: K=%d must be a multiple of 256\n", tag, K);
-        return -1;
+    // A whole number of the type's blocks, not of a 256-weight super-block:
+    // mmq bounds its K loop by ncols_x / qk with the true K, and
+    // MATRIX_ROW_PADDING only sizes the activation buffer.  qwen4exp's routed
+    // down experts are K = 640, twenty legacy blocks and no super-blocks.
+    {
+        const int k_step = (int)ggml_blck_size(type);
+        if (k_step <= 0 || K % k_step != 0) {
+            fprintf(stderr, "%s: K=%d must be a multiple of %d\n", tag, K, k_step);
+            return -1;
+        }
     }
     if (n_expert_used > n_experts) {
         fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
@@ -3869,6 +3958,15 @@ extern "C" int ds4_mmq_q4_K_moe_vec(
         cudaStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_vec", W, X, ids, out, M, K,
+        n_tokens, n_experts, n_expert_used, stream);
+}
+
+extern "C" int ds4_mmq_q5_K_moe_vec(
+        const void * W, const float * X, const int32_t * ids, float * out,
+        int M, int K, int n_tokens, int n_experts, int n_expert_used,
+        cudaStream_t stream) {
+    return ds4_mmq_moe_vec_impl<GGML_TYPE_Q5_K>(
+        "ds4_mmq_q5_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
 }
 
@@ -4946,6 +5044,10 @@ template void mul_mat_q_case<GGML_TYPE_Q2_K>(
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q5_K>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q5_1>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

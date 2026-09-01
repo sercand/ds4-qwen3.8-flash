@@ -17,6 +17,10 @@
 /tests/test_engine_mgpu_refusal
 /tests/test_engine_correctness
 /tests/test_gpu_args
+/tests/test_qwen4exp_graph
+/tests/test_qwen4exp_ple
+/tests/test_qwen4exp_tokenizer
+/tests/test_gguf_split
 /tests/test_gpu_lookup_cache_strict
 /tests/test_gpu_model_cache
 /tests/test_gpu_xdev

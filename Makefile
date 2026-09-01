@@ -25,8 +25,8 @@ DS4_DSPARK_SUPPORT ?= gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_metal.o ds4_layer_pack.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= $(shell if [ -x /usr/local/cuda/bin/nvcc ]; then \
@@ -51,8 +51,8 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NA
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -185,7 +185,7 @@ cuda:
 
 strix-halo:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
@@ -197,15 +197,16 @@ rocm: strix-halo
 # of this target; run them through `make test` / `make cuda-regression` on
 # CUDA hosts.  Everything else mirrors `make test`.
 test-rocm:
-	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
+	$(MAKE) -B ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_gguf_split mxfp4-dot-test \
 		tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 		ds4 ds4-server ds4-bench ds4-agent \
-		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
+		CORE_OBJS="ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_rocm.o ds4_rocm_compat.o ds4_rocm_unavailable.o ds4_layer_pack.o $(ROCM_MMQ_OBJS)" \
 		CFLAGS="$(CFLAGS) $(ROCM_HOST_CFLAGS) -DDS4_ROCM_BUILD" \
 		DS4_LINK="$(HIPCC) $(ROCM_CFLAGS)" \
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
+	./tests/test_gguf_split
 	./ds4_test
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
@@ -250,7 +251,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_ple_stream.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -258,6 +259,9 @@ ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/pn
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
+
+ds4_ple_stream.o: ds4_ple_stream.c ds4_ple_stream.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_ple_stream.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -307,7 +311,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_ple_stream.h ds4_distributed.h ds4_gpu.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -375,7 +379,7 @@ $(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o
 test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
 	./$(GLM53_KDA_ROCM_TEST)
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_qwen4exp_gpu.cuh ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -465,13 +469,37 @@ ds4_cpu_test_hooks.o: ds4.c ds4.h ds4_image.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer
 tests/test_engine_mgpu_placement.o: tests/test_engine_mgpu_placement.c ds4.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
-tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_engine_mgpu_placement: tests/test_engine_mgpu_placement.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_qwen4exp_graph.o: tests/test_qwen4exp_graph.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_graph: tests/test_qwen4exp_graph.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_qwen4exp_tokenizer.o: tests/test_qwen4exp_tokenizer.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_tokenizer: tests/test_qwen4exp_tokenizer.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_qwen4exp_ple.o: tests/test_qwen4exp_ple.c ds4.h ds4_ple_stream.h
+	$(CC) $(CFLAGS) -I. -DDS4_TEST_HOOKS -c -o $@ $<
+
+tests/test_qwen4exp_ple: tests/test_qwen4exp_ple.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+tests/test_gguf_split.o: tests/test_gguf_split.c ds4.h
+	$(CC) $(CFLAGS) -I. -DDS4_TEST_HOOKS -c -o $@ $<
+
+tests/test_gguf_split: tests/test_gguf_split.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 tests/test_sampling.o: tests/test_sampling.c ds4.h
 	$(CC) $(CFLAGS) -fno-finite-math-only -DDS4_TEST_HOOKS -I. -c -o $@ $<
 
-tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+tests/test_sampling: tests/test_sampling.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
 ifneq ($(UNAME_S),Darwin)
@@ -547,17 +575,26 @@ else
 	$(DS4_LINK) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(DS4_LINK_LIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test \
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_gguf_split mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
 	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
+	./tests/test_gguf_split
 	./ds4_test
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
 	./tests/test_gpu_args_cli.sh
 	./tests/test_sampling
+
+# qwen4exp correctness against the llama.cpp oracle.  Both need the model, so
+# they are not part of `make test`; point DS4_QWEN4EXP_MODEL at the first GGUF
+# shard.  See misc/qwen4exp-oracle/README.md.
+DS4_QWEN4EXP_MODEL ?=
+test-qwen4exp: tests/test_qwen4exp_ple tests/test_qwen4exp_graph
+	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_ple
+	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_graph
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \

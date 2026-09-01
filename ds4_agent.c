@@ -782,6 +782,10 @@ static agent_config parse_options(int argc, char **argv) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
+        } else if (!strcmp(arg, "--think-low")) {
+            c.gen.think_mode = DS4_THINK_LOW;
+        } else if (!strcmp(arg, "--think-medium")) {
+            c.gen.think_mode = DS4_THINK_MEDIUM;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {

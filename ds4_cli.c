@@ -1270,6 +1270,8 @@ static void print_repl_help(void) {
     puts("Commands:");
     puts("  /help          Show this help.");
     puts("  /think         Use normal thinking mode.");
+    puts("  /think-low     Low reasoning effort (Qwen3.8 has its own sentence; others read it as high).");
+    puts("  /think-medium  Medium reasoning effort (Qwen3.8: thinking on, no effort sentence).");
     puts("  /think-max     Use Think Max only when context is at least 393216 tokens.");
     puts("  /nothink       Disable thinking mode.");
     puts("  /ctx N         Set context size for following prompts.");
@@ -1367,6 +1369,8 @@ static void tokens_remove(ds4_tokens *dst, int pos, int n) {
 
 static const char *repl_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -1707,6 +1711,14 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
             cfg->gen.think_mode = DS4_THINK_HIGH;
             repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_HIGH);
             puts("Thinking mode: high.");
+        } else if (!strcmp(cmd, "/think-low")) {
+            cfg->gen.think_mode = DS4_THINK_LOW;
+            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_LOW);
+            puts("Thinking mode: low.");
+        } else if (!strcmp(cmd, "/think-medium")) {
+            cfg->gen.think_mode = DS4_THINK_MEDIUM;
+            repl_chat_apply_think_prefix(engine, &chat, DS4_THINK_MEDIUM);
+            puts("Thinking mode: medium.");
         } else if (!strcmp(cmd, "/think-max")) {
             cfg->gen.think_mode = DS4_THINK_MAX;
             bool active = ds4_think_mode_for_context(cfg->gen.think_mode,
@@ -2094,6 +2106,10 @@ static cli_config parse_options(int argc, char **argv) {
                 parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
             c.gen.think_mode = DS4_THINK_HIGH;
+        } else if (!strcmp(arg, "--think-low")) {
+            c.gen.think_mode = DS4_THINK_LOW;
+        } else if (!strcmp(arg, "--think-medium")) {
+            c.gen.think_mode = DS4_THINK_MEDIUM;
         } else if (!strcmp(arg, "--think-max")) {
             c.gen.think_mode = DS4_THINK_MAX;
         } else if (!strcmp(arg, "--nothink")) {

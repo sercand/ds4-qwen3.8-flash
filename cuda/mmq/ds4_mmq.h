@@ -206,7 +206,8 @@ int ds4_mmq_q8_0_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    int             max_rows_per_expert);
 
 int ds4_mmq_q2_K_moe(
     const void    * W,
@@ -264,6 +265,39 @@ int ds4_mmq_q4_K_moe(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream);
+
+int ds4_mmq_q5_1_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    int             max_rows_per_expert);
+
+/* max_rows_per_expert: an upper bound on the rows any one expert can receive,
+ * or 0 for the gathered-row total.  mmq launches ceil(ncols_max / tile) tiles
+ * per expert, so the default massively overlaunches empty tiles for a genuine
+ * top-k selection, where one token contributes at most one row to any expert
+ * and the token count bounds every bucket.  Callers that flatten (token, slot)
+ * pairs into n_tokens with n_expert_used = 1 must pass the original token
+ * count.  The bound must hold: rows past it are never computed. */
+int ds4_mmq_q5_K_moe(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream,
+    int             max_rows_per_expert);
 
 int ds4_mmq_mxfp4_moe(
     const void    * W,
@@ -390,6 +424,7 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
     size_t *down_q8_bytes,
     size_t *work_bytes);
 
+/* max_rows_per_expert: see ds4_mmq_q5_K_moe. */
 int ds4_mmq_q4_K_moe_pair(
     const void    * W_a,
     const void    * W_b,
@@ -402,7 +437,8 @@ int ds4_mmq_q4_K_moe_pair(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    cudaStream_t    stream,
+    int             max_rows_per_expert);
 
 int ds4_mmq_mxfp4_moe_pair(
     const void    * W_a,
@@ -475,6 +511,19 @@ int ds4_mmq_iq2_xxs_moe_vec(
     cudaStream_t    stream);
 
 int ds4_mmq_q4_K_moe_vec(
+    const void    * W,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+// qwen4exp: Q5_K routed gate/up, present on one layer of the Unsloth mix.
+int ds4_mmq_q5_K_moe_vec(
     const void    * W,
     const float   * X_f32,
     const int32_t * ids,

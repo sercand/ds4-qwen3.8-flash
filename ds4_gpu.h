@@ -113,6 +113,18 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
+/* Address model weights in place instead of copying them into device memory.
+ * Only meaningful where host memory is already device addressable; returns 0
+ * when the device cannot, leaving the copying path in use. */
+int ds4_gpu_set_direct_model_mapping(int enable);
+int ds4_gpu_direct_model_mapping_active(void);
+/* Register a GGUF split's descriptors so weight staging reads the right file. */
+int ds4_gpu_set_model_shard_fds(const void *model_map, const int *fds,
+                                const uint64_t *bases, const uint64_t *sizes,
+                                uint32_t count);
+int ds4_gpu_prefetch_model_spans(const void *model_map, uint64_t model_size,
+                                 const uint64_t *offsets, const uint64_t *sizes,
+                                 uint32_t count);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                     const char *model_path);
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
@@ -3084,6 +3096,81 @@ int  ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key);
 int  ds4_gpu_decode_graph_end(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graph_abort(const ds4_decode_graph_key *key);
 void ds4_gpu_decode_graphs_invalidate(void);
+
+
+/* =========================================================================
+ * qwen4exp (Qwen3.8-Flash-Next) operations.
+ * =========================================================================
+ *
+ * Implemented in ds4_qwen4exp_gpu.cuh.  Weights are addressed by model offset
+ * so they resolve through the same weight cache as every other path.  The
+ * residual these take is hc streams of n_embd, stream-outer.
+ */
+/* Q8_0 mat-vec tuned for a narrow output dimension.  Returns 0 when the shape
+ * is not one it handles, so the caller keeps the generic dispatch. */
+int ds4_gpu_q4e_matvec_q8_0_narrow(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x);
+
+/* F32 mat-vec that splits the contraction when the output is narrow. */
+int ds4_gpu_q4e_matmul_q8_0_rows( ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_q4e_matvec_f32(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x);
+
+int ds4_gpu_q4e_hc_init( ds4_gpu_tensor *res, const ds4_gpu_tensor *embed, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+/* res = embed broadcast over the streams + h ([n_tok, n_hc * n_embd]). */
+int ds4_gpu_q4e_hc_init_add( ds4_gpu_tensor *res, const ds4_gpu_tensor *embed, const ds4_gpu_tensor *h, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+
+int ds4_gpu_q4e_hc_norm( ds4_gpu_tensor *out, const ds4_gpu_tensor *res, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
+
+int ds4_gpu_q4e_scale_silu(ds4_gpu_tensor *x, float inv_scale, uint64_t n);
+
+int ds4_gpu_q4e_hc_collapse( ds4_gpu_tensor *out, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *up, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+
+int ds4_gpu_q4e_hc_combine( ds4_gpu_tensor *res, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *inject, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+
+int ds4_gpu_q4e_moe_route( ds4_gpu_tensor *ids, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits, uint32_t n_expert, uint32_t n_used, uint32_t n_tok);
+
+int ds4_gpu_q4e_swiglu( ds4_gpu_tensor *out, const ds4_gpu_tensor *gate, const ds4_gpu_tensor *up, uint64_t n);
+
+int ds4_gpu_q4e_moe_combine( ds4_gpu_tensor *out, const ds4_gpu_tensor *down, const ds4_gpu_tensor *weights, uint32_t n_embd, uint32_t n_used, uint32_t n_tok);
+
+int ds4_gpu_q4e_shared_add( ds4_gpu_tensor *out, const ds4_gpu_tensor *shared, const ds4_gpu_tensor *logit, uint32_t n_embd, uint32_t n_tok);
+
+int ds4_gpu_q4e_gdn_conv( ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t channels, uint32_t kernel, uint32_t n_tok, ds4_gpu_tensor *ckpt, uint32_t ckpt_cap);
+
+int ds4_gpu_q4e_gdn_l2norm( ds4_gpu_tensor *qkv, uint32_t head_dim, uint32_t n_heads, uint32_t stride, uint32_t offset, uint32_t n_tok);
+
+int ds4_gpu_q4e_gdn_gates( ds4_gpu_tensor *decay, ds4_gpu_tensor *beta, const ds4_gpu_tensor *alpha_proj, const ds4_gpu_tensor *beta_proj, const void *model_map, uint64_t model_size, uint64_t dt_bias_offset, uint64_t a_offset, uint32_t n_head, uint32_t n_tok);
+
+int ds4_gpu_q4e_gdn_recurrent( ds4_gpu_tensor *attn_out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *decay, const ds4_gpu_tensor *beta, uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v, uint32_t stride, uint32_t n_tok, ds4_gpu_tensor *ckpt, uint32_t ckpt_cap);
+
+int ds4_gpu_q4e_gdn_out_gate( ds4_gpu_tensor *out, const ds4_gpu_tensor *attn, const ds4_gpu_tensor *z, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t head_dim, uint32_t n_head, uint32_t n_tok, float eps);
+
+int ds4_gpu_q4e_ple_dequant( ds4_gpu_tensor *out, const ds4_gpu_tensor *rows, uint32_t head_dim, uint32_t n_heads, uint32_t row_bytes, uint32_t n_tok);
+
+int ds4_gpu_q4e_ple_gated_value( ds4_gpu_tensor *gv, const ds4_gpu_tensor *key, const ds4_gpu_tensor *query, const ds4_gpu_tensor *value, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+
+int ds4_gpu_q4e_ple_conv( ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t channels, uint32_t kernel, uint32_t dilation, uint32_t n_tok, ds4_gpu_tensor *ckpt, uint32_t ckpt_cap);
+
+int ds4_gpu_q4e_add2( ds4_gpu_tensor *res, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint64_t n);
+
+int ds4_gpu_q4e_qsa_q_norm_rope( ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, const ds4_gpu_tensor *qkv, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head, uint32_t n_rot, float rope_base, uint32_t n_tok, float eps);
+
+int ds4_gpu_q4e_qsa_store_kv( ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base, uint32_t cache_slots, uint32_t n_tok, float eps);
+
+int ds4_gpu_q4e_qsa_attention( ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok);
+
+int ds4_gpu_q4e_qsa_gate(ds4_gpu_tensor *x, const ds4_gpu_tensor *gate, uint64_t n);
+
+int ds4_gpu_q4e_moe_gate_up( ds4_gpu_tensor *mid, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used, int *fused_silu);
+
+int ds4_gpu_q4e_moe_down( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used);
+
+int ds4_gpu_q4e_moe_matmul( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used);
 
 #ifdef __cplusplus
 }

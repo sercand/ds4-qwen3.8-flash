@@ -462,17 +462,17 @@ static const char *glm_graph_env_value(const char *rocm_name,
 enum {
     DS4_MAX_LAYER            = 79,
     DS4_MAX_EMBD             = 7168,
-    DS4_MAX_VOCAB            = 154880,
+    DS4_MAX_VOCAB            = 248320,
     DS4_MAX_HEAD             = 128,
-    DS4_MAX_HEAD_KV          = 1,
+    DS4_MAX_HEAD_KV          = 2,
     DS4_MAX_HEAD_DIM         = 576,
     DS4_MAX_VALUE_DIM        = 512,
     DS4_MAX_ROT              = 64,
     DS4_MAX_OUT_GROUP        = 16,
     DS4_MAX_LORA_Q           = 2048,
     DS4_MAX_LORA_O           = 1024,
-    DS4_MAX_EXPERT           = 384,
-    DS4_MAX_EXPERT_USED      = 8,
+    DS4_MAX_EXPERT           = 512,
+    DS4_MAX_EXPERT_USED      = 10,
     DS4_MAX_EXPERT_SHARED    = 1,
     DS4_MAX_FF_EXP           = 3072,
     DS4_MAX_HASH_LAYER       = 3,
@@ -485,18 +485,25 @@ enum {
     DS4_MAX_KDA_HEAD         = 64,
     DS4_MAX_KDA_HEAD_DIM     = 128,
     DS4_MAX_KDA_CONV         = 4,
+    /* qwen4exp PLE: the n-gram hash reads ngram_size tokens back and produces
+     * (ngram_size - 1) * heads_per_ngram row indices per token.  The tables
+     * below are sized by these two bounds, not by the layer count. */
+    DS4_MAX_PLE_NGRAM        = 4,
+    DS4_MAX_PLE_HEAD         = 32,
 };
 
 typedef enum {
     DS4_MODEL_FAMILY_DEEPSEEK4 = 0,
     DS4_MODEL_FAMILY_GLM_DSA   = 1,
+    DS4_MODEL_FAMILY_QWEN4EXP  = 2,
 } ds4_model_family;
 
 typedef enum {
-    DS4_VARIANT_FLASH = 0,
-    DS4_VARIANT_PRO   = 1,
-    DS4_VARIANT_GLM52 = 2,
-    DS4_VARIANT_GLM53 = 3,
+    DS4_VARIANT_FLASH   = 0,
+    DS4_VARIANT_PRO     = 1,
+    DS4_VARIANT_GLM52   = 2,
+    DS4_VARIANT_GLM53   = 3,
+    DS4_VARIANT_QWEN38F = 4,
 } ds4_variant;
 
 typedef struct {
@@ -534,6 +541,29 @@ typedef struct {
     uint32_t n_kda_head;
     uint32_t n_kda_head_dim;
     uint32_t n_kda_conv;
+    /* qwen4exp gated DeltaNet.  Unlike KDA the key and value head counts
+     * differ (16 vs 48) and the decay is one scalar per value head, so these
+     * get their own fields rather than overloading the KDA ones. */
+    uint32_t n_gdn_key_head;
+    uint32_t n_gdn_value_head;
+    uint32_t n_gdn_head_dim;
+    uint32_t n_gdn_conv;
+    /* qwen4exp layer schedule: every n_full_attn_interval-th layer is QSA
+     * sparse attention, the rest are gated DeltaNet.  The QSA indexer scores
+     * key blocks mean-pooled over n_indexer_compress tokens. */
+    uint32_t n_full_attn_interval;
+    uint32_t n_indexer_compress;
+    /* qwen4exp hyper-connections mix the hc streams through a low-rank pair
+     * instead of DeepSeek's Sinkhorn iteration. */
+    uint32_t n_hc_lowrank;
+    /* qwen4exp PLE n-gram embeddings, present on exactly one layer.  A zero
+     * n_ple_ngram means the model has no PLE block at all. */
+    uint32_t ple_layer;
+    uint32_t n_ple_ngram;
+    uint32_t n_ple_heads_per_ngram;
+    uint32_t n_ple_head_dim;
+    uint32_t n_ple_conv;
+    uint32_t ple_eos_token;
     float rms_eps;
     float hc_eps;
     float expert_weight_scale;
@@ -707,6 +737,50 @@ static const ds4_shape DS4_SHAPE_GLM53 = {
     .kda_gate_lower_bound = -5.0f,
 };
 
+/* Qwen3.8-Flash-Next, GGUF architecture "qwen4exp".  Layer i is QSA sparse
+ * attention when (i + 1) % 4 == 0 and gated DeltaNet otherwise; every layer
+ * carries a 512-expert MoE plus a shared expert, and two hyper-connection
+ * blocks over a 4 x 2560 residual.  Layer 1 additionally owns the PLE block,
+ * whose 320M x 160 hash table is streamed from disk rather than resident. */
+static const ds4_shape DS4_SHAPE_QWEN38F = {
+    .name = "Qwen3.8 Flash Next",
+    .family = DS4_MODEL_FAMILY_QWEN4EXP,
+    .variant = DS4_VARIANT_QWEN38F,
+    .n_layer = 48,
+    .n_embd = 2560,
+    .n_vocab = 248320,
+    .n_head = 24,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 512,
+    .n_expert_used = 10,
+    .n_expert_shared = 1,
+    .n_ff_exp = 640,
+    .n_indexer_head = 4,
+    .n_indexer_head_dim = 128,
+    .n_indexer_top_k = 2048,
+    .n_hc = 4,
+    .n_gdn_key_head = 16,
+    .n_gdn_value_head = 48,
+    .n_gdn_head_dim = 128,
+    .n_gdn_conv = 4,
+    .n_full_attn_interval = 4,
+    .n_indexer_compress = 4,
+    .n_hc_lowrank = 320,
+    .ple_layer = 1,
+    .n_ple_ngram = 3,
+    .n_ple_heads_per_ngram = 8,
+    .n_ple_head_dim = 160,
+    .n_ple_conv = 4,
+    .ple_eos_token = 248044,
+    .rms_eps = 1.0e-6f,
+    .rope_freq_base = 10000000.0f,
+    .rope_scale_factor = 1.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -747,6 +821,18 @@ static ds4_shape g_ds4_shape = {
 
 static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 
+/* qwen4exp PLE hash parameters.  The reference derives these from splitmix64
+ * plus a Miller-Rabin prime search; the GGUF carries them verbatim, so we load
+ * them and never reproduce that recipe -- reproducing it bit-exactly would be
+ * pure risk for no gain.  head_offsets partitions one shared table into
+ * DS4_N_PLE_HEAD disjoint row ranges, head_vocab holds each range's length. */
+static struct {
+    uint64_t multipliers[DS4_MAX_PLE_NGRAM];
+    uint64_t head_offsets[DS4_MAX_PLE_HEAD];
+    uint64_t head_vocab[DS4_MAX_PLE_HEAD];
+    uint64_t total_rows;
+} g_ds4_ple;
+
 #define DS4_MODEL_SHAPE_NAME          (g_ds4_shape.name)
 #define DS4_MODEL_FAMILY              (g_ds4_shape.family)
 #define DS4_MODEL_VARIANT             (g_ds4_shape.variant)
@@ -781,6 +867,22 @@ static uint32_t g_ds4_compress_ratios[DS4_MAX_LAYER] = {0};
 #define DS4_N_KDA_HEAD                (g_ds4_shape.n_kda_head)
 #define DS4_N_KDA_HEAD_DIM            (g_ds4_shape.n_kda_head_dim)
 #define DS4_N_KDA_CONV                (g_ds4_shape.n_kda_conv)
+#define DS4_N_GDN_KEY_HEAD            (g_ds4_shape.n_gdn_key_head)
+#define DS4_N_GDN_VALUE_HEAD          (g_ds4_shape.n_gdn_value_head)
+#define DS4_N_GDN_HEAD_DIM            (g_ds4_shape.n_gdn_head_dim)
+#define DS4_N_GDN_CONV                (g_ds4_shape.n_gdn_conv)
+#define DS4_N_FULL_ATTN_INTERVAL      (g_ds4_shape.n_full_attn_interval)
+#define DS4_N_INDEXER_COMPRESS        (g_ds4_shape.n_indexer_compress)
+#define DS4_N_HC_LOWRANK              (g_ds4_shape.n_hc_lowrank)
+#define DS4_PLE_LAYER                 (g_ds4_shape.ple_layer)
+#define DS4_N_PLE_NGRAM               (g_ds4_shape.n_ple_ngram)
+#define DS4_N_PLE_HEADS_PER_NGRAM     (g_ds4_shape.n_ple_heads_per_ngram)
+#define DS4_N_PLE_HEAD_DIM            (g_ds4_shape.n_ple_head_dim)
+#define DS4_N_PLE_CONV                (g_ds4_shape.n_ple_conv)
+#define DS4_PLE_EOS_TOKEN             (g_ds4_shape.ple_eos_token)
+/* Total hashed rows gathered per token: one block of heads_per_ngram heads for
+ * each n-gram order from 2 up to ngram_size. */
+#define DS4_N_PLE_HEAD                ((DS4_N_PLE_NGRAM - 1u) * DS4_N_PLE_HEADS_PER_NGRAM)
 #define DS4_RMS_EPS                   (g_ds4_shape.rms_eps)
 #define DS4_HC_EPS                    (g_ds4_shape.hc_eps)
 #define DS4_EXPERT_WEIGHT_SCALE       (g_ds4_shape.expert_weight_scale)
@@ -808,6 +910,43 @@ static bool ds4_glm53_layer_is_kda(uint32_t il) {
            il % 4u != 3u;
 }
 
+static bool ds4_model_is_qwen4exp(void) {
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP;
+}
+
+/* qwen4exp interleaves QSA sparse attention with gated DeltaNet: layer il is a
+ * full-attention layer when il + 1 is a multiple of the interval, so the last
+ * layer is always one.  The GGUF states this twice -- as the interval and as
+ * the per-layer compress_ratios array -- and config validation checks that the
+ * array agrees with this schedule, which is what the tensor set follows. */
+static bool ds4_qwen4exp_layer_is_full_attn(uint32_t il) {
+    return ds4_model_is_qwen4exp() &&
+           DS4_N_FULL_ATTN_INTERVAL != 0u &&
+           (il + 1u) % DS4_N_FULL_ATTN_INTERVAL == 0u;
+}
+
+/* The PLE block sits on exactly one layer and its 320M-row hash table is
+ * streamed from disk, so callers gate the whole PLE path on this. */
+static bool ds4_qwen4exp_layer_has_ple(uint32_t il) {
+    return ds4_model_is_qwen4exp() && DS4_N_PLE_NGRAM != 0u && il == DS4_PLE_LAYER;
+}
+
+/* Fill the streamer's parameter block from the validated shape and the PLE
+ * metadata the GGUF carried. */
+static void qwen4exp_ple_params(ds4_ple_params *p) {
+    memset(p, 0, sizeof(*p));
+    p->ngram_size      = DS4_N_PLE_NGRAM;
+    p->heads_per_ngram = DS4_N_PLE_HEADS_PER_NGRAM;
+    p->n_heads         = DS4_N_PLE_HEAD;
+    p->head_dim        = DS4_N_PLE_HEAD_DIM;
+    p->eos_token       = (int)DS4_PLE_EOS_TOKEN;
+    for (uint32_t i = 0; i < DS4_N_PLE_NGRAM; i++) p->multipliers[i] = g_ds4_ple.multipliers[i];
+    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+        p->head_offsets[h] = g_ds4_ple.head_offsets[h];
+        p->head_vocab[h]   = g_ds4_ple.head_vocab[h];
+    }
+}
+
 static int g_ds4_lock_fd = -1;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -827,10 +966,13 @@ static int g_ds4_lock_fd = -1;
  *   - Q5_K/Q6_K GLM routed experts
  *   - IQ2_XXS routed gate/up experts
  *   - MXFP4 routed experts preserved from native checkpoints
+ *   - Q5_1 routed down experts in Unsloth's qwen4exp mixes
+ *   - IQ4_NL rows of the qwen4exp PLE hash table
  *   - Q8_K temporary activation blocks for dot products
  */
 #define QK_K 256
 #define QK_MXFP4 32
+#define QK_LEGACY 32
 
 typedef struct {
     uint8_t  scales[QK_K / 16];
@@ -877,6 +1019,28 @@ typedef struct {
     uint8_t qs[QK_MXFP4 / 2];
 } block_mxfp4;
 
+/* Legacy 32-weight blocks.  Q5_1 carries a scale and a minimum with the fifth
+ * bit of every weight packed into qh; IQ4_NL is a scale plus 4-bit indices into
+ * a fixed 16-entry non-linear table.  ds4 reads both only because the Unsloth
+ * qwen4exp mixes use them: Q5_1 for most routed down experts, IQ4_NL for the
+ * PLE table, whose rows are exactly five of these blocks. */
+typedef struct {
+    uint16_t d;
+    uint16_t m;
+    uint8_t  qh[4];
+    uint8_t  qs[QK_LEGACY / 2];
+} block_q5_1;
+
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[QK_LEGACY / 2];
+} block_iq4_nl;
+
+/* kvalues_iq4nl from the reference; the 4-bit index selects one of these. */
+static DS4_MAYBE_UNUSED const int8_t ds4_iq4nl_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
@@ -885,6 +1049,8 @@ DS4_STATIC_ASSERT(ds4_block_q6_k_size, sizeof(block_q6_K) == 210);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
+DS4_STATIC_ASSERT(ds4_block_q5_1_size, sizeof(block_q5_1) == 24);
+DS4_STATIC_ASSERT(ds4_block_iq4_nl_size, sizeof(block_iq4_nl) == 18);
 
 typedef struct {
     uint32_t ctx_size;
@@ -2105,8 +2271,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2124,6 +2290,7 @@ enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
+    DS4_TENSOR_Q5_1     = 7,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
     DS4_TENSOR_Q4_K     = 12,
@@ -2131,6 +2298,7 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ4_NL   = 20,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
@@ -2153,6 +2321,12 @@ typedef struct {
     uint64_t bytes;
 } ds4_tensor;
 
+/* GGUF splits are mapped back to back inside one reserved virtual range, so a
+ * tensor keeps a single absolute offset and the rest of the engine -- span
+ * vectors, weight caching, Metal buffer slices -- never learns that the model
+ * spans files.  Only the pread paths need to undo this, via model_shard_of(). */
+#define DS4_MAX_SHARDS 32
+
 typedef struct {
     int fd;
     const uint8_t *map;
@@ -2165,9 +2339,28 @@ typedef struct {
     uint64_t tensor_data_pos;
     uint64_t max_tensor_bytes;
 
+    uint32_t n_shards;
+    int      shard_fd[DS4_MAX_SHARDS];
+    uint64_t shard_base[DS4_MAX_SHARDS];
+    uint64_t shard_size[DS4_MAX_SHARDS];
+
     ds4_kv *kv;
     ds4_tensor *tensors;
 } ds4_model;
+
+/* Map an absolute offset in the joined mapping back to the file that holds it.
+ * Returns the shard index and writes the offset within that file. */
+static DS4_MAYBE_UNUSED uint32_t model_shard_of(const ds4_model *m, uint64_t abs_offset,
+                                               uint64_t *file_offset) {
+    for (uint32_t i = m->n_shards; i-- > 0; ) {
+        if (abs_offset >= m->shard_base[i]) {
+            if (file_offset) *file_offset = abs_offset - m->shard_base[i];
+            return i;
+        }
+    }
+    if (file_offset) *file_offset = abs_offset;
+    return 0;
+}
 
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
@@ -2317,6 +2510,39 @@ static bool model_get_token_id(const ds4_model *m, const char *key, int *out) {
     }
 }
 
+/* GGUF split keys are written as uint16 by llama-gguf-split while other
+ * producers use uint32, so accept any unsigned width that fits. */
+static bool model_get_u32_compat(const ds4_model *m, const char *key, uint32_t *out) {
+    ds4_kv *kv = model_find_kv(m, key);
+    if (!kv) return false;
+
+    ds4_cursor c = cursor_at(m, kv->value_pos);
+    switch (kv->type) {
+    case GGUF_VALUE_UINT16: {
+        uint16_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v))) return false;
+        *out = v;
+        return true;
+    }
+    case GGUF_VALUE_INT16: {
+        int16_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (uint32_t)v;
+        return true;
+    }
+    case GGUF_VALUE_UINT32:
+        return cursor_u32(&c, out);
+    case GGUF_VALUE_INT32: {
+        int32_t v = 0;
+        if (!cursor_read(&c, &v, sizeof(v)) || v < 0) return false;
+        *out = (uint32_t)v;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
 static bool model_get_u64_compat(const ds4_model *m, const char *key, uint64_t *out) {
     ds4_kv *kv = model_find_kv(m, key);
     if (!kv) return false;
@@ -2392,8 +2618,12 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+    /* One reservation covers every shard, so a single munmap releases them all;
+     * the per-shard descriptors still have to be closed one by one. */
     if (m->map) munmap((void *)m->map, (size_t)m->size);
-    if (m->fd >= 0) close(m->fd);
+    for (uint32_t i = 0; i < DS4_MAX_SHARDS; i++) {
+        if (m->shard_fd[i] >= 0) close(m->shard_fd[i]);
+    }
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 }
@@ -2458,16 +2688,19 @@ static void parse_metadata(ds4_model *m, ds4_cursor *c) {
 
 /* Read the tensor directory and convert relative GGUF offsets to absolute
  * mmap offsets.  Tensor bytes are still never copied here. */
-static void parse_tensors(ds4_model *m, ds4_cursor *c) {
-    /* As in parse_metadata: each tensor directory entry needs at least one byte
-     * in the file, so reject a count larger than the bytes remaining before the
-     * allocation. */
-    if (m->n_tensors > c->size - c->pos) ds4_die("GGUF tensor count exceeds file size");
-    m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
-    if (!m->tensors) ds4_die("out of memory while allocating tensor table");
+/* Parse one shard's tensor directory into m->tensors[dst .. dst+count).  `c`
+ * must sit right after that shard's metadata table.  Offsets are rebased onto
+ * the shard's slot in the joined mapping, so callers downstream see one flat
+ * address space.  Returns the shard's own tensor_data_pos, already rebased. */
+static uint64_t parse_tensor_directory(ds4_model *m, ds4_cursor *c, uint32_t shard,
+                                       uint64_t count, uint64_t dst) {
+    const uint64_t shard_base = m->shard_base[shard];
+    const uint64_t shard_end  = shard_base + m->shard_size[shard];
 
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        ds4_tensor *t = &m->tensors[i];
+    if (count > c->size - c->pos) ds4_die("GGUF tensor count exceeds file size");
+
+    for (uint64_t i = 0; i < count; i++) {
+        ds4_tensor *t = &m->tensors[dst + i];
 
         if (!cursor_string(c, &t->name)) ds4_die(c->error);
         if (!cursor_u32(c, &t->ndim)) ds4_die(c->error);
@@ -2495,33 +2728,125 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         }
     }
 
-    m->tensor_data_pos = align_up(c->pos, m->alignment);
+    /* shard_base is page aligned and the GGUF alignment divides a page, so
+     * aligning the joined position is the same as aligning the file position. */
+    const uint64_t data_pos = align_up(c->pos, m->alignment);
 
-    for (uint64_t i = 0; i < m->n_tensors; i++) {
-        ds4_tensor *t = &m->tensors[i];
-        if (t->rel_offset > UINT64_MAX - m->tensor_data_pos) {
-            ds4_die("tensor offset overflow");
-        }
-        t->abs_offset = m->tensor_data_pos + t->rel_offset;
+    for (uint64_t i = 0; i < count; i++) {
+        ds4_tensor *t = &m->tensors[dst + i];
+        if (t->rel_offset > UINT64_MAX - data_pos) ds4_die("tensor offset overflow");
+        t->abs_offset = data_pos + t->rel_offset;
+        /* Bound against this shard, not the joined mapping: a tensor that ran
+         * past its own file would otherwise read the next shard's header. */
         if (t->bytes != 0 &&
-            (t->abs_offset > m->size || t->bytes > m->size - t->abs_offset))
+            (t->abs_offset > shard_end || t->bytes > shard_end - t->abs_offset))
         {
-            ds4_die("tensor points outside GGUF file");
+            ds4_die("tensor points outside its GGUF shard");
         }
         if (t->bytes > m->max_tensor_bytes) {
             m->max_tensor_bytes = t->bytes;
         }
     }
+    return data_pos;
 }
 
 /* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
  * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
  * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
  * walks the huge tensor payload. */
+/* Read one shard's GGUF header at `pos` in the joined mapping. */
+static void model_read_shard_header(ds4_model *m, uint64_t pos,
+                                    uint64_t *n_tensors, uint64_t *n_kv,
+                                    ds4_cursor *out) {
+    ds4_cursor c = cursor_at(m, pos);
+    uint32_t magic = 0, version = 0;
+    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+    if (!cursor_u32(&c, &version)) ds4_die(c.error);
+    if (!cursor_u64(&c, n_tensors)) ds4_die(c.error);
+    if (!cursor_u64(&c, n_kv)) ds4_die(c.error);
+    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+    if (version != 3) ds4_die("only GGUF v3 is supported");
+    m->version = version;
+    *out = c;
+}
+
+/* Build the path of shard `no` (0 based) of a GGUF split, given any shard's
+ * path.  llama.cpp names them "<prefix>-%05u-of-%05u.gguf" and that is the only
+ * layout ds4 accepts: guessing looser patterns would risk stitching together
+ * files that are not the same model. */
+static bool model_split_path(const char *path, uint32_t no, uint32_t count,
+                             char *out, size_t out_cap) {
+    const size_t len = strlen(path);
+    /* "-00001-of-00004.gguf" is 20 characters. */
+    const size_t suffix = 20;
+    if (len < suffix) return false;
+    const char *tail = path + len - suffix;
+    unsigned a = 0, b = 0;
+    char probe[8] = {0};
+    if (sscanf(tail, "-%05u-of-%05u%7s", &a, &b, probe) != 3) return false;
+    if (strcmp(probe, ".gguf") != 0) return false;
+    if (b != count) return false;
+    const int n = snprintf(out, out_cap, "%.*s-%05u-of-%05u.gguf",
+                           (int)(len - suffix), path, no + 1u, count);
+    return n > 0 && (size_t)n < out_cap;
+}
+
+/* Map every shard of a split back to back into one reserved range.  Shard 0
+ * lands at offset 0, so a single-file model and the first shard of a split have
+ * identical addresses and every offset the rest of the engine holds stays
+ * valid. */
+static void model_map_split(ds4_model *m, const char *path, uint32_t count,
+                            int mmap_flags) {
+    if (count > DS4_MAX_SHARDS) ds4_die("GGUF split has more shards than ds4 supports");
+
+    /* Each shard has to start on a page boundary for MAP_FIXED, so shard sizes
+     * are rounded up and small gaps appear between them.  The reservation is
+     * PROT_READ anonymous memory, which leaves those gaps as readable zero
+     * pages: whole-range scans such as model_warm_weights() can then walk
+     * [tensor_data_pos, size) without knowing where the shards end. */
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    char paths[DS4_MAX_SHARDS][4096];
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!model_split_path(path, i, count, paths[i], sizeof(paths[i]))) {
+            ds4_die("GGUF split shard name does not follow -%05u-of-%05u.gguf");
+        }
+        struct stat st;
+        if (stat(paths[i], &st) == -1) ds4_die_errno("cannot stat model shard", paths[i]);
+        if (st.st_size < 32) ds4_die("model shard is too small to be GGUF");
+        m->shard_size[i] = (uint64_t)st.st_size;
+        m->shard_base[i] = total;
+        total += align_up((uint64_t)st.st_size, page);
+    }
+
+    /* Reserve the whole range first so the shards are guaranteed adjacent. */
+    void *base = mmap(NULL, (size_t)total, PROT_READ,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) ds4_die_errno("cannot reserve model address space", path);
+
+    for (uint32_t i = 0; i < count; i++) {
+        const int fd = open(paths[i], O_RDONLY);
+        if (fd == -1) ds4_die_errno("cannot open model shard", paths[i]);
+        void *want = (uint8_t *)base + m->shard_base[i];
+        void *got = mmap(want, (size_t)m->shard_size[i], PROT_READ,
+                         mmap_flags | MAP_FIXED, fd, 0);
+        if (got != want) ds4_die_errno("cannot mmap model shard", paths[i]);
+        m->shard_fd[i] = fd;
+    }
+
+    m->n_shards = count;
+    m->map = (const uint8_t *)base;
+    m->size = total;
+    m->fd = m->shard_fd[0];
+}
+
+/* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
+ * MTLBuffer slices; the CPU path uses a private one (see the note below). */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
                        bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
+    for (uint32_t i = 0; i < DS4_MAX_SHARDS; i++) m->shard_fd[i] = -1;
 
     int fd = open(path, O_RDONLY);
     if (fd == -1) ds4_die_errno("cannot open model", path);
@@ -2549,19 +2874,80 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->n_shards = 1;
+    m->shard_fd[0] = fd;
+    m->shard_base[0] = 0;
+    m->shard_size[0] = m->size;
 
-    ds4_cursor c = cursor_at(m, 0);
-    uint32_t magic;
-    if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
-
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
-
+    ds4_cursor c;
+    model_read_shard_header(m, 0, &m->n_tensors, &m->n_kv, &c);
     parse_metadata(m, &c);
-    parse_tensors(m, &c);
+
+    /* A split carries its shard count in metadata.  Only the first shard may be
+     * named on the command line: the others have no metadata table of their own
+     * beyond the split keys, so the model is undescribed without it. */
+    uint32_t split_count = 1;
+    (void)model_get_u32_compat(m, "split.count", &split_count);
+    if (split_count > 1) {
+        uint32_t split_no = 0;
+        (void)model_get_u32_compat(m, "split.no", &split_no);
+        if (split_no != 0) ds4_die("point ds4 at shard 00001 of a GGUF split");
+
+        /* ds4_kv and ds4_tensor keep pointers into the mapping, so drop what we
+         * parsed and redo it once every shard is in place.  Shard 0 keeps
+         * offset 0, so nothing outside this function can tell the difference. */
+        free(m->kv);
+        m->kv = NULL;
+        munmap(map, (size_t)st.st_size);
+        close(fd);
+        memset(m->shard_fd, -1, sizeof(m->shard_fd));
+        m->fd = -1;
+        m->map = NULL;
+
+        model_map_split(m, path, split_count, mmap_flags);
+
+        uint64_t counts[DS4_MAX_SHARDS] = {0};
+        uint64_t cursors[DS4_MAX_SHARDS] = {0};
+        uint64_t total_tensors = 0;
+        for (uint32_t i = 0; i < m->n_shards; i++) {
+            uint64_t n_kv = 0;
+            ds4_cursor sc;
+            model_read_shard_header(m, m->shard_base[i], &counts[i], &n_kv, &sc);
+            if (i == 0) {
+                m->n_kv = n_kv;
+                parse_metadata(m, &sc);
+            } else {
+                /* Trailing shards repeat only the split keys; skip them. */
+                for (uint64_t k = 0; k < n_kv; k++) {
+                    ds4_str key;
+                    uint32_t type = 0;
+                    if (!cursor_string(&sc, &key)) ds4_die(sc.error);
+                    if (!cursor_u32(&sc, &type)) ds4_die(sc.error);
+                    if (!skip_value(&sc, type, 0)) ds4_die(sc.error);
+                }
+            }
+            cursors[i] = sc.pos;
+            total_tensors += counts[i];
+        }
+
+        m->n_tensors = total_tensors;
+        m->tensors = calloc((size_t)m->n_tensors, sizeof(m->tensors[0]));
+        if (!m->tensors) ds4_die("out of memory while allocating tensor table");
+
+        uint64_t dst = 0;
+        for (uint32_t i = 0; i < m->n_shards; i++) {
+            ds4_cursor sc = cursor_at(m, cursors[i]);
+            const uint64_t data_pos =
+                    parse_tensor_directory(m, &sc, i, counts[i], dst);
+            if (i == 0) m->tensor_data_pos = data_pos;
+            dst += counts[i];
+        }
+    } else {
+        m->tensors = calloc((size_t)(m->n_tensors ? m->n_tensors : 1),
+                            sizeof(m->tensors[0]));
+        if (!m->tensors) ds4_die("out of memory while allocating tensor table");
+        m->tensor_data_pos = parse_tensor_directory(m, &c, 0, m->n_tensors, 0);
+    }
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
 }
@@ -2609,6 +2995,11 @@ typedef enum {
     DS4_SUPPORT_NONE = 0,
     DS4_SUPPORT_MTP_LEGACY,
     DS4_SUPPORT_DSPARK,
+    /* Qwen3.8-Flash-Next's own multi-token-prediction head, built by
+     * gguf-tools/qwen4exp_mtp_quantize.py.  One full-attention decoder layer
+     * named blk.0.* -- the same names the qwen4exp layer binder already uses
+     * -- plus the mtp.* projections that turn (token, hidden) into its input. */
+    DS4_SUPPORT_QWEN4EXP_MTP,
 } ds4_support_kind;
 
 static bool model_get_u32_any(const ds4_model *m, const char *const *keys,
@@ -2758,6 +3149,28 @@ static void model_print_dspark_summary(const ds4_model *m) {
     }
 }
 
+/* Read `<arch>.<suffix>` for whichever architecture the file declares.  The
+ * summary is printed before any shape is selected, so it cannot go through the
+ * DS4_N_* macros; keying off general.architecture keeps it working for every
+ * family without a per-arch fallback chain. */
+static bool model_get_arch_u32(const ds4_model *m, ds4_str arch,
+                               const char *suffix, uint32_t *out) {
+    char key[128];
+    if (snprintf(key, sizeof(key), "%.*s.%s", (int)arch.len, arch.ptr, suffix) >= (int)sizeof(key)) {
+        return false;
+    }
+    return model_get_u32(m, key, out);
+}
+
+static bool model_get_arch_u64(const ds4_model *m, ds4_str arch,
+                               const char *suffix, uint64_t *out) {
+    char key[128];
+    if (snprintf(key, sizeof(key), "%.*s.%s", (int)arch.len, arch.ptr, suffix) >= (int)sizeof(key)) {
+        return false;
+    }
+    return model_get_u64_compat(m, key, out);
+}
+
 static void model_summary(const ds4_model *m) {
     ds4_str name = {0};
     ds4_str arch = {0};
@@ -2778,44 +3191,24 @@ static void model_summary(const ds4_model *m) {
     uint64_t params = 0;
 
     model_get_string(m, "general.name", &name);
-    model_get_string(m, "general.architecture", &arch);
-    if (!model_get_u32(m, "deepseek4.block_count", &layers)) {
-        model_get_u32(m, "glm-dsa.block_count", &layers);
+    if (!model_get_string(m, "general.architecture", &arch)) {
+        arch.ptr = "deepseek4";
+        arch.len = 9;
     }
-    if (!model_get_u64_compat(m, "deepseek4.context_length", &ctx_train)) {
-        model_get_u64_compat(m, "glm-dsa.context_length", &ctx_train);
-    }
-    if (!model_get_u32(m, "deepseek4.attention.head_count", &n_head)) {
-        model_get_u32(m, "glm-dsa.attention.head_count", &n_head);
-    }
-    if (!model_get_u32(m, "deepseek4.attention.head_count_kv", &n_head_kv)) {
-        model_get_u32(m, "glm-dsa.attention.head_count_kv", &n_head_kv);
-    }
-    if (!model_get_u32(m, "deepseek4.attention.key_length", &head_dim)) {
-        model_get_u32(m, "glm-dsa.attention.key_length", &head_dim);
-    }
-    model_get_u32(m, "deepseek4.attention.sliding_window", &n_swa);
-    if (!model_get_u32(m, "deepseek4.attention.indexer.head_count", &indexer_heads)) {
-        model_get_u32(m, "glm-dsa.attention.indexer.head_count", &indexer_heads);
-    }
-    if (!model_get_u32(m, "deepseek4.attention.indexer.key_length", &indexer_head_dim)) {
-        model_get_u32(m, "glm-dsa.attention.indexer.key_length", &indexer_head_dim);
-    }
-    if (!model_get_u32(m, "deepseek4.attention.indexer.top_k", &indexer_top_k)) {
-        model_get_u32(m, "glm-dsa.attention.indexer.top_k", &indexer_top_k);
-    }
-    if (!model_get_u32(m, "deepseek4.expert_count", &n_expert)) {
-        model_get_u32(m, "glm-dsa.expert_count", &n_expert);
-    }
-    if (!model_get_u32(m, "deepseek4.expert_used_count", &n_expert_used)) {
-        model_get_u32(m, "glm-dsa.expert_used_count", &n_expert_used);
-    }
-    if (!model_get_u32(m, "deepseek4.expert_group_count", &n_expert_groups)) {
-        model_get_u32(m, "glm-dsa.expert_group_count", &n_expert_groups);
-    }
-    if (!model_get_u32(m, "deepseek4.expert_group_used_count", &n_group_used)) {
-        model_get_u32(m, "glm-dsa.expert_group_used_count", &n_group_used);
-    }
+
+    model_get_arch_u32(m, arch, "block_count", &layers);
+    model_get_arch_u64(m, arch, "context_length", &ctx_train);
+    model_get_arch_u32(m, arch, "attention.head_count", &n_head);
+    model_get_arch_u32(m, arch, "attention.head_count_kv", &n_head_kv);
+    model_get_arch_u32(m, arch, "attention.key_length", &head_dim);
+    model_get_arch_u32(m, arch, "attention.sliding_window", &n_swa);
+    model_get_arch_u32(m, arch, "attention.indexer.head_count", &indexer_heads);
+    model_get_arch_u32(m, arch, "attention.indexer.key_length", &indexer_head_dim);
+    model_get_arch_u32(m, arch, "attention.indexer.top_k", &indexer_top_k);
+    model_get_arch_u32(m, arch, "expert_count", &n_expert);
+    model_get_arch_u32(m, arch, "expert_used_count", &n_expert_used);
+    model_get_arch_u32(m, arch, "expert_group_count", &n_expert_groups);
+    model_get_arch_u32(m, arch, "expert_group_used_count", &n_group_used);
 
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
@@ -2826,6 +3219,7 @@ static void model_summary(const ds4_model *m) {
     printf("arch:  %.*s\n", (int)arch.len, arch.ptr);
     printf("gguf:  v%u, %" PRIu64 " metadata keys, %" PRIu64 " tensors\n",
         m->version, m->n_kv, m->n_tensors);
+    if (m->n_shards > 1) printf("split: %u shards mapped as one range\n", m->n_shards);
     if (layers) printf("layers: %u\n", layers);
     if (ctx_train) printf("train context: %" PRIu64 "\n", ctx_train);
     if (n_head || n_head_kv || head_dim || n_swa) {
@@ -2881,9 +3275,10 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 
 static const char *support_kind_name(ds4_support_kind kind) {
     switch (kind) {
-    case DS4_SUPPORT_MTP_LEGACY: return "legacy MTP";
-    case DS4_SUPPORT_DSPARK:     return "DSpark";
-    case DS4_SUPPORT_NONE:       return "none";
+    case DS4_SUPPORT_MTP_LEGACY:   return "legacy MTP";
+    case DS4_SUPPORT_DSPARK:       return "DSpark";
+    case DS4_SUPPORT_QWEN4EXP_MTP: return "qwen4exp MTP";
+    case DS4_SUPPORT_NONE:         return "none";
     }
     return "unknown";
 }
@@ -2895,6 +3290,16 @@ static ds4_support_kind support_model_detect(
     if (stages_out) *stages_out = 0;
     if (summary_out) memset(summary_out, 0, sizeof(*summary_out));
     if (!m) return DS4_SUPPORT_NONE;
+
+    /* Checked before the DSpark probe: the qwen4exp head shares no tensor
+     * names with either of the older two, and its architecture key is
+     * unambiguous. */
+    if (model_find_tensor(m, "mtp.fc_embedding.weight") &&
+        model_find_tensor(m, "mtp.fc_hidden.weight") &&
+        model_find_tensor(m, "blk.0.ffn_gate_exps.weight")) {
+        if (stages_out) *stages_out = 1u;
+        return DS4_SUPPORT_QWEN4EXP_MTP;
+    }
 
     ds4_dspark_summary s = model_dspark_summary(m);
     if (summary_out) *summary_out = s;
@@ -3115,7 +3520,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (backend != DS4_BACKEND_CUDA) return true;
     if (!m || !m->map || m->size == 0) return false;
 #ifndef DS4_ROCM_BUILD
-    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL) {
+    /* Nothing to prepare when the weights are addressed where they lie. */
+    if (getenv("DS4_CUDA_DIRECT_MODEL") != NULL ||
+        ds4_gpu_direct_model_mapping_active()) {
         return true;
     }
 #endif
@@ -3125,7 +3532,15 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     if (!accelerator_prepare_model_tensor_spans(m, span_offsets, span_sizes, span_count, &prepared)) {
         return false;
     }
-    if (!accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) return false;
+    /* The dequantized-f16 prefill cache selects tensors by DeepSeek/GLM name
+     * and shape.  On qwen4exp the only names it matches are the shared
+     * expert's, where it replaces the exact Q8_0 dot product with an f16
+     * GEMM: prefill logits then drift about 0.3%, which is enough to send a
+     * greedy continuation somewhere else entirely.  Keep the exact path. */
+    if (!ds4_model_is_qwen4exp() &&
+        !accelerator_cache_q8_tensors(m, span_offsets, span_sizes, span_count)) {
+        return false;
+    }
     const double t1 = now_sec();
 #ifdef DS4_ROCM_BUILD
     const char *accelerator_name = "ROCm";
@@ -4244,6 +4659,57 @@ typedef struct {
     ds4_tensor *nextn_enorm;
     ds4_tensor *nextn_hnorm;
     ds4_tensor *nextn_shared_head_norm;
+
+    /* ---- qwen4exp ----------------------------------------------------
+     * Hyper-connections here are a low-rank mix (norm, down, up) plus one
+     * injection logit per stream, and there is a pair per block: one feeding
+     * the token mixer, one feeding the MoE.  They replace the pre-norms
+     * entirely -- qwen4exp has no attn_norm or ffn_norm. */
+    ds4_tensor *hc_attn_norm;
+    ds4_tensor *hc_attn_down;
+    ds4_tensor *hc_attn_up;
+    ds4_tensor *hc_attn_inject;
+    ds4_tensor *hc_ffn_norm;
+    ds4_tensor *hc_ffn_down;
+    ds4_tensor *hc_ffn_up;
+    ds4_tensor *hc_ffn_inject;
+
+    /* QSA layers.  qsa_q fuses the query with its per-head output gate, so it
+     * is twice the query width and must be split per head, not down the
+     * middle.  The indexer is a separate 4-head scorer over compressed keys. */
+    ds4_tensor *qsa_q;
+    ds4_tensor *qsa_k;
+    ds4_tensor *qsa_v;
+    ds4_tensor *qsa_q_norm;
+    ds4_tensor *qsa_k_norm;
+    ds4_tensor *idx_q;
+    ds4_tensor *idx_k;
+    ds4_tensor *idx_q_norm;
+    ds4_tensor *idx_k_norm;
+
+    /* Gated DeltaNet layers.  The GGUF calls the in-projection attn_qkv, the
+     * output gate attn_gate and the out-projection ssm_out; they are the
+     * linear-attention operator's tensors, not attention ones. */
+    ds4_tensor *gdn_qkv;
+    ds4_tensor *gdn_gate;
+    ds4_tensor *gdn_conv1d;
+    ds4_tensor *gdn_a;
+    ds4_tensor *gdn_alpha;
+    ds4_tensor *gdn_beta;
+    ds4_tensor *gdn_dt_bias;
+    ds4_tensor *gdn_norm;
+    ds4_tensor *gdn_out;
+
+    /* PLE block, bound on one layer only. */
+    ds4_tensor *ple_key;
+    ds4_tensor *ple_value;
+    ds4_tensor *ple_norm_key;
+    ds4_tensor *ple_norm_query;
+    ds4_tensor *ple_norm_conv;
+    ds4_tensor *ple_conv1d;
+
+    /* Scalar sigmoid gate on the shared expert. */
+    ds4_tensor *ffn_gate_inp_shexp;
 } ds4_layer_weights;
 
 typedef struct {
@@ -4253,6 +4719,16 @@ typedef struct {
     ds4_tensor *output_hc_scale;
     ds4_tensor *output_norm;
     ds4_tensor *output;
+    /* qwen4exp collapses its four residual streams with one last hyper-
+     * connection mix, and that mix *is* the output norm: there is no separate
+     * output_norm tensor in the file. */
+    ds4_tensor *output_mix_norm;
+    ds4_tensor *output_mix_down;
+    ds4_tensor *output_mix_up;
+    /* The 320M x 160 PLE hash table.  Named at model scope in the file even
+     * though a single layer reads it; it is never resident, so only its offset
+     * and extent are used. */
+    ds4_tensor *ple_table;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
@@ -4267,6 +4743,27 @@ typedef struct {
     ds4_tensor *hc_head_scale;
     ds4_layer_weights block;
 } ds4_mtp_weights;
+
+/* Qwen3.8-Flash-Next's MTP head.  The draft step is
+ *   emb = fc_embedding(pre_fc_norm_embedding(embed(t)))
+ *   h   = fc_hidden(pre_fc_norm_hidden(res_10240) per 2560 stream)
+ *   h   = broadcast(emb) + h                      -> [T, 10240]
+ *   h   = block(h)                                 one full-attention layer
+ *   (multi_hidden, sample_hidden) = mix(hc_*)      the mixer has no inject
+ * `res_10240` on the first step is the target's pre-final-mixer residual, and
+ * on later steps the previous draft step's multi_hidden.
+ * See vllm/models/qwen4_exp/nvidia/mtp.py:272-338. */
+typedef struct {
+    ds4_tensor *pre_fc_norm_embedding;
+    ds4_tensor *pre_fc_norm_hidden;
+    ds4_tensor *fc_embedding;
+    ds4_tensor *fc_hidden;
+    ds4_tensor *hc_norm;
+    ds4_tensor *hc_down;
+    ds4_tensor *hc_up;
+    ds4_layer_weights block;
+    bool        ready;
+} ds4_q4e_mtp_weights;
 
 typedef struct {
     ds4_tensor *main_proj;
@@ -4525,6 +5022,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
+           type == DS4_TENSOR_Q5_1 ||
            type == DS4_TENSOR_MXFP4;
 }
 
@@ -4536,6 +5034,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
+    case DS4_TENSOR_Q5_1:    return sizeof(block_q5_1);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
     default:                 ds4_die("unsupported routed expert tensor type");
     }
@@ -4962,8 +5461,42 @@ static bool weights_glm_dsa_layer_has_required(const ds4_layer_weights *l, uint3
     return true;
 }
 
+/* Every qwen4exp layer needs both hyper-connection blocks and the whole MoE;
+ * which token mixer it needs depends on the layer schedule, and the PLE block
+ * is required on exactly the one layer that declares it. */
+static bool weights_qwen4exp_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
+    if (!l->hc_attn_norm || !l->hc_attn_down || !l->hc_attn_up || !l->hc_attn_inject ||
+        !l->hc_ffn_norm  || !l->hc_ffn_down  || !l->hc_ffn_up  || !l->hc_ffn_inject) {
+        return false;
+    }
+    if (ds4_qwen4exp_layer_is_full_attn(il)) {
+        if (!l->qsa_q || !l->qsa_k || !l->qsa_v || !l->qsa_q_norm || !l->qsa_k_norm ||
+            !l->attn_output ||
+            !l->idx_q || !l->idx_k || !l->idx_q_norm || !l->idx_k_norm) {
+            return false;
+        }
+    } else {
+        if (!l->gdn_qkv || !l->gdn_gate || !l->gdn_conv1d || !l->gdn_a || !l->gdn_alpha ||
+            !l->gdn_beta || !l->gdn_dt_bias || !l->gdn_norm || !l->gdn_out) {
+            return false;
+        }
+    }
+    if (ds4_qwen4exp_layer_has_ple(il)) {
+        if (!l->ple_key || !l->ple_value || !l->ple_norm_key || !l->ple_norm_query ||
+            !l->ple_norm_conv || !l->ple_conv1d) {
+            return false;
+        }
+    }
+    return l->ffn_gate_inp && l->ffn_gate_inp_shexp &&
+           l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+           l->ffn_gate_shexp && l->ffn_up_shexp && l->ffn_down_shexp;
+}
+
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
     if (!l) return false;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        return weights_qwen4exp_layer_has_required(l, il);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return weights_glm_dsa_layer_has_required(l, il);
     }
@@ -5193,12 +5726,123 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
+static void weights_validate_qwen4exp_layout(
+        const ds4_weights *w,
+        uint32_t           layer_start,
+        uint32_t           layer_end,
+        bool               require_token_embd,
+        bool               require_output) {
+    if (!w) ds4_die("internal error: missing weights while validating layout");
+    if (layer_start >= DS4_N_LAYER) ds4_die("invalid first layer in weight layout validation");
+    if (layer_end == UINT32_MAX) layer_end = DS4_N_LAYER - 1u;
+    if (layer_end >= DS4_N_LAYER || layer_end < layer_start) {
+        ds4_die("invalid last layer in weight layout validation");
+    }
+
+    /* The residual is hc streams wide; q_dim counts the query heads only, and
+     * qsa_q is twice that because the per-head output gate rides along. */
+    const uint64_t hc_dim  = (uint64_t)DS4_N_EMBD * DS4_N_HC;
+    const uint64_t q_dim   = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t kv_dim  = (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM;
+    const uint64_t idx_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const uint64_t gdn_k   = (uint64_t)DS4_N_GDN_KEY_HEAD * DS4_N_GDN_HEAD_DIM;
+    const uint64_t gdn_v   = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM;
+    const uint64_t gdn_in  = 2u * gdn_k + gdn_v;
+
+    if (require_token_embd) {
+        tensor_expect_glm_dense_quant_layout(w->token_embd, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    if (require_output) {
+        tensor_expect_layout(w->output_mix_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+        tensor_expect_glm_dense_quant_layout(w->output_mix_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_glm_dense_quant_layout(w->output_mix_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_glm_dense_quant_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
+    }
+    if (w->ple_table) {
+        tensor_expect_layout(w->ple_table, DS4_TENSOR_IQ4_NL, 2,
+                             DS4_N_PLE_HEAD_DIM, w->ple_table->dim[1], 0);
+        if (w->ple_table->dim[1] < g_ds4_ple.total_rows) {
+            ds4_die("qwen4exp PLE table has fewer rows than the head vocabularies address");
+        }
+    }
+
+    for (uint32_t il = layer_start; il <= layer_end; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!weights_layer_has_required(l, il)) {
+            fprintf(stderr, "ds4: qwen4exp layer %u is missing required tensors\n", il);
+            exit(1);
+        }
+
+        tensor_expect_layout(l->hc_attn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+        tensor_expect_glm_dense_quant_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_glm_dense_quant_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_layout(l->hc_attn_inject, DS4_TENSOR_F32, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_layout(l->hc_ffn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+        tensor_expect_glm_dense_quant_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
+        tensor_expect_glm_dense_quant_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
+        tensor_expect_layout(l->hc_ffn_inject, DS4_TENSOR_F32, 2, hc_dim, DS4_N_HC, 0);
+
+        if (ds4_qwen4exp_layer_is_full_attn(il)) {
+            tensor_expect_glm_dense_quant_layout(l->qsa_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
+            tensor_expect_glm_dense_quant_layout(l->qsa_k, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_glm_dense_quant_layout(l->qsa_v, 2, DS4_N_EMBD, kv_dim, 0);
+            tensor_expect_layout(l->qsa_q_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->qsa_k_norm, DS4_TENSOR_F32, 1, DS4_N_HEAD_DIM, 0, 0);
+            tensor_expect_glm_dense_quant_layout(l->attn_output, 2, q_dim, DS4_N_EMBD, 0);
+            tensor_expect_glm_dense_quant_layout(l->idx_q, 2, DS4_N_EMBD, idx_dim, 0);
+            tensor_expect_glm_dense_quant_layout(l->idx_k, 2, DS4_N_EMBD, DS4_N_INDEXER_HEAD_DIM, 0);
+            tensor_expect_layout(l->idx_q_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+            tensor_expect_layout(l->idx_k_norm, DS4_TENSOR_F32, 1, DS4_N_INDEXER_HEAD_DIM, 0, 0);
+        } else {
+            tensor_expect_glm_dense_quant_layout(l->gdn_qkv, 2, DS4_N_EMBD, gdn_in, 0);
+            tensor_expect_glm_dense_quant_layout(l->gdn_gate, 2, DS4_N_EMBD, gdn_v, 0);
+            tensor_expect_layout(l->gdn_conv1d, DS4_TENSOR_F32, 2, DS4_N_GDN_CONV, gdn_in, 0);
+            tensor_expect_layout(l->gdn_a, DS4_TENSOR_F32, 1, DS4_N_GDN_VALUE_HEAD, 0, 0);
+            tensor_expect_layout(l->gdn_alpha, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
+            tensor_expect_layout(l->gdn_beta, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
+            tensor_expect_layout(l->gdn_dt_bias, DS4_TENSOR_F32, 1, DS4_N_GDN_VALUE_HEAD, 0, 0);
+            tensor_expect_layout(l->gdn_norm, DS4_TENSOR_F32, 1, DS4_N_GDN_HEAD_DIM, 0, 0);
+            tensor_expect_glm_dense_quant_layout(l->gdn_out, 2, gdn_v, DS4_N_EMBD, 0);
+        }
+
+        if (ds4_qwen4exp_layer_has_ple(il)) {
+            tensor_expect_glm_dense_quant_layout(l->ple_key, 2, DS4_N_EMBD, hc_dim, 0);
+            tensor_expect_glm_dense_quant_layout(l->ple_value, 2, DS4_N_EMBD, DS4_N_EMBD, 0);
+            tensor_expect_layout(l->ple_norm_key, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+            tensor_expect_layout(l->ple_norm_query, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+            tensor_expect_layout(l->ple_norm_conv, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
+            tensor_expect_layout(l->ple_conv1d, DS4_TENSOR_F32, 2, DS4_N_PLE_CONV, hc_dim, 0);
+            if (!w->ple_table) ds4_die("qwen4exp PLE layer is bound without its hash table");
+        }
+
+        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_up_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+        tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+        /* Gate and up share one kernel, so they must share a quant type. */
+        if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
+            fprintf(stderr,
+                    "ds4: qwen4exp layer %u routed gate and up have different quant types\n", il);
+            exit(1);
+        }
+        tensor_expect_glm_dense_quant_layout(l->ffn_gate_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_glm_dense_quant_layout(l->ffn_up_shexp, 2, DS4_N_EMBD, DS4_N_FF_EXP, 0);
+        tensor_expect_glm_dense_quant_layout(l->ffn_down_shexp, 2, DS4_N_FF_EXP, DS4_N_EMBD, 0);
+    }
+}
+
 static void weights_validate_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
         uint32_t           layer_end,
         bool               require_token_embd,
         bool               require_output) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        weights_validate_qwen4exp_layout(w, layer_start, layer_end,
+                                         require_token_embd, require_output);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_validate_glm_dsa_layout(w,
                                         layer_start,
@@ -6094,6 +6738,185 @@ static void config_validate_glm53_model(const ds4_model *m) {
     config_validate_glm53_layer_types(m);
 }
 
+/* Read a u64 metadata array into out[], requiring exactly `want` entries.  The
+ * PLE tables are the only u64 arrays ds4 reads, and they must be complete: a
+ * short table would silently mis-address the 320M-row hash. */
+static void qwen4exp_read_u64_array(const ds4_model *m, const char *key,
+                                    uint64_t *out, uint32_t want) {
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) ||
+        (arr.type != GGUF_VALUE_UINT64 && arr.type != GGUF_VALUE_INT64)) {
+        fprintf(stderr, "ds4: required uint64 array metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    if (arr.len != want) {
+        fprintf(stderr, "ds4: %s has %llu entries, expected %u\n",
+                key, (unsigned long long)arr.len, want);
+        exit(1);
+    }
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t i = 0; i < want; i++) {
+        uint64_t v = 0;
+        if (!cursor_u64(&c, &v)) ds4_die(c.error);
+        out[i] = v;
+    }
+}
+
+/* qwen4exp.attention.compress_ratios repeats the layer schedule: the indexer
+ * block size on QSA layers, zero on gated-DeltaNet layers.  Checking it against
+ * full_attention_interval is what guarantees the tensor set we bind matches the
+ * graph we run. */
+static void qwen4exp_validate_layer_schedule(const ds4_model *m) {
+    const char *key = "qwen4exp.attention.compress_ratios";
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) ||
+        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        fprintf(stderr, "ds4: required int32/uint32 array metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    if (arr.len < DS4_N_LAYER) ds4_die("qwen4exp.attention.compress_ratios is shorter than the layer count");
+
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        int32_t got = 0;
+        if (!cursor_read(&c, &got, sizeof(got))) ds4_die(c.error);
+        const int32_t expected = ds4_qwen4exp_layer_is_full_attn(il)
+                ? (int32_t)DS4_N_INDEXER_COMPRESS : 0;
+        if (got != expected) {
+            fprintf(stderr,
+                    "ds4: unexpected qwen4exp compress ratio at layer %u: got %d, expected %d\n",
+                    il, got, expected);
+            exit(1);
+        }
+    }
+}
+
+/* The PLE layer index arrives as a one-entry array.  The reference stores it
+ * 1-based and the converter already subtracted one, so this is a plain layer
+ * index into blk.N. */
+static void qwen4exp_validate_ple_layers(const ds4_model *m) {
+    const char *key = "qwen4exp.ple.layers";
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) ||
+        (arr.type != GGUF_VALUE_UINT32 && arr.type != GGUF_VALUE_INT32)) {
+        fprintf(stderr, "ds4: required int32/uint32 array metadata key is missing: %s\n", key);
+        exit(1);
+    }
+    if (arr.len != 1) ds4_die("ds4 supports exactly one qwen4exp PLE layer");
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    int32_t got = 0;
+    if (!cursor_read(&c, &got, sizeof(got))) ds4_die(c.error);
+    config_expect_u32("ple.layers[0]", (uint32_t)got, DS4_PLE_LAYER);
+}
+
+static void config_validate_qwen4exp_model(const ds4_model *m) {
+    g_ds4_shape = DS4_SHAPE_QWEN38F;
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    memset(&g_ds4_ple, 0, sizeof(g_ds4_ple));
+
+    config_expect_u32("block_count", required_u32(m, "qwen4exp.block_count"), DS4_N_LAYER);
+    config_expect_u64("context_length", required_u64_compat(m, "qwen4exp.context_length"),
+                      DS4_ROPE_ORIG_CTX);
+    config_expect_u32("embedding_length", required_u32(m, "qwen4exp.embedding_length"), DS4_N_EMBD);
+
+    /* qwen4exp has no vocab_size key; the tokenizer array is the only source. */
+    ds4_array_ref tokens;
+    if (!model_get_array(m, "tokenizer.ggml.tokens", &tokens) || tokens.type != GGUF_VALUE_STRING) {
+        ds4_die("qwen4exp model is missing tokenizer.ggml.tokens");
+    }
+    config_expect_u64("tokenizer.ggml.tokens", tokens.len, DS4_N_VOCAB);
+
+    config_expect_u32("attention.head_count", required_u32(m, "qwen4exp.attention.head_count"),
+                      DS4_N_HEAD);
+    config_expect_u32("attention.head_count_kv", required_u32(m, "qwen4exp.attention.head_count_kv"),
+                      DS4_N_HEAD_KV);
+    config_expect_u32("attention.key_length", required_u32(m, "qwen4exp.attention.key_length"),
+                      DS4_N_HEAD_DIM);
+    config_expect_u32("attention.value_length", required_u32(m, "qwen4exp.attention.value_length"),
+                      DS4_N_VALUE_DIM);
+    config_expect_u32("rope.dimension_count", required_u32(m, "qwen4exp.rope.dimension_count"),
+                      DS4_N_ROT);
+    config_expect_f32("rope.freq_base", required_f32(m, "qwen4exp.rope.freq_base"),
+                      DS4_ROPE_FREQ_BASE);
+    config_expect_f32("attention.layer_norm_rms_epsilon",
+                      required_f32(m, "qwen4exp.attention.layer_norm_rms_epsilon"), DS4_RMS_EPS);
+
+    config_expect_u32("expert_count", required_u32(m, "qwen4exp.expert_count"), DS4_N_EXPERT);
+    config_expect_u32("expert_used_count", required_u32(m, "qwen4exp.expert_used_count"),
+                      DS4_N_EXPERT_USED);
+    config_expect_u32("expert_feed_forward_length",
+                      required_u32(m, "qwen4exp.expert_feed_forward_length"), DS4_N_FF_EXP);
+    config_expect_u32("expert_shared_feed_forward_length",
+                      required_u32(m, "qwen4exp.expert_shared_feed_forward_length"), DS4_N_FF_EXP);
+
+    /* The GGUF describes gated DeltaNet in Mamba vocabulary: group_count is the
+     * key/query head count, time_step_rank the value head count, state_size the
+     * shared head dim, inner_size the value width they multiply out to. */
+    config_expect_u32("ssm.group_count", required_u32(m, "qwen4exp.ssm.group_count"),
+                      DS4_N_GDN_KEY_HEAD);
+    config_expect_u32("ssm.time_step_rank", required_u32(m, "qwen4exp.ssm.time_step_rank"),
+                      DS4_N_GDN_VALUE_HEAD);
+    config_expect_u32("ssm.state_size", required_u32(m, "qwen4exp.ssm.state_size"),
+                      DS4_N_GDN_HEAD_DIM);
+    config_expect_u32("ssm.conv_kernel", required_u32(m, "qwen4exp.ssm.conv_kernel"),
+                      DS4_N_GDN_CONV);
+    config_expect_u32("ssm.inner_size", required_u32(m, "qwen4exp.ssm.inner_size"),
+                      DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM);
+
+    config_expect_u32("full_attention_interval",
+                      required_u32(m, "qwen4exp.full_attention_interval"), DS4_N_FULL_ATTN_INTERVAL);
+    config_expect_u32("hyper_connection.count",
+                      required_u32(m, "qwen4exp.hyper_connection.count"), DS4_N_HC);
+    config_expect_u32("hyper_connection.low_rank",
+                      required_u32(m, "qwen4exp.hyper_connection.low_rank"), DS4_N_HC_LOWRANK);
+    config_expect_u32("attention.indexer.head_count",
+                      required_u32(m, "qwen4exp.attention.indexer.head_count"), DS4_N_INDEXER_HEAD);
+    config_expect_u32("attention.indexer.key_length",
+                      required_u32(m, "qwen4exp.attention.indexer.key_length"),
+                      DS4_N_INDEXER_HEAD_DIM);
+    config_expect_u32("attention.indexer.top_k",
+                      required_u32(m, "qwen4exp.attention.indexer.top_k"), DS4_N_INDEXER_TOP_K);
+    qwen4exp_validate_layer_schedule(m);
+
+    config_expect_u32("ple.ngram_size", required_u32(m, "qwen4exp.ple.ngram_size"), DS4_N_PLE_NGRAM);
+    config_expect_u32("ple.heads_per_ngram", required_u32(m, "qwen4exp.ple.heads_per_ngram"),
+                      DS4_N_PLE_HEADS_PER_NGRAM);
+    config_expect_u32("ple.conv_kernel", required_u32(m, "qwen4exp.ple.conv_kernel"), DS4_N_PLE_CONV);
+    config_expect_u32("ple.eos_token_id", required_u32(m, "qwen4exp.ple.eos_token_id"),
+                      DS4_PLE_EOS_TOKEN);
+    config_expect_u32("embedding_length_per_layer_input",
+                      required_u32(m, "qwen4exp.embedding_length_per_layer_input"),
+                      DS4_N_PLE_HEAD_DIM);
+    config_expect_u32("ple head fan-out", DS4_N_PLE_HEAD * DS4_N_PLE_HEAD_DIM, DS4_N_EMBD);
+    qwen4exp_validate_ple_layers(m);
+
+    qwen4exp_read_u64_array(m, "qwen4exp.ple.layer_multipliers",
+                            g_ds4_ple.multipliers, DS4_N_PLE_NGRAM);
+    qwen4exp_read_u64_array(m, "qwen4exp.ple.head_offsets",
+                            g_ds4_ple.head_offsets, DS4_N_PLE_HEAD);
+    qwen4exp_read_u64_array(m, "qwen4exp.ple.head_vocab_sizes",
+                            g_ds4_ple.head_vocab, DS4_N_PLE_HEAD);
+
+    /* The heads must tile the table without gaps or overlap; the row index we
+     * compute per head is only in range if this holds. */
+    uint64_t rows = 0;
+    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+        if (g_ds4_ple.head_offsets[h] != rows) {
+            ds4_die("qwen4exp PLE head offsets are not a contiguous prefix sum of the vocab sizes");
+        }
+        if (g_ds4_ple.head_vocab[h] == 0) ds4_die("qwen4exp PLE head vocabulary size is zero");
+        rows += g_ds4_ple.head_vocab[h];
+    }
+    g_ds4_ple.total_rows = rows;
+    /* Every multiplier must be odd: the reference builds them as 2*x+1 so the
+     * hash stays a bijection on the low bits. */
+    for (uint32_t i = 0; i < DS4_N_PLE_NGRAM; i++) {
+        if ((g_ds4_ple.multipliers[i] & 1u) == 0) {
+            ds4_die("qwen4exp PLE layer multiplier is even");
+        }
+    }
+}
+
 static void config_validate_model(const ds4_model *m) {
     ds4_str arch = {0};
     if (model_get_string(m, "general.architecture", &arch)) {
@@ -6103,6 +6926,10 @@ static void config_validate_model(const ds4_model *m) {
         }
         if (ds4_streq(arch, "glm5-next")) {
             config_validate_glm53_model(m);
+            return;
+        }
+        if (ds4_streq(arch, "qwen4exp")) {
+            config_validate_qwen4exp_model(m);
             return;
         }
     }
@@ -6245,6 +7072,22 @@ static void weights_bind_output(
         const ds4_model *m,
         bool             required,
         bool             optional) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        /* The final hyper-connection mix replaces the output norm, so there is
+         * no output_norm.weight to bind. */
+        if (required) {
+            w->output_mix_norm = required_tensor(m, "output_hc_norm.weight");
+            w->output_mix_down = required_tensor(m, "output_hc_down.weight");
+            w->output_mix_up   = required_tensor(m, "output_hc_up.weight");
+            w->output          = required_tensor(m, "output.weight");
+        } else if (optional) {
+            w->output_mix_norm = model_find_tensor(m, "output_hc_norm.weight");
+            w->output_mix_down = model_find_tensor(m, "output_hc_down.weight");
+            w->output_mix_up   = model_find_tensor(m, "output_hc_up.weight");
+            w->output          = model_find_tensor(m, "output.weight");
+        }
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (required) {
             w->output_norm = required_tensor(m, "output_norm.weight");
@@ -6350,7 +7193,141 @@ static void weights_bind_glm_dsa_layer(ds4_layer_weights *l, const ds4_model *m,
     }
 }
 
+/* qwen4exp layer tensors.  Every layer carries the two hyper-connection
+ * blocks and the full MoE; the token mixer alternates between QSA sparse
+ * attention and gated DeltaNet, and layer DS4_PLE_LAYER adds the PLE block. */
+static void weights_bind_qwen4exp_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    l->hc_attn_norm   = required_tensorf(m, "blk.%u.hc_attn_norm.weight", il);
+    l->hc_attn_down   = required_tensorf(m, "blk.%u.hc_attn_down.weight", il);
+    l->hc_attn_up     = required_tensorf(m, "blk.%u.hc_attn_up.weight", il);
+    l->hc_attn_inject = required_tensorf(m, "blk.%u.hc_attn_inject.weight", il);
+    l->hc_ffn_norm    = required_tensorf(m, "blk.%u.hc_ffn_norm.weight", il);
+    l->hc_ffn_down    = required_tensorf(m, "blk.%u.hc_ffn_down.weight", il);
+    l->hc_ffn_up      = required_tensorf(m, "blk.%u.hc_ffn_up.weight", il);
+    l->hc_ffn_inject  = required_tensorf(m, "blk.%u.hc_ffn_inject.weight", il);
+
+    if (ds4_qwen4exp_layer_is_full_attn(il)) {
+        l->qsa_q      = required_tensorf(m, "blk.%u.attn_q.weight", il);
+        l->qsa_k      = required_tensorf(m, "blk.%u.attn_k.weight", il);
+        l->qsa_v      = required_tensorf(m, "blk.%u.attn_v.weight", il);
+        l->qsa_q_norm = required_tensorf(m, "blk.%u.attn_q_norm.weight", il);
+        l->qsa_k_norm = required_tensorf(m, "blk.%u.attn_k_norm.weight", il);
+        l->attn_output = required_tensorf(m, "blk.%u.attn_output.weight", il);
+        l->idx_q      = required_tensorf(m, "blk.%u.indexer.q_proj.weight", il);
+        l->idx_k      = required_tensorf(m, "blk.%u.indexer.k_proj.weight", il);
+        l->idx_q_norm = required_tensorf(m, "blk.%u.indexer.q_norm.weight", il);
+        l->idx_k_norm = required_tensorf(m, "blk.%u.indexer.k_norm.weight", il);
+    } else {
+        l->gdn_qkv     = required_tensorf(m, "blk.%u.attn_qkv.weight", il);
+        l->gdn_gate    = required_tensorf(m, "blk.%u.attn_gate.weight", il);
+        l->gdn_conv1d  = required_tensorf(m, "blk.%u.ssm_conv1d.weight", il);
+        l->gdn_a       = required_tensorf(m, "blk.%u.ssm_a", il);
+        l->gdn_alpha   = required_tensorf(m, "blk.%u.ssm_alpha.weight", il);
+        l->gdn_beta    = required_tensorf(m, "blk.%u.ssm_beta.weight", il);
+        l->gdn_dt_bias = required_tensorf(m, "blk.%u.ssm_dt.bias", il);
+        l->gdn_norm    = required_tensorf(m, "blk.%u.ssm_norm.weight", il);
+        l->gdn_out     = required_tensorf(m, "blk.%u.ssm_out.weight", il);
+    }
+
+    if (ds4_qwen4exp_layer_has_ple(il)) {
+        l->ple_key        = required_tensorf(m, "blk.%u.ple_key.weight", il);
+        l->ple_value      = required_tensorf(m, "blk.%u.ple_value.weight", il);
+        l->ple_norm_key   = required_tensorf(m, "blk.%u.ple_norm_key.weight", il);
+        l->ple_norm_query = required_tensorf(m, "blk.%u.ple_norm_query.weight", il);
+        l->ple_norm_conv  = required_tensorf(m, "blk.%u.ple_norm_conv.weight", il);
+        l->ple_conv1d     = required_tensorf(m, "blk.%u.ple_conv1d.weight", il);
+    }
+
+    l->ffn_gate_inp       = required_tensorf(m, "blk.%u.ffn_gate_inp.weight", il);
+    l->ffn_gate_inp_shexp = required_tensorf(m, "blk.%u.ffn_gate_inp_shexp.weight", il);
+    l->ffn_gate_exps      = required_tensorf(m, "blk.%u.ffn_gate_exps.weight", il);
+    l->ffn_up_exps        = required_tensorf(m, "blk.%u.ffn_up_exps.weight", il);
+    l->ffn_down_exps      = required_tensorf(m, "blk.%u.ffn_down_exps.weight", il);
+    l->ffn_gate_shexp     = required_tensorf(m, "blk.%u.ffn_gate_shexp.weight", il);
+    l->ffn_up_shexp       = required_tensorf(m, "blk.%u.ffn_up_shexp.weight", il);
+    l->ffn_down_shexp     = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
+}
+
+/* Binds the MTP head.  Deliberately not weights_bind_qwen4exp_layer: that one
+ * decides attention type from the layer index, and index 0 is a Gated DeltaNet
+ * layer in the target, whereas the MTP block is full attention.  It also
+ * exit()s on a missing tensor, which is wrong for an optional sidecar -- a
+ * malformed one should disable speculation, not kill the process. */
+static bool q4e_mtp_weights_bind(ds4_q4e_mtp_weights *w, const ds4_model *m) {
+    memset(w, 0, sizeof(*w));
+
+    const char *missing = NULL;
+#define Q4E_MTP_BIND(dst, name)                                   \
+    do {                                                          \
+        (dst) = model_find_tensor(m, (name));                     \
+        if (!(dst) && !missing) missing = (name);                 \
+    } while (0)
+
+    Q4E_MTP_BIND(w->pre_fc_norm_embedding, "mtp.pre_fc_norm_embedding.weight");
+    Q4E_MTP_BIND(w->pre_fc_norm_hidden,    "mtp.pre_fc_norm_hidden.weight");
+    Q4E_MTP_BIND(w->fc_embedding,          "mtp.fc_embedding.weight");
+    Q4E_MTP_BIND(w->fc_hidden,             "mtp.fc_hidden.weight");
+    /* The collapsing mixer has no inject, exactly like the target's
+     * output_mix; q4e_hc_mix takes NULL there. */
+    Q4E_MTP_BIND(w->hc_norm,               "mtp.hc_norm.weight");
+    Q4E_MTP_BIND(w->hc_down,               "mtp.hc_down.weight");
+    Q4E_MTP_BIND(w->hc_up,                 "mtp.hc_up.weight");
+
+    ds4_layer_weights *l = &w->block;
+    Q4E_MTP_BIND(l->hc_attn_norm,   "blk.0.hc_attn_norm.weight");
+    Q4E_MTP_BIND(l->hc_attn_down,   "blk.0.hc_attn_down.weight");
+    Q4E_MTP_BIND(l->hc_attn_up,     "blk.0.hc_attn_up.weight");
+    Q4E_MTP_BIND(l->hc_attn_inject, "blk.0.hc_attn_inject.weight");
+    Q4E_MTP_BIND(l->hc_ffn_norm,    "blk.0.hc_ffn_norm.weight");
+    Q4E_MTP_BIND(l->hc_ffn_down,    "blk.0.hc_ffn_down.weight");
+    Q4E_MTP_BIND(l->hc_ffn_up,      "blk.0.hc_ffn_up.weight");
+    Q4E_MTP_BIND(l->hc_ffn_inject,  "blk.0.hc_ffn_inject.weight");
+
+    Q4E_MTP_BIND(l->qsa_q,       "blk.0.attn_q.weight");
+    Q4E_MTP_BIND(l->qsa_k,       "blk.0.attn_k.weight");
+    Q4E_MTP_BIND(l->qsa_v,       "blk.0.attn_v.weight");
+    Q4E_MTP_BIND(l->qsa_q_norm,  "blk.0.attn_q_norm.weight");
+    Q4E_MTP_BIND(l->qsa_k_norm,  "blk.0.attn_k_norm.weight");
+    Q4E_MTP_BIND(l->attn_output, "blk.0.attn_output.weight");
+    Q4E_MTP_BIND(l->idx_q,       "blk.0.indexer.q_proj.weight");
+    Q4E_MTP_BIND(l->idx_k,       "blk.0.indexer.k_proj.weight");
+    Q4E_MTP_BIND(l->idx_q_norm,  "blk.0.indexer.q_norm.weight");
+    Q4E_MTP_BIND(l->idx_k_norm,  "blk.0.indexer.k_norm.weight");
+
+    Q4E_MTP_BIND(l->ffn_gate_inp,       "blk.0.ffn_gate_inp.weight");
+    Q4E_MTP_BIND(l->ffn_gate_inp_shexp, "blk.0.ffn_gate_inp_shexp.weight");
+    Q4E_MTP_BIND(l->ffn_gate_exps,      "blk.0.ffn_gate_exps.weight");
+    Q4E_MTP_BIND(l->ffn_up_exps,        "blk.0.ffn_up_exps.weight");
+    Q4E_MTP_BIND(l->ffn_down_exps,      "blk.0.ffn_down_exps.weight");
+    Q4E_MTP_BIND(l->ffn_gate_shexp,     "blk.0.ffn_gate_shexp.weight");
+    Q4E_MTP_BIND(l->ffn_up_shexp,       "blk.0.ffn_up_shexp.weight");
+    Q4E_MTP_BIND(l->ffn_down_shexp,     "blk.0.ffn_down_shexp.weight");
+#undef Q4E_MTP_BIND
+
+    if (missing) {
+        fprintf(stderr, "ds4: qwen4exp MTP head is missing %s\n", missing);
+        return false;
+    }
+
+    /* Shape gates.  The draft shares every kernel with the target, so a
+     * mismatched head would corrupt the graph rather than fail cleanly. */
+    if (w->fc_embedding->dim[0] != DS4_N_EMBD ||
+        w->fc_hidden->dim[0] != DS4_N_EMBD ||
+        w->pre_fc_norm_hidden->dim[0] != (uint64_t)DS4_N_EMBD * DS4_N_HC ||
+        l->ffn_gate_exps->dim[2] != DS4_N_EXPERT) {
+        fprintf(stderr, "ds4: qwen4exp MTP head shapes do not match the target\n");
+        return false;
+    }
+
+    w->ready = true;
+    return true;
+}
+
 static void weights_bind_layer(ds4_layer_weights *l, const ds4_model *m, uint32_t il) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        weights_bind_qwen4exp_layer(l, m, il);
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         weights_bind_glm_dsa_layer(l, m, il);
         return;
@@ -6439,6 +7416,14 @@ static void weights_bind(
         w->token_embd = model_find_tensor(m, "token_embd.weight");
     }
     weights_bind_output(w, m, require_output, optional_output);
+
+    /* The PLE table has to be bound whenever its layer is in the slice: the
+     * streaming reader needs its offset and extent even though the bytes never
+     * become resident. */
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP &&
+        DS4_PLE_LAYER >= start && DS4_PLE_LAYER <= end) {
+        w->ple_table = required_tensor(m, "per_layer_token_embd.weight");
+    }
 
     for (uint32_t il = start; il <= end; il++) {
         weights_bind_layer(&w->layer[il], m, il);
@@ -6912,6 +7897,75 @@ static bool model_map_span_vec_finish(ds4_model_map_span_vec *spans) {
     spans->len = out;
     return spans->len != 0;
 }
+
+/* qwen4exp resident set: every tensor the graph reads through the model map.
+ *
+ * per_layer_token_embd is deliberately absent.  It is 26.8 GiB of the 103.7 GiB
+ * file and the PLE reader pulls its rows straight off the shard, so mapping it
+ * would make the model resident twice over and exhaust the machine -- which is
+ * exactly what the default whole-file mapping does. */
+static void model_map_span_vec_include_qwen4exp_layer(
+        ds4_model_map_span_vec *spans, const ds4_layer_weights *l) {
+#define DS4_INCLUDE_TENSOR(t_) model_map_span_vec_include_one(spans, (t_))
+    DS4_INCLUDE_TENSOR(l->hc_attn_norm);
+    DS4_INCLUDE_TENSOR(l->hc_attn_down);
+    DS4_INCLUDE_TENSOR(l->hc_attn_up);
+    DS4_INCLUDE_TENSOR(l->hc_attn_inject);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_norm);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_down);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_up);
+    DS4_INCLUDE_TENSOR(l->hc_ffn_inject);
+    DS4_INCLUDE_TENSOR(l->qsa_q);
+    DS4_INCLUDE_TENSOR(l->qsa_k);
+    DS4_INCLUDE_TENSOR(l->qsa_v);
+    DS4_INCLUDE_TENSOR(l->qsa_q_norm);
+    DS4_INCLUDE_TENSOR(l->qsa_k_norm);
+    DS4_INCLUDE_TENSOR(l->attn_output);
+    DS4_INCLUDE_TENSOR(l->idx_q);
+    DS4_INCLUDE_TENSOR(l->idx_k);
+    DS4_INCLUDE_TENSOR(l->idx_q_norm);
+    DS4_INCLUDE_TENSOR(l->idx_k_norm);
+    DS4_INCLUDE_TENSOR(l->gdn_qkv);
+    DS4_INCLUDE_TENSOR(l->gdn_gate);
+    DS4_INCLUDE_TENSOR(l->gdn_conv1d);
+    DS4_INCLUDE_TENSOR(l->gdn_a);
+    DS4_INCLUDE_TENSOR(l->gdn_alpha);
+    DS4_INCLUDE_TENSOR(l->gdn_beta);
+    DS4_INCLUDE_TENSOR(l->gdn_dt_bias);
+    DS4_INCLUDE_TENSOR(l->gdn_norm);
+    DS4_INCLUDE_TENSOR(l->gdn_out);
+    DS4_INCLUDE_TENSOR(l->ple_key);
+    DS4_INCLUDE_TENSOR(l->ple_value);
+    DS4_INCLUDE_TENSOR(l->ple_norm_key);
+    DS4_INCLUDE_TENSOR(l->ple_norm_query);
+    DS4_INCLUDE_TENSOR(l->ple_norm_conv);
+    DS4_INCLUDE_TENSOR(l->ple_conv1d);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_inp);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_inp_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_up_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_down_exps);
+    DS4_INCLUDE_TENSOR(l->ffn_gate_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_up_shexp);
+    DS4_INCLUDE_TENSOR(l->ffn_down_shexp);
+#undef DS4_INCLUDE_TENSOR
+}
+
+static bool weights_model_map_qwen4exp_spans(
+        const ds4_weights *w, ds4_model_map_span_vec *spans) {
+    if (!w || !spans) return false;
+    memset(spans, 0, sizeof(*spans));
+    model_map_span_vec_include_one(spans, w->token_embd);
+    model_map_span_vec_include_one(spans, w->output);
+    model_map_span_vec_include_one(spans, w->output_mix_norm);
+    model_map_span_vec_include_one(spans, w->output_mix_down);
+    model_map_span_vec_include_one(spans, w->output_mix_up);
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        model_map_span_vec_include_qwen4exp_layer(spans, &w->layer[il]);
+    }
+    return model_map_span_vec_finish(spans);
+}
+
 
 static DS4_MAYBE_UNUSED bool weights_model_map_spans(
         const ds4_weights *w,
@@ -37848,6 +38902,7 @@ struct ds4_engine {
     ds4_vocab vocab;
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
+    ds4_q4e_mtp_weights q4e_mtp_weights;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
@@ -37871,6 +38926,7 @@ struct ds4_engine {
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
+    uint64_t ple_cache_bytes;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
@@ -38476,9 +39532,21 @@ static uint32_t ascii_tolower_cp(uint32_t cp) {
     return cp;
 }
 
-/* ChatGLM4/GLM pre-tokenization.  GLM GGUFs use tokenizer.ggml.pre="glm4",
- * which shares the llama3-style split shape used by llama.cpp's CHATGLM4 path. */
-static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, token_vec *out) {
+/* The llama3-style pre-tokenization shape, shared by two of the three
+ * families here:
+ *
+ *   (?i:'s|'t|'re|'ve|'m|'ll|'d)
+ *   [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
+ *   \p{N}{1,max_digit_run}
+ *    ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+ *   \s*[\r\n]+   |   \s+(?!\S)   |   \s+
+ *
+ * GLM GGUFs declare tokenizer.ggml.pre="glm4" and run digits three at a time;
+ * Qwen3.8-Flash declares "qwen35" and is identical except that it emits one
+ * digit per piece.  That single difference is the whole reason this is
+ * parameterized rather than copied. */
+static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *text,
+                                          token_vec *out, int max_digit_run) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
@@ -38525,7 +39593,7 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
 
         if (cur.is_number) {
             int ndigits = 0;
-            while (pos < len && ndigits < 3) {
+            while (pos < len && ndigits < max_digit_run) {
                 glm4_char_info scan = glm4_char_at(text, len, pos);
                 if (!scan.valid || !scan.is_number) break;
                 pos = scan.next;
@@ -38615,7 +39683,14 @@ static void bpe_tokenize_text_glm4(const ds4_vocab *vocab, const char *text, tok
  */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        bpe_tokenize_text_glm4(vocab, text, out);
+        bpe_tokenize_text_llama3_like(vocab, text, out, 3);
+        return;
+    }
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        /* tokenizer.ggml.pre = "qwen35": the glm4 shape with one digit per
+         * piece.  Feeding this model the JoyAI split below instead silently
+         * changes the token stream for every number and contraction. */
+        bpe_tokenize_text_llama3_like(vocab, text, out, 1);
         return;
     }
 
@@ -38738,6 +39813,34 @@ static void vocab_load(ds4_vocab *vocab, const ds4_model *model) {
         table_put(&vocab->merge_rank, merge, (int)i);
     }
 
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        /* Qwen's ChatML set.  The file's bos/pad is <|endoftext|> while the
+         * chat turn ends with <|im_end|>; the PLE hash uses the former and the
+         * sampler stops on the latter, so they are kept apart deliberately. */
+        if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
+            vocab->bos_id = vocab_lookup_optional(vocab, "<|endoftext|>");
+        }
+        if (!model_get_token_id(model, "tokenizer.ggml.eos_token_id", &vocab->eos_id)) {
+            vocab->eos_id = vocab_lookup_optional(vocab, "<|im_end|>");
+        }
+        vocab->system_id = vocab_lookup_optional(vocab, "<|im_start|>");
+        vocab->user_id = vocab->system_id;
+        vocab->assistant_id = vocab->system_id;
+        vocab->observation_id = -1;
+        vocab->sop_id = -1;
+        vocab->think_start_id = vocab_lookup_optional(vocab, "<think>");
+        vocab->think_end_id = vocab_lookup_optional(vocab, "</think>");
+        vocab->tool_call_start_id = vocab_lookup_optional(vocab, "<tool_call>");
+        vocab->tool_call_end_id = vocab_lookup_optional(vocab, "</tool_call>");
+        vocab->tool_response_start_id = vocab_lookup_optional(vocab, "<tool_response>");
+        vocab->tool_response_end_id = vocab_lookup_optional(vocab, "</tool_response>");
+        vocab->arg_key_start_id = -1;
+        vocab->arg_key_end_id = -1;
+        vocab->arg_value_start_id = -1;
+        vocab->arg_value_end_id = -1;
+        vocab->dsml_id = -1;
+        return;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (!model_get_token_id(model, "tokenizer.ggml.bos_token_id", &vocab->bos_id)) {
             vocab->bos_id = vocab_lookup_optional(vocab, "<sop>");
@@ -38802,6 +39905,9 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
 
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    /* GLM's template knows High and Max; the lower levels read as High. */
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -38823,12 +39929,95 @@ static void chat_push_think_prefix(const ds4_vocab *vocab,
     }
 }
 
+/* The reasoning-effort sentences Qwen3.8-Flash's own template injects as a
+ * system message, word for word.  The template resolves 'high' to 'xhigh' and
+ * defaults to 'xhigh'; 'medium' contributes no sentence at all (thinking stays
+ * on, unguided); 'low' has its own sentence. */
+static const char *const DS4_QWEN4EXP_REASONING_XHIGH =
+    "Reasoning effort is set to xhigh. Please think carefully through the "
+    "task, validate key assumptions, consider plausible alternatives, and "
+    "prioritize correctness, consistency, and clarity in the final answer.";
+static const char *const DS4_QWEN4EXP_REASONING_LOW =
+    "Reasoning effort is set to low. Keep your thinking brief and focused, "
+    "moving directly to the conclusion without unnecessary elaboration.";
+
+/* NULL when the level adds no system sentence: thinking off, or medium.
+ * Callers decide the <think> framing from ds4_think_mode_enabled(), not from
+ * this. */
+const char *ds4_qwen4exp_reasoning_effort_text(ds4_think_mode mode) {
+    switch (mode) {
+    case DS4_THINK_LOW:    return DS4_QWEN4EXP_REASONING_LOW;
+    case DS4_THINK_MEDIUM: return NULL;
+    case DS4_THINK_HIGH:
+    case DS4_THINK_MAX:    return DS4_QWEN4EXP_REASONING_XHIGH;
+    case DS4_THINK_NONE:   return NULL;
+    }
+    return NULL;
+}
+
+/* ChatML, following the template the GGUF ships:
+ *
+ *   <|im_start|>system\n{reasoning}\n\n{system}<|im_end|>\n     (when either)
+ *   <|im_start|>user\n{prompt}<|im_end|>\n
+ *   <|im_start|>assistant\n<think>\n                            (thinking)
+ *   <|im_start|>assistant\n<think>\n\n</think>\n\n              (no thinking)
+ *
+ * There is no BOS: the turn markers carry the framing, and <|endoftext|> is
+ * only the pad/PLE-cut token. */
+static void encode_chat_prompt_qwen4exp(
+        const ds4_vocab *vocab,
+        const char      *system,
+        const char      *prompt,
+        ds4_think_mode   think_mode,
+        token_vec       *out) {
+    if (vocab->system_id < 0 || vocab->eos_id < 0 ||
+        vocab->think_start_id < 0 || vocab->think_end_id < 0) {
+        ds4_die("this tokenizer does not provide the qwen4exp ChatML markers; "
+                "use raw prompt tokenization");
+    }
+    const bool thinking = ds4_think_mode_enabled(think_mode);
+    const char *reasoning = ds4_qwen4exp_reasoning_effort_text(think_mode);
+
+    if (reasoning || (system && system[0])) {
+        token_vec_push(out, vocab->system_id);
+        bpe_tokenize_text(vocab, "system\n", out);
+        if (reasoning) {
+            bpe_tokenize_text(vocab, reasoning, out);
+            if (system && system[0]) bpe_tokenize_text(vocab, "\n\n", out);
+        }
+        if (system && system[0]) bpe_tokenize_text(vocab, system, out);
+        token_vec_push(out, vocab->eos_id);
+        bpe_tokenize_text(vocab, "\n", out);
+    }
+
+    token_vec_push(out, vocab->system_id);
+    bpe_tokenize_text(vocab, "user\n", out);
+    bpe_tokenize_text(vocab, prompt ? prompt : "", out);
+    token_vec_push(out, vocab->eos_id);
+    bpe_tokenize_text(vocab, "\n", out);
+
+    token_vec_push(out, vocab->system_id);
+    bpe_tokenize_text(vocab, "assistant\n", out);
+    token_vec_push(out, vocab->think_start_id);
+    if (thinking) {
+        bpe_tokenize_text(vocab, "\n", out);
+    } else {
+        bpe_tokenize_text(vocab, "\n\n", out);
+        token_vec_push(out, vocab->think_end_id);
+        bpe_tokenize_text(vocab, "\n\n", out);
+    }
+}
+
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,
         const char      *prompt,
         ds4_think_mode   think_mode,
         token_vec       *out) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        encode_chat_prompt_qwen4exp(vocab, system, prompt, think_mode, out);
+        return;
+    }
     const bool need_think_start =
         ds4_think_mode_enabled(think_mode) ||
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
@@ -38866,10 +40055,21 @@ void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out) {
 }
 
 static bool special_token_at(const ds4_vocab *vocab, const char *p, int *token, size_t *len) {
+    /* ChatML markers, recognized only for the family that uses them.  For
+     * qwen4exp every role shares the <|im_start|> token and the role name
+     * that follows it is ordinary text, so the renderer emits the marker and
+     * then "user\n" or "assistant\n" as a plain span. */
+    const bool chatml = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP;
+    const int im_start_id = chatml ? vocab->system_id : -1;
+    const int im_end_id = chatml ? vocab->eos_id : -1;
+    const int endoftext_id = chatml ? vocab->bos_id : -1;
     struct special {
         const char *text;
         int token;
     } specials[] = {
+        {"<|im_start|>",           im_start_id},
+        {"<|im_end|>",             im_end_id},
+        {"<|endoftext|>",          endoftext_id},
         {"<｜begin▁of▁sentence｜>", vocab->bos_id},
         {"<｜end▁of▁sentence｜>",   vocab->eos_id},
         {"[gMASK]",                vocab->bos_id},
@@ -53170,14 +54370,16 @@ static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX;
+    return mode != DS4_THINK_NONE;
 }
 
 const char *ds4_think_mode_name(ds4_think_mode mode) {
     switch (mode) {
-    case DS4_THINK_NONE: return "none";
-    case DS4_THINK_HIGH: return "high";
-    case DS4_THINK_MAX:  return "max";
+    case DS4_THINK_NONE:   return "none";
+    case DS4_THINK_LOW:    return "low";
+    case DS4_THINK_MEDIUM: return "medium";
+    case DS4_THINK_HIGH:   return "high";
+    case DS4_THINK_MAX:    return "max";
     }
     return "unknown";
 }
@@ -53312,6 +54514,208 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+/* Ceiling on qwen4exp drafts per step; the verify batch is 1 + this. */
+#define Q4E_SPEC_MAX_DRAFT 8u
+
+#ifndef DS4_NO_GPU
+/* N-gram (prompt-lookup) speculation: when the last few tokens already
+ * occurred earlier in the context, propose what followed them.  No weights,
+ * one host-side scan per step, and strongest exactly where an agent echoes
+ * tool output back.  DS4_QWEN4EXP_NGRAM_K caps the proposal (0 disables,
+ * default 8); DS4_QWEN4EXP_NGRAM_MIN is the shortest match accepted
+ * (default 3 tokens). */
+static uint32_t q4e_ngram_k(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_NGRAM_K");
+        long v = (env && env[0]) ? strtol(env, NULL, 10) : 8;
+        if (v < 0) v = 0;
+        if (v > (long)Q4E_SPEC_MAX_DRAFT) v = Q4E_SPEC_MAX_DRAFT;
+        cached = (int)v;
+    }
+    return (uint32_t)cached;
+}
+
+static uint32_t q4e_ngram_min_match(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_NGRAM_MIN");
+        long v = (env && env[0]) ? strtol(env, NULL, 10) : 3;
+        if (v < 1) v = 1;
+        if (v > 8) v = 8;
+        cached = (int)v;
+    }
+    return (uint32_t)cached;
+}
+
+/* Propose up to max_k tokens after seq = hist[0, len) ++ [first].  Tries the
+ * longest key first (up to 6 tokens, down to the configured minimum) and takes
+ * the most recent earlier occurrence.  Returns the number proposed. */
+static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
+                                  int *out, uint32_t max_k) {
+    const uint32_t L = len + 1u;
+    const uint32_t min_n = q4e_ngram_min_match();
+    if (max_k == 0 || L < min_n + 1u) return 0;
+#define Q4E_SEQ(j) ((j) < len ? hist[(j)] : first)
+    for (uint32_t n = 6u; n >= min_n; n--) {
+        if (n + 1u > L) continue;
+        /* key = seq[L - n, L); look for it ending at i, i <= L - 2. */
+        for (uint32_t i = L - 2u; i + 1u >= n; i--) {
+            uint32_t m = 0;
+            while (m < n && Q4E_SEQ(i - m) == Q4E_SEQ(L - 1u - m)) m++;
+            if (m == n) {
+                uint32_t k = 0;
+                while (k < max_k && i + 1u + k < L) {
+                    out[k] = Q4E_SEQ(i + 1u + k);
+                    k++;
+                }
+                if (k) return k;
+                break;
+            }
+            if (i == 0) break;
+        }
+        if (n == 0) break;
+    }
+#undef Q4E_SEQ
+    return 0;
+}
+#endif /* DS4_NO_GPU */
+
+#ifndef DS4_NO_GPU
+/* Shorthands for the widths the graph keeps recomputing. */
+#define Q4E_HC_DIM   ((uint32_t)(DS4_N_EMBD * DS4_N_HC))
+#define Q4E_Q_DIM    ((uint32_t)(DS4_N_HEAD * DS4_N_HEAD_DIM))
+#define Q4E_KV_DIM   ((uint32_t)(DS4_N_HEAD_KV * DS4_N_HEAD_DIM))
+#define Q4E_GDN_K    ((uint32_t)(DS4_N_GDN_KEY_HEAD * DS4_N_GDN_HEAD_DIM))
+#define Q4E_GDN_V    ((uint32_t)(DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM))
+#define Q4E_GDN_IN   (2u * Q4E_GDN_K + Q4E_GDN_V)
+#define Q4E_PLE_HIST ((DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM)
+
+/* Scratch and persistent state for one session.  Scratch is sized for the
+ * prefill chunk; decode uses the same buffers with n_tok = 1. */
+typedef struct {
+    uint32_t ctx_size;
+    uint32_t tok_cap;
+    uint32_t pos;              /* next position to write */
+    bool     ready;
+
+    /* Persistent recurrent state.  The gated DeltaNet layers carry a conv
+     * window and a 128x128 matrix per value head; the PLE block carries its
+     * own dilated conv window; the QSA layers carry an f16 KV cache. */
+    ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *ple_conv;
+
+    /* Per-step inputs. */
+    ds4_gpu_tensor *tokens;
+    ds4_gpu_tensor *positions;
+
+    /* Residual and hyper-connection scratch. */
+    ds4_gpu_tensor *embed;
+    ds4_gpu_tensor *res;
+    ds4_gpu_tensor *xn;
+    ds4_gpu_tensor *lora;
+    ds4_gpu_tensor *up;
+    ds4_gpu_tensor *mixed;
+    ds4_gpu_tensor *inject;
+    ds4_gpu_tensor *blk_out;
+
+    /* Gated DeltaNet. */
+    ds4_gpu_tensor *gdn_qkv;
+    ds4_gpu_tensor *gdn_conv_out;
+    ds4_gpu_tensor *gdn_z;
+    ds4_gpu_tensor *gdn_alpha;
+    ds4_gpu_tensor *gdn_betap;
+    ds4_gpu_tensor *gdn_decay;
+    ds4_gpu_tensor *gdn_beta;
+    ds4_gpu_tensor *gdn_attn;
+    ds4_gpu_tensor *gdn_gated;
+
+    /* QSA. */
+    ds4_gpu_tensor *qsa_qfull;
+    ds4_gpu_tensor *qsa_q;
+    ds4_gpu_tensor *qsa_gate;
+    ds4_gpu_tensor *qsa_k;
+    ds4_gpu_tensor *qsa_v;
+    ds4_gpu_tensor *qsa_out;
+
+    /* MoE. */
+    ds4_gpu_tensor *router;
+    ds4_gpu_tensor *moe_ids;
+    ds4_gpu_tensor *moe_w;
+    ds4_gpu_tensor *moe_gate;
+    ds4_gpu_tensor *moe_up;
+    ds4_gpu_tensor *moe_mid;
+    ds4_gpu_tensor *moe_down;
+    ds4_gpu_tensor *sh_gate;
+    ds4_gpu_tensor *sh_up;
+    ds4_gpu_tensor *sh_mid;
+    ds4_gpu_tensor *sh_out;
+    ds4_gpu_tensor *sh_logit;
+
+    /* PLE. */
+    ds4_gpu_tensor *ple_rows;
+    ds4_gpu_tensor *ple_emb;
+    ds4_gpu_tensor *ple_k;
+    ds4_gpu_tensor *ple_v;
+    ds4_gpu_tensor *ple_q;
+    ds4_gpu_tensor *ple_gv;
+    ds4_gpu_tensor *ple_cv;
+
+    ds4_gpu_tensor *logits;        /* logit_rows * n_vocab */
+
+    /* PLE row streaming: the reader plus host scratch for one chunk's rows. */
+    ds4_ple_stream *ple_stream;
+    uint64_t       *ple_row_ids;
+    uint8_t        *ple_row_data;
+
+    /* Speculative decoding.  A verify step runs 1 + K tokens through the
+     * target in one pass; the recurrent kernels checkpoint their state after
+     * each of the first K tokens so a rejected suffix can be rolled back to
+     * the last accepted one.  spec_k is the slot count (0 = no MTP head). */
+    uint32_t spec_k;
+    uint32_t logit_rows;
+    ds4_gpu_tensor *gdn_conv_ckpt[DS4_MAX_LAYER];
+    ds4_gpu_tensor *gdn_state_ckpt[DS4_MAX_LAYER];
+    ds4_gpu_tensor *ple_conv_ckpt;
+    float          *verify_logits;   /* host, logit_rows * n_vocab */
+
+    /* The MTP draft head.  It is one full-attention layer plus its own
+     * projections, and it runs through the same island code as the target
+     * with a shallow copy of this struct whose residual, embedding, inputs,
+     * KV and logits point here; every other scratch buffer is shared. */
+    bool            mtp_ready;
+    ds4_gpu_tensor *mtp_res;
+    ds4_gpu_tensor *mtp_embed;
+    ds4_gpu_tensor *mtp_tokens;
+    ds4_gpu_tensor *mtp_positions;
+    ds4_gpu_tensor *mtp_k_cache;
+    ds4_gpu_tensor *mtp_v_cache;
+    ds4_gpu_tensor *mtp_logits;
+    float          *mtp_host_logits;
+
+    /* Target residual rows whose draft-side KV has not been written yet:
+     * rows [pend_row0, pend_row0 + pend_n) of `res`, at positions pend_pos0
+     * onward.  The draft for position p needs the target hidden at p and the
+     * token at p + 1, so the last row waits for the next token. */
+    bool     pend_valid;
+    uint32_t pend_row0;
+    uint32_t pend_n;
+    uint32_t pend_pos0;
+
+    uint64_t spec_steps;
+    uint64_t spec_drafted;
+    uint64_t spec_accepted;
+    uint64_t spec_ngram_steps;
+    uint64_t spec_ngram_drafted;
+    uint64_t spec_ngram_accepted;
+    double   spec_draft_ms;
+    double   spec_verify_ms;
+} ds4_q4e_graph;
+#endif /* DS4_NO_GPU */
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -53319,6 +54723,7 @@ struct ds4_session {
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
+    ds4_q4e_graph q4e_graph;
     bool glm_graph_ready;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -54251,6 +55656,10 @@ static void ds4_session_dspark_capture_note_checkpoint(ds4_session *s) {
 
 static bool ds4_session_is_glm(const ds4_session *s) {
     return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
+}
+
+static bool ds4_session_is_qwen4exp(const ds4_session *s) {
+    return s && s->engine && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP;
 }
 
 #ifndef DS4_NO_GPU
@@ -55192,6 +56601,16 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
     if (e && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
+#ifndef DS4_NO_GPU
+    if (e && ds4_model_is_qwen4exp() && e->backend != DS4_BACKEND_CPU &&
+        e->distributed.role == DS4_DISTRIBUTED_NONE) {
+        /* qwen4exp speculates from an MTP head, from n-gram lookup in the
+         * live context, or both; the wider of the two is the batch. */
+        const int mtp_k = ds4_engine_has_mtp(e) ? e->mtp_draft_tokens : 0;
+        const int ng_k = (int)q4e_ngram_k();
+        return mtp_k > ng_k ? mtp_k : ng_k;
+    }
+#endif
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
     if (e &&
@@ -61915,6 +63334,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                     opt->prefill_chunk);
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+    e->ple_cache_bytes = opt->ple_cache_bytes;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
@@ -62110,6 +63530,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
     }
 #endif
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        if (opt->inspect_only) {
+            *out = e;
+            return 0;
+        }
+        /* qwen4exp execution is CUDA only: the hyper-connections, gated
+         * DeltaNet, QSA attention and PLE gather all need bespoke kernels and
+         * only the CUDA backend carries them.  Refuse here rather than failing
+         * somewhere inside graph construction. */
+        if (!ds4_backend_uses_graph(e->backend)) {
+            fprintf(stderr,
+                    "ds4: qwen4exp inference requires the CUDA graph backend; "
+                    "use --inspect for metadata\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming) {
+            fprintf(stderr,
+                    "ds4: qwen4exp keeps its experts resident; only the PLE table "
+                    "streams, and it always does\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        /* Hold one full context's worth of PLE rows.  The hit rate is bounded
+         * by how often n-grams repeat, not by capacity, so a larger cache is
+         * memory spent for nothing. */
+        if (e->ple_cache_bytes == 0) e->ple_cache_bytes = 512ull << 20;
+        /* The routed matmuls run about a hundred times per token at one token
+         * each, so the vendored path's per-call Q8_1 pool allocation is pure
+         * overhead here.  A persistent scratch removes it; at these shapes the
+         * buffer is a few KiB.  ds4_mmq_init reads this once, later than here. */
+        setenv("DS4_CUDA_MMQ_Q81_PERSISTENT", "1", 0);
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         if (opt->inspect_only) {
             *out = e;
@@ -62257,6 +63712,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 dspark_weights_bind_optional(&e->dspark_weights,
                                              &e->mtp_model,
                                              &dspark);
+            } else if (e->support_kind == DS4_SUPPORT_QWEN4EXP_MTP) {
+                /* Binding here costs nothing and makes --inspect the cheap way
+                 * to check a freshly built head against the target. */
+                const bool ok = q4e_mtp_weights_bind(&e->q4e_mtp_weights,
+                                                     &e->mtp_model);
+                fprintf(stderr, "ds4: qwen4exp MTP head: %s (%llu tensors)\n",
+                        ok ? "binds cleanly" : "REJECTED",
+                        (unsigned long long)e->mtp_model.n_tensors);
             }
         }
         *out = e;
@@ -62369,6 +63832,33 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 fprintf(stderr, "ds4: MTP support model loaded: %s (draft=%d)\n",
                         opt->mtp_path,
                         e->mtp_draft_tokens);
+            }
+        } else if (e->support_kind == DS4_SUPPORT_QWEN4EXP_MTP) {
+            if (!ds4_model_is_qwen4exp()) {
+                fprintf(stderr,
+                        "ds4: %s is a qwen4exp MTP head but the target model is not "
+                        "qwen4exp\n", opt->mtp_path);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            if (!q4e_mtp_weights_bind(&e->q4e_mtp_weights, &e->mtp_model)) {
+                model_close(&e->mtp_model);
+                e->support_kind = DS4_SUPPORT_NONE;
+                e->support_stages = 0;
+            } else {
+                e->mtp_ready = true;
+                /* K = 3 drafts per step unless --mtp-draft asks for more;
+                 * the verify batch is 1 + K rows.  The server's option
+                 * default is 1, which for the legacy head means "off", so
+                 * anything at or below 1 reads as unset here -- a head that
+                 * was asked for is meant to be used. */
+                if (opt->mtp_draft_tokens <= 1) e->mtp_draft_tokens = 3;
+                if (e->mtp_draft_tokens > (int)Q4E_SPEC_MAX_DRAFT) {
+                    e->mtp_draft_tokens = (int)Q4E_SPEC_MAX_DRAFT;
+                }
+                fprintf(stderr, "ds4: qwen4exp MTP head loaded: %s (draft=%d)\n",
+                        opt->mtp_path, e->mtp_draft_tokens);
             }
         } else if (e->support_kind == DS4_SUPPORT_DSPARK) {
             dspark_weights_bind_optional(&e->dspark_weights,
@@ -62770,6 +64260,39 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                         load_span_count,
                                                         spans.max_tensor_bytes);
             free(spans.v);
+        } else if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+            ds4_model_map_span_vec spans;
+            if (!weights_model_map_qwen4exp_spans(&e->weights, &spans)) {
+                fprintf(stderr, "ds4: cannot build the qwen4exp resident span set\n");
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+            uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+            uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+            uint64_t span_bytes = 0;
+            for (uint32_t i = 0; i < spans.len; i++) {
+                offsets[i] = spans.v[i].off;
+                sizes[i] = spans.v[i].end - spans.v[i].off;
+                span_bytes += sizes[i];
+            }
+            load_offsets = offsets;
+            load_sizes = sizes;
+            load_span_count = spans.len;
+            e->startup_model_span_bytes = span_bytes;
+            fprintf(stderr,
+                    "ds4: qwen4exp resident weights: %.2f GiB of %.2f GiB "
+                    "(%.2f GiB PLE table streams from disk)\n",
+                    (double)span_bytes / 1073741824.0,
+                    (double)(e->model.size - e->model.tensor_data_pos) / 1073741824.0,
+                    (double)e->weights.ple_table->bytes / 1073741824.0);
+            model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
+                                                        e->model.size,
+                                                        load_offsets,
+                                                        load_sizes,
+                                                        load_span_count,
+                                                        spans.max_tensor_bytes);
+            free(spans.v);
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
@@ -62833,7 +64356,18 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        /* One descriptor only names a single-file model.  A split is mapped as
+         * one range but lives in several files, so the backend gets the whole
+         * table and resolves each offset to the file that owns it -- without
+         * this it cannot stage weights or drop the pages it read. */
+        if (e->model.n_shards > 1) {
+            (void)ds4_gpu_set_model_shard_fds(e->model.map, e->model.shard_fd,
+                                              e->model.shard_base,
+                                              e->model.shard_size,
+                                              e->model.n_shards);
+        } else {
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+        }
         if (!accelerator_cache_model_tensors(e->backend, &e->model,
                                              load_offsets, load_sizes,
                                              load_span_count)) {
@@ -62859,7 +64393,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
-            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            /* Hand the descriptor slot back to the target.  A single file is
+             * read through its one descriptor; a split goes back through its
+             * shard table, which the support model's registration displaced. */
+            if (e->model.n_shards <= 1) {
+                (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
+            } else {
+                (void)ds4_gpu_set_model_shard_fds(e->model.map, e->model.shard_fd,
+                                                  e->model.shard_base,
+                                                  e->model.shard_size,
+                                                  e->model.n_shards);
+            }
         }
         if (e->vision_ready) {
 #if defined(__APPLE__)
@@ -63396,6 +64940,11 @@ bool ds4_engine_is_glm_dsa(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA;
 }
 
+bool ds4_engine_is_qwen4exp(ds4_engine *e) {
+    (void)e;
+    return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP;
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
@@ -63572,6 +65121,1215 @@ static int ds4_session_tp_register(ds4_session *s) {
     return 1;
 }
 
+#ifndef DS4_NO_GPU
+/* =========================================================================
+ * qwen4exp graph.
+ * =========================================================================
+ *
+ * One decoder layer is: a hyper-connection mix, a token mixer (gated DeltaNet
+ * on three layers out of four, QSA attention on the fourth), a combine, a
+ * second mix, the 512-expert MoE plus its shared expert, and a second combine.
+ * Layer DS4_PLE_LAYER additionally folds in the PLE n-gram block before the
+ * first mix.  There are no pre-norms: the mixes are the norms, and the final
+ * mix stands in for the output norm.
+ *
+ * Everything runs in f32 except the KV cache, which is f16 because a decode
+ * step reads all of it.  The residual is DS4_N_HC streams of n_embd, stream
+ * outer, so one token is DS4_N_HC * n_embd contiguous floats.
+ */
+
+
+
+/* Optional per-node tracing.  DS4_QWEN4EXP_TRACE=1 prints one line per named
+ * intermediate with its sum, in the same order and with the same names the
+ * llama.cpp graph uses, so a run can be diffed straight against
+ * misc/qwen4exp-oracle/golden_sums.txt.  Diagnostic only: it synchronizes and
+ * reads back every tensor it prints. */
+static int q4e_trace_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_TRACE");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Tokens in the chunk being traced, so q4e_trace can find the last row. */
+static uint32_t g_q4e_trace_ntok = 1;
+
+static void q4e_trace(const char *name, int il, const ds4_gpu_tensor *t, uint64_t n) {
+    if (!q4e_trace_enabled() || !t) return;
+    float *host = xmalloc(n * sizeof(float));
+    ds4_gpu_synchronize();
+    if (ds4_gpu_tensor_read(t, 0, host, n * sizeof(float))) {
+        double sum = 0.0, l1 = 0.0, l2 = 0.0;
+        for (uint64_t i = 0; i < n; i++) {
+            sum += host[i];
+            l1 += fabs((double)host[i]);
+            l2 += (double)host[i] * (double)host[i];
+        }
+        l2 = sqrt(l2);
+        /* The sum alone is a poor comparator for a zero-mean tensor: heavy
+         * cancellation turns rounding noise into a large relative figure.  The
+         * leading elements are what actually show a wrong kernel.
+         *
+         * Both the first and the last row are printed.  llama.cpp's dump keeps
+         * whole tensors for most nodes but narrows the last layer and the
+         * output head to the final token, so comparing only row 0 silently
+         * skips every position-dependent kernel -- which is exactly where a
+         * bug hides that leaves short prompts correct and long ones not. */
+        const uint32_t nt = g_q4e_trace_ntok ? g_q4e_trace_ntok : 1u;
+        const uint64_t row = (n >= nt && nt > 0) ? n / nt : n;
+        const uint64_t lastb = (nt > 1 && row > 0) ? (uint64_t)(nt - 1) * row : 0;
+        char id[64];
+        if (il >= 0) snprintf(id, sizeof(id), "%s-%d", name, il);
+        else         snprintf(id, sizeof(id), "%s", name);
+        fprintf(stderr, "q4e %s\t%.6f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.4f\t%.6f\t%.6f\n",
+                id, sum, (double)host[0],
+                (double)host[n > 1 ? 1 : 0], (double)host[n > 2 ? 2 : 0],
+                (double)host[lastb],
+                (double)host[lastb + (row > 1 ? 1 : 0)],
+                (double)host[lastb + (row > 2 ? 2 : 0)],
+                l1, l2);
+    }
+    free(host);
+}
+
+/* Coarse phase profiler.  DS4_QWEN4EXP_PROFILE=1 synchronizes around each
+ * phase and reports where a decode step actually goes; the synchronization
+ * perturbs absolute numbers but the ranking is what matters.  Diagnostic
+ * only -- the release path never calls into this. */
+enum {
+    Q4E_PH_PLE_GATHER, Q4E_PH_PLE_BLOCK, Q4E_PH_EMBED, Q4E_PH_HC_MIX,
+    Q4E_PH_GDN, Q4E_PH_QSA, Q4E_PH_MOE_ROUTE, Q4E_PH_MOE_GATE_UP,
+    Q4E_PH_MOE_DOWN, Q4E_PH_MOE_SHARED, Q4E_PH_HC_COMBINE, Q4E_PH_OUTPUT,
+    Q4E_PH_COUNT,
+};
+static const char *const Q4E_PHASE_NAME[Q4E_PH_COUNT] = {
+    "ple gather (host+io)", "ple block", "embed", "hc mix",
+    "gated deltanet", "qsa attention", "moe route", "moe gate+up",
+    "moe down", "moe shared", "hc combine", "output head",
+};
+static double g_q4e_phase[Q4E_PH_COUNT];
+static uint64_t g_q4e_steps;
+
+static int q4e_profile_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_PROFILE");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static double q4e_phase_begin(void) {
+    if (!q4e_profile_enabled()) return 0.0;
+    ds4_gpu_synchronize();
+    return now_sec();
+}
+
+static void q4e_phase_end(int phase, double t0) {
+    if (!q4e_profile_enabled()) return;
+    ds4_gpu_synchronize();
+    g_q4e_phase[phase] += now_sec() - t0;
+}
+
+static void q4e_profile_report(void) {
+    if (!q4e_profile_enabled() || g_q4e_steps == 0) return;
+    double total = 0.0;
+    for (int i = 0; i < Q4E_PH_COUNT; i++) total += g_q4e_phase[i];
+    fprintf(stderr, "\nds4: qwen4exp phase profile over %llu steps (%.1f ms/step)\n",
+            (unsigned long long)g_q4e_steps, total * 1e3 / (double)g_q4e_steps);
+    for (int i = 0; i < Q4E_PH_COUNT; i++) {
+        if (g_q4e_phase[i] <= 0.0) continue;
+        fprintf(stderr, "  %-22s %7.2f ms/step  %5.1f%%\n",
+                Q4E_PHASE_NAME[i], g_q4e_phase[i] * 1e3 / (double)g_q4e_steps,
+                100.0 * g_q4e_phase[i] / total);
+    }
+    /* One report per session: the next session starts from zero. */
+    memset(g_q4e_phase, 0, sizeof(g_q4e_phase));
+    g_q4e_steps = 0;
+}
+
+static void q4e_graph_free(ds4_q4e_graph *g) {
+    q4e_profile_report();
+    if (!g) return;
+    if (g->spec_steps) {
+        fprintf(stderr,
+                "ds4: qwen4exp spec stats: steps=%llu drafted=%llu accepted=%llu "
+                "(%.2f accepted/step, %.1f%% of drafts) draft=%.1fms verify=%.1fms "
+                "per step; ngram steps=%llu drafted=%llu accepted=%llu\n",
+                (unsigned long long)g->spec_steps,
+                (unsigned long long)g->spec_drafted,
+                (unsigned long long)g->spec_accepted,
+                (double)g->spec_accepted / (double)g->spec_steps,
+                g->spec_drafted ? 100.0 * (double)g->spec_accepted / (double)g->spec_drafted : 0.0,
+                g->spec_draft_ms / (double)g->spec_steps,
+                g->spec_verify_ms / (double)g->spec_steps,
+                (unsigned long long)g->spec_ngram_steps,
+                (unsigned long long)g->spec_ngram_drafted,
+                (unsigned long long)g->spec_ngram_accepted);
+    }
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->gdn_conv[il]);
+        ds4_gpu_tensor_free(g->gdn_state[il]);
+        ds4_gpu_tensor_free(g->k_cache[il]);
+        ds4_gpu_tensor_free(g->v_cache[il]);
+        ds4_gpu_tensor_free(g->gdn_conv_ckpt[il]);
+        ds4_gpu_tensor_free(g->gdn_state_ckpt[il]);
+    }
+    ds4_gpu_tensor *const flat[] = {
+        g->ple_conv, g->tokens, g->positions, g->embed, g->res, g->xn, g->lora,
+        g->up, g->mixed, g->inject, g->blk_out, g->gdn_qkv, g->gdn_conv_out,
+        g->gdn_z, g->gdn_alpha, g->gdn_betap, g->gdn_decay, g->gdn_beta,
+        g->gdn_attn, g->gdn_gated, g->qsa_qfull, g->qsa_q, g->qsa_gate,
+        g->qsa_k, g->qsa_v, g->qsa_out, g->router, g->moe_ids, g->moe_w,
+        g->moe_gate, g->moe_up, g->moe_mid, g->moe_down, g->sh_gate, g->sh_up,
+        g->sh_mid, g->sh_out, g->sh_logit, g->ple_rows, g->ple_emb, g->ple_k,
+        g->ple_v, g->ple_q, g->ple_gv, g->ple_cv, g->logits,
+        g->ple_conv_ckpt, g->mtp_res, g->mtp_embed, g->mtp_tokens,
+        g->mtp_positions, g->mtp_k_cache, g->mtp_v_cache, g->mtp_logits,
+    };
+    for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
+    ds4_ple_stream_close(g->ple_stream);
+    free(g->ple_row_ids);
+    free(g->ple_row_data);
+    free(g->verify_logits);
+    free(g->mtp_host_logits);
+    memset(g, 0, sizeof(*g));
+}
+
+/* Drop every recurrent trace of the current sequence.  There is no partial
+ * rewind: the DeltaNet state and the two conv windows only move forward. */
+static void q4e_graph_reset(ds4_q4e_graph *g) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g->gdn_conv[il]) {
+            ds4_gpu_tensor_fill_f32(g->gdn_conv[il], 0.0f,
+                                    (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN);
+            ds4_gpu_tensor_fill_f32(g->gdn_state[il], 0.0f,
+                                    (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                    DS4_N_GDN_HEAD_DIM);
+        }
+    }
+    if (g->ple_conv) {
+        ds4_gpu_tensor_fill_f32(g->ple_conv, 0.0f, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM);
+    }
+    g->pos = 0;
+    g->pend_valid = false;
+}
+
+static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
+    *dst = ds4_gpu_tensor_alloc(bytes);
+    return *dst != NULL;
+}
+
+static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
+    memset(g, 0, sizeof(*g));
+    g->ctx_size = ctx_size;
+    /* The chunk sizes every scratch buffer below.  It wants to be large: the
+     * dense projections re-read their weights once per chunk, so halving the
+     * chunk count halves that traffic, and with 512 experts a chunk of a few
+     * hundred tokens already touches every one of them.  The ceiling is
+     * memory -- the routed intermediates are tok_cap * n_used wide, and at
+     * 2048 they come to roughly 700 MiB. */
+    g->tok_cap = e->prefill_chunk ? e->prefill_chunk : 2048u;
+    {
+        /* The routed GEMMs are the reason to tune this: a chunk spreads
+         * tok_cap * 10 rows over 512 experts, so 1024 tokens leaves each expert
+         * a 20-row tile.  Wider chunks make those tiles worth the launch --
+         * 2048 measured 7% faster than 1024 on a 2048-token prefill.
+         *
+         * Chunk width perturbs the router logits by ~5e-5 (a different row
+         * count reassociates the GEMM), which is enough to flip which expert
+         * ranks tenth out of 512 when two are near-tied.  Downstream MoE
+         * activations then differ by ~1%.  That is inherent to top-k routing,
+         * not a defect: the drift against llama.cpp is 0.3% at every chunk
+         * width tested.  Do not treat a chunk-dependent logit as a bug. */
+        const char *env = getenv("DS4_QWEN4EXP_PREFILL_CHUNK");
+        if (env && env[0]) {
+            const long v = strtol(env, NULL, 10);
+            if (v > 0) g->tok_cap = (uint32_t)v;
+        }
+    }
+    if (g->tok_cap > 2048u) g->tok_cap = 2048u;
+    if (g->tok_cap > ctx_size) g->tok_cap = ctx_size;
+
+    const uint32_t T = g->tok_cap;
+    const uint64_t f = sizeof(float);
+    bool ok = true;
+
+    /* With an MTP head the verify pass runs 1 + K tokens and needs a logit
+     * row for each, plus K state checkpoints per recurrent layer. */
+    const bool mtp = e->mtp_ready && e->support_kind == DS4_SUPPORT_QWEN4EXP_MTP &&
+                     e->q4e_mtp_weights.ready;
+    g->spec_k = q4e_ngram_k();
+    if (mtp) {
+        const uint32_t k = e->mtp_draft_tokens > 0 ? (uint32_t)e->mtp_draft_tokens : 1u;
+        if (k > g->spec_k) g->spec_k = k;
+    }
+    if (g->spec_k > Q4E_SPEC_MAX_DRAFT) g->spec_k = Q4E_SPEC_MAX_DRAFT;
+    g->logit_rows = 1u + g->spec_k;
+    const uint64_t gdn_conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t gdn_state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                     DS4_N_GDN_HEAD_DIM * f;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (ds4_qwen4exp_layer_is_full_attn(il)) {
+            const uint64_t slots = (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t);
+            ok = q4e_alloc(&g->k_cache[il], slots) && q4e_alloc(&g->v_cache[il], slots);
+        } else {
+            ok = q4e_alloc(&g->gdn_conv[il], gdn_conv_bytes) &&
+                 q4e_alloc(&g->gdn_state[il], gdn_state_bytes);
+            if (ok && g->spec_k) {
+                ok = q4e_alloc(&g->gdn_conv_ckpt[il], g->spec_k * gdn_conv_bytes) &&
+                     q4e_alloc(&g->gdn_state_ckpt[il], g->spec_k * gdn_state_bytes);
+            }
+        }
+    }
+
+    const uint32_t row_bytes = (DS4_N_PLE_HEAD_DIM / 32u) * 18u;
+    ok = ok
+      && q4e_alloc(&g->ple_conv, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->tokens, (uint64_t)T * sizeof(int32_t))
+      && q4e_alloc(&g->positions, (uint64_t)T * sizeof(int32_t))
+      && q4e_alloc(&g->embed, (uint64_t)T * DS4_N_EMBD * f)
+      && q4e_alloc(&g->res, (uint64_t)T * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->xn, (uint64_t)T * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->lora, (uint64_t)T * DS4_N_HC_LOWRANK * f)
+      && q4e_alloc(&g->up, (uint64_t)T * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->mixed, (uint64_t)T * DS4_N_EMBD * f)
+      && q4e_alloc(&g->inject, (uint64_t)T * DS4_N_HC * f)
+      && q4e_alloc(&g->blk_out, (uint64_t)T * DS4_N_EMBD * f)
+      && q4e_alloc(&g->gdn_qkv, (uint64_t)T * Q4E_GDN_IN * f)
+      && q4e_alloc(&g->gdn_conv_out, (uint64_t)T * Q4E_GDN_IN * f)
+      && q4e_alloc(&g->gdn_z, (uint64_t)T * Q4E_GDN_V * f)
+      && q4e_alloc(&g->gdn_alpha, (uint64_t)T * DS4_N_GDN_VALUE_HEAD * f)
+      && q4e_alloc(&g->gdn_betap, (uint64_t)T * DS4_N_GDN_VALUE_HEAD * f)
+      && q4e_alloc(&g->gdn_decay, (uint64_t)T * DS4_N_GDN_VALUE_HEAD * f)
+      && q4e_alloc(&g->gdn_beta, (uint64_t)T * DS4_N_GDN_VALUE_HEAD * f)
+      && q4e_alloc(&g->gdn_attn, (uint64_t)T * Q4E_GDN_V * f)
+      && q4e_alloc(&g->gdn_gated, (uint64_t)T * Q4E_GDN_V * f)
+      && q4e_alloc(&g->qsa_qfull, (uint64_t)T * 2u * Q4E_Q_DIM * f)
+      && q4e_alloc(&g->qsa_q, (uint64_t)T * Q4E_Q_DIM * f)
+      && q4e_alloc(&g->qsa_gate, (uint64_t)T * Q4E_Q_DIM * f)
+      && q4e_alloc(&g->qsa_k, (uint64_t)T * Q4E_KV_DIM * f)
+      && q4e_alloc(&g->qsa_v, (uint64_t)T * Q4E_KV_DIM * f)
+      && q4e_alloc(&g->qsa_out, (uint64_t)T * Q4E_Q_DIM * f)
+      && q4e_alloc(&g->router, (uint64_t)T * DS4_N_EXPERT * f)
+      && q4e_alloc(&g->moe_ids, (uint64_t)T * DS4_N_EXPERT_USED * sizeof(int32_t))
+      && q4e_alloc(&g->moe_w, (uint64_t)T * DS4_N_EXPERT_USED * f)
+      && q4e_alloc(&g->moe_gate, (uint64_t)T * DS4_N_EXPERT_USED * DS4_N_FF_EXP * f)
+      && q4e_alloc(&g->moe_up, (uint64_t)T * DS4_N_EXPERT_USED * DS4_N_FF_EXP * f)
+      && q4e_alloc(&g->moe_mid, (uint64_t)T * DS4_N_EXPERT_USED * DS4_N_FF_EXP * f)
+      && q4e_alloc(&g->moe_down, (uint64_t)T * DS4_N_EXPERT_USED * DS4_N_EMBD * f)
+      && q4e_alloc(&g->sh_gate, (uint64_t)T * DS4_N_FF_EXP * f)
+      && q4e_alloc(&g->sh_up, (uint64_t)T * DS4_N_FF_EXP * f)
+      && q4e_alloc(&g->sh_mid, (uint64_t)T * DS4_N_FF_EXP * f)
+      && q4e_alloc(&g->sh_out, (uint64_t)T * DS4_N_EMBD * f)
+      && q4e_alloc(&g->sh_logit, (uint64_t)T * f)
+      && q4e_alloc(&g->ple_rows, (uint64_t)T * DS4_N_PLE_HEAD * row_bytes)
+      && q4e_alloc(&g->ple_emb, (uint64_t)T * DS4_N_EMBD * f)
+      && q4e_alloc(&g->ple_k, (uint64_t)T * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->ple_v, (uint64_t)T * DS4_N_EMBD * f)
+      && q4e_alloc(&g->ple_q, (uint64_t)T * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->ple_gv, (uint64_t)T * Q4E_HC_DIM * f)
+      && q4e_alloc(&g->ple_cv, (uint64_t)T * Q4E_HC_DIM * f)
+      /* Only the final row is ever sampled -- or the final 1 + K rows under
+       * speculative verify -- so the head runs on those rows and the buffer is
+       * that wide.  At 248320 logits a per-token buffer would be gigabytes of
+       * scratch for nothing. */
+      && q4e_alloc(&g->logits, (uint64_t)g->logit_rows * DS4_N_VOCAB * f);
+
+    if (ok && g->spec_k) {
+        ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
+        if (ok) g->verify_logits = xmalloc((size_t)g->logit_rows * DS4_N_VOCAB * sizeof(float));
+    }
+    if (ok && mtp) {
+        ok = q4e_alloc(&g->mtp_res, (uint64_t)T * Q4E_HC_DIM * f)
+          && q4e_alloc(&g->mtp_embed, (uint64_t)T * DS4_N_EMBD * f)
+          && q4e_alloc(&g->mtp_tokens, (uint64_t)T * sizeof(int32_t))
+          && q4e_alloc(&g->mtp_positions, (uint64_t)T * sizeof(int32_t))
+          && q4e_alloc(&g->mtp_k_cache, (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t))
+          && q4e_alloc(&g->mtp_v_cache, (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t))
+          && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
+        if (ok) {
+            g->mtp_host_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+            g->mtp_ready = true;
+        }
+    }
+
+    if (!ok) {
+        q4e_graph_free(g);
+        return 1;
+    }
+
+    /* The PLE table is read straight from the shard that holds it, never
+     * through the joined mapping: the reader wants a file descriptor. */
+    uint64_t file_offset = 0;
+    const uint32_t shard = model_shard_of(&e->model, e->weights.ple_table->abs_offset,
+                                          &file_offset);
+    ds4_ple_params params;
+    qwen4exp_ple_params(&params);
+    char err[256] = {0};
+    if (ds4_ple_stream_open(&g->ple_stream, &params, e->model.shard_fd[shard], file_offset,
+                            e->weights.ple_table->dim[1], e->ple_cache_bytes,
+                            err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: cannot open the qwen4exp PLE reader: %s\n", err);
+        q4e_graph_free(g);
+        return 1;
+    }
+    g->ple_row_ids = xmalloc((size_t)T * DS4_N_PLE_HEAD * sizeof(uint64_t));
+    g->ple_row_data = xmalloc((size_t)T * DS4_N_PLE_HEAD * row_bytes);
+
+    /* Recurrent state starts at zero and the conv windows start empty. */
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g->gdn_conv[il]) {
+            ds4_gpu_tensor_fill_f32(g->gdn_conv[il], 0.0f,
+                                    (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN);
+            ds4_gpu_tensor_fill_f32(g->gdn_state[il], 0.0f,
+                                    (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                    DS4_N_GDN_HEAD_DIM);
+        }
+    }
+    ds4_gpu_tensor_fill_f32(g->ple_conv, 0.0f, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM);
+    g->ready = true;
+    return 0;
+}
+
+/* Dense matmul dispatched on the weight's quant type.  qwen4exp's dense
+ * tensors are Q8_0 apart from the BF16 indexer projections and the F32 router
+ * and injection weights. */
+static int q4e_f32_splitk_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_NO_F32_SPLITK");
+        cached = (env && env[0] && env[0] != '0') ? 0 : 1;
+    }
+    return cached;
+}
+
+static int q4e_verify_graphs_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_VERIFY_GRAPHS");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static int q4e_rows_matmul_disabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_NO_ROWS_MATMUL");
+        cached = (env && env[0] && env[0] != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                      const ds4_gpu_tensor *x, uint32_t n_tok) {
+    /* The shared expert's gate is stored rank 1: one output row, so dim[1] is
+     * absent rather than 1. */
+    const uint64_t out_dim = w->ndim >= 2 ? w->dim[1] : 1u;
+    switch (w->type) {
+    case DS4_TENSOR_Q8_0:
+        /* The hyper-connection down projections and the QSA key/value heads
+         * are wide-in, narrow-out: the generic warp-per-row decode kernel
+         * fills too few blocks for them.  The narrow entry declines any shape
+         * it does not improve. */
+        if (n_tok == 1u) {
+            const int rc = ds4_gpu_q4e_matvec_q8_0_narrow(
+                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x);
+            if (rc != 0) return rc > 0;
+        } else if (n_tok <= 8u && !q4e_rows_matmul_disabled()) {
+            /* The speculative verify batch: a few rows through weights that
+             * are read once for all of them, instead of the generic
+             * multi-row dispatch. */
+            const int rc = ds4_gpu_q4e_matmul_q8_0_rows(
+                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x, n_tok);
+            if (rc != 0) return rc > 0;
+        }
+        /* fall through */
+    case DS4_TENSOR_Q4_K:
+        return ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type,
+                                           w->dim[0], out_dim, x, n_tok);
+    case DS4_TENSOR_BF16:
+        return ds4_gpu_glm53_matmul_bf16(out, m->map, m->size, w->abs_offset,
+                                         (uint32_t)w->dim[0], (uint32_t)out_dim, x, n_tok);
+    case DS4_TENSOR_F32:
+        /* The injection logits are 10240 inputs into 4 outputs, which the
+         * generic one-block-per-row kernel runs on four blocks, so splitting
+         * the contraction is worth about a tok/s.  Verified to leave the
+         * prefill fingerprint byte-identical; DS4_QWEN4EXP_NO_F32_SPLITK=1
+         * restores the generic path. */
+        if (n_tok == 1u && q4e_f32_splitk_enabled()) {
+            const int rc = ds4_gpu_q4e_matvec_f32(
+                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x);
+            if (rc != 0) return rc > 0;
+        }
+        return ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset,
+                                         w->dim[0], out_dim, x, n_tok);
+    default:
+        fprintf(stderr, "ds4: qwen4exp dense matmul: unsupported type %u\n", w->type);
+        return 0;
+    }
+}
+
+/* The hyper-connection mix.  Produces the block input and, in `inject`, the
+ * logits the matching combine needs -- both derive from the same normed
+ * residual, which is why they are computed together.
+ *
+ * `inject` is NULL for the mixer that stands in for the output norm: that one
+ * collapses the streams for the vocabulary projection and has nothing to
+ * inject back into a residual.  It goes through here rather than repeating
+ * the sequence at the call site, because when it was written out separately
+ * the `up` projection got fed the normed residual instead of the low-rank
+ * vector -- a 320-input matmul reading the first 320 of 10240 floats.  Every
+ * layer stayed exact and only the final logits were wrong, which reads as a
+ * model that answers short questions and falls apart on long ones. */
+static int q4e_hc_mix(ds4_q4e_graph *g, const ds4_model *m,
+                      const ds4_tensor *norm, const ds4_tensor *down,
+                      const ds4_tensor *up, const ds4_tensor *inject,
+                      uint32_t n_tok) {
+    if (!ds4_gpu_q4e_hc_norm(g->xn, g->res, m->map, m->size, norm->abs_offset,
+                             DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
+    if (!q4e_matmul(g->lora, m, down, g->xn, n_tok)) return 0;
+    if (!ds4_gpu_q4e_scale_silu(g->lora, 1.0f / (float)DS4_N_HC,
+                                (uint64_t)n_tok * DS4_N_HC_LOWRANK)) return 0;
+    if (!q4e_matmul(g->up, m, up, g->lora, n_tok)) return 0;
+    if (!ds4_gpu_q4e_hc_collapse(g->mixed, g->xn, g->up, DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+    if (!inject) return 1;
+    return q4e_matmul(g->inject, m, inject, g->xn, n_tok);
+}
+
+/* PLE n-gram block.  The rows were gathered on the host before the first
+ * layer ran, so this only decodes and applies them. */
+static int q4e_ple_block(ds4_q4e_graph *g, const ds4_model *m,
+                         const ds4_layer_weights *l, uint32_t n_tok) {
+    const uint32_t row_bytes = (DS4_N_PLE_HEAD_DIM / 32u) * 18u;
+    if (!ds4_gpu_q4e_ple_dequant(g->ple_emb, g->ple_rows, DS4_N_PLE_HEAD_DIM,
+                                 DS4_N_PLE_HEAD, row_bytes, n_tok)) return 0;
+    q4e_trace("ple_embd", -1, g->ple_emb, (uint64_t)n_tok * DS4_N_EMBD);
+
+    if (!q4e_matmul(g->ple_k, m, l->ple_key, g->ple_emb, n_tok)) return 0;
+    if (!q4e_matmul(g->ple_v, m, l->ple_value, g->ple_emb, n_tok)) return 0;
+    /* key and the residual are normed with their own weights; the gate is the
+     * per-stream dot of the two. */
+    if (!ds4_gpu_q4e_hc_norm(g->ple_k, g->ple_k, m->map, m->size,
+                             l->ple_norm_key->abs_offset,
+                             DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
+    if (!ds4_gpu_q4e_hc_norm(g->ple_q, g->res, m->map, m->size,
+                             l->ple_norm_query->abs_offset,
+                             DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
+    if (!ds4_gpu_q4e_ple_gated_value(g->ple_gv, g->ple_k, g->ple_q, g->ple_v,
+                                     DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+    q4e_trace("ple_gated_value", (int)DS4_PLE_LAYER, g->ple_gv, (uint64_t)n_tok * Q4E_HC_DIM);
+
+    /* The conv input is the gated value normed again, and its output is added
+     * alongside the ungated branch. */
+    if (!ds4_gpu_q4e_hc_norm(g->ple_cv, g->ple_gv, m->map, m->size,
+                             l->ple_norm_conv->abs_offset,
+                             DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
+    if (!ds4_gpu_q4e_ple_conv(g->ple_cv, g->ple_conv, g->ple_cv, m->map, m->size,
+                              l->ple_conv1d->abs_offset, Q4E_HC_DIM,
+                              DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, n_tok,
+                              g->ple_conv_ckpt, g->spec_k)) return 0;
+    q4e_trace("ple_conv_out", (int)DS4_PLE_LAYER, g->ple_cv, (uint64_t)n_tok * Q4E_HC_DIM);
+
+    return ds4_gpu_q4e_add2(g->res, g->ple_gv, g->ple_cv, (uint64_t)n_tok * Q4E_HC_DIM);
+}
+
+static int q4e_gdn_layer(ds4_q4e_graph *g, const ds4_model *m,
+                         const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
+    if (!q4e_matmul(g->gdn_qkv, m, l->gdn_qkv, g->mixed, n_tok)) return 0;
+    if (!ds4_gpu_q4e_gdn_conv(g->gdn_conv_out, g->gdn_conv[il], g->gdn_qkv,
+                              m->map, m->size, l->gdn_conv1d->abs_offset,
+                              Q4E_GDN_IN, DS4_N_GDN_CONV, n_tok,
+                              g->gdn_conv_ckpt[il], g->spec_k)) return 0;
+    q4e_trace("conv_output_silu", (int)il, g->gdn_conv_out, (uint64_t)n_tok * Q4E_GDN_IN);
+    /* q and k are L2 normalized after the conv; v is used as it comes. */
+    if (!ds4_gpu_q4e_gdn_l2norm(g->gdn_conv_out, DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                Q4E_GDN_IN, 0u, n_tok)) return 0;
+    if (!ds4_gpu_q4e_gdn_l2norm(g->gdn_conv_out, DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                Q4E_GDN_IN, Q4E_GDN_K, n_tok)) return 0;
+
+    if (!q4e_matmul(g->gdn_alpha, m, l->gdn_alpha, g->mixed, n_tok)) return 0;
+    if (!q4e_matmul(g->gdn_betap, m, l->gdn_beta, g->mixed, n_tok)) return 0;
+    if (!ds4_gpu_q4e_gdn_gates(g->gdn_decay, g->gdn_beta, g->gdn_alpha, g->gdn_betap,
+                               m->map, m->size, l->gdn_dt_bias->abs_offset,
+                               l->gdn_a->abs_offset, DS4_N_GDN_VALUE_HEAD, n_tok)) return 0;
+    q4e_trace("alpha", (int)il, g->gdn_alpha, (uint64_t)n_tok * DS4_N_GDN_VALUE_HEAD);
+    q4e_trace("gate", (int)il, g->gdn_decay, (uint64_t)n_tok * DS4_N_GDN_VALUE_HEAD);
+    q4e_trace("beta_sigmoid", (int)il, g->gdn_beta, (uint64_t)n_tok * DS4_N_GDN_VALUE_HEAD);
+
+    if (!ds4_gpu_q4e_gdn_recurrent(g->gdn_attn, g->gdn_state[il], g->gdn_conv_out,
+                                   g->gdn_decay, g->gdn_beta,
+                                   DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                   DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, n_tok,
+                                   g->gdn_state_ckpt[il], g->spec_k)) return 0;
+    q4e_trace("attn_output", (int)il, g->gdn_attn, (uint64_t)n_tok * Q4E_GDN_V);
+
+    if (!q4e_matmul(g->gdn_z, m, l->gdn_gate, g->mixed, n_tok)) return 0;
+    if (!ds4_gpu_q4e_gdn_out_gate(g->gdn_gated, g->gdn_attn, g->gdn_z,
+                                  m->map, m->size, l->gdn_norm->abs_offset,
+                                  DS4_N_GDN_HEAD_DIM, DS4_N_GDN_VALUE_HEAD,
+                                  n_tok, DS4_RMS_EPS)) return 0;
+    return q4e_matmul(g->blk_out, m, l->gdn_out, g->gdn_gated, n_tok);
+}
+
+static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
+                         const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
+    (void)il;
+    if (!q4e_matmul(g->qsa_qfull, m, l->qsa_q, g->mixed, n_tok)) return 0;
+    /* The query projection interleaves the query and its output gate per head;
+     * this splits them and applies the norm and the partial RoPE to the query. */
+    if (!ds4_gpu_q4e_qsa_q_norm_rope(g->qsa_q, g->qsa_gate, g->qsa_qfull,
+                                     m->map, m->size, l->qsa_q_norm->abs_offset,
+                                     g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                     DS4_N_ROT, DS4_ROPE_FREQ_BASE, n_tok,
+                                     DS4_RMS_EPS)) return 0;
+    if (!q4e_matmul(g->qsa_k, m, l->qsa_k, g->mixed, n_tok)) return 0;
+    if (!q4e_matmul(g->qsa_v, m, l->qsa_v, g->mixed, n_tok)) return 0;
+    if (!ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], g->qsa_k, g->qsa_v,
+                                  m->map, m->size, l->qsa_k_norm->abs_offset,
+                                  g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD_KV,
+                                  DS4_N_ROT, DS4_ROPE_FREQ_BASE, g->ctx_size,
+                                  n_tok, DS4_RMS_EPS)) return 0;
+    if (!ds4_gpu_q4e_qsa_attention(g->qsa_out, g->k_cache[il], g->v_cache[il], g->qsa_q,
+                                   g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                   DS4_N_HEAD_KV, n_tok)) return 0;
+    if (!ds4_gpu_q4e_qsa_gate(g->qsa_out, g->qsa_gate,
+                              (uint64_t)n_tok * Q4E_Q_DIM)) return 0;
+    q4e_trace("attn_gated", (int)il, g->qsa_out, (uint64_t)n_tok * Q4E_Q_DIM);
+    return q4e_matmul(g->blk_out, m, l->attn_output, g->qsa_out, n_tok);
+}
+
+static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
+                   const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
+    double t = q4e_phase_begin();
+    if (!q4e_matmul(g->router, m, l->ffn_gate_inp, g->mixed, n_tok)) return 0;
+    q4e_trace("ffn_moe_logits", (int)il, g->router, (uint64_t)n_tok * DS4_N_EXPERT);
+    if (!ds4_gpu_q4e_moe_route(g->moe_ids, g->moe_w, g->router,
+                               DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tok)) return 0;
+    q4e_trace("ffn_moe_weights_norm", (int)il, g->moe_w,
+              (uint64_t)n_tok * DS4_N_EXPERT_USED);
+    q4e_phase_end(Q4E_PH_MOE_ROUTE, t);
+
+    /* Gate and up read the same activation, so they run as one call that
+     * quantizes it once; at a single token that call also folds in the
+     * SwiGLU, leaving one launch where there were three. */
+    t = q4e_phase_begin();
+    int fused_silu = 0;
+    if (!ds4_gpu_q4e_moe_gate_up(g->moe_mid, g->moe_gate, g->moe_up,
+                                 g->mixed, g->moe_ids, m->map, m->size,
+                                 l->ffn_gate_exps->abs_offset,
+                                 l->ffn_up_exps->abs_offset,
+                                 l->ffn_gate_exps->type,
+                                 DS4_N_FF_EXP, DS4_N_EMBD, n_tok,
+                                 DS4_N_EXPERT, DS4_N_EXPERT_USED, &fused_silu)) return 0;
+    if (!fused_silu) {
+        q4e_trace("ffn_moe_gate", (int)il, g->moe_gate,
+                  (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_FF_EXP);
+        q4e_trace("ffn_moe_up", (int)il, g->moe_up,
+                  (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_FF_EXP);
+        if (!ds4_gpu_q4e_swiglu(g->moe_mid, g->moe_gate, g->moe_up,
+                                (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_FF_EXP)) return 0;
+    }
+    q4e_trace("ffn_moe_swiglu", (int)il, g->moe_mid,
+              (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_FF_EXP);
+    q4e_phase_end(Q4E_PH_MOE_GATE_UP, t);
+
+    /* Gate and up broadcast one input row across a token's experts, but down
+     * consumes a different vector per (token, slot).  So it runs as
+     * n_tok * n_used independent rows with a single expert each; the swiglu
+     * output is already laid out that way, one 640-wide row per column of the
+     * previous stage. */
+    t = q4e_phase_begin();
+    if (!ds4_gpu_q4e_moe_down(g->moe_down, g->moe_mid, g->moe_ids, m->map, m->size,
+                              l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
+                              DS4_N_EMBD, DS4_N_FF_EXP,
+                              n_tok, DS4_N_EXPERT, DS4_N_EXPERT_USED)) return 0;
+    q4e_trace("ffn_moe_down", (int)il, g->moe_down,
+              (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_EMBD);
+    if (!ds4_gpu_q4e_moe_combine(g->blk_out, g->moe_down, g->moe_w,
+                                 DS4_N_EMBD, DS4_N_EXPERT_USED, n_tok)) return 0;
+    q4e_trace("ffn_moe_out", (int)il, g->blk_out, (uint64_t)n_tok * DS4_N_EMBD);
+    q4e_phase_end(Q4E_PH_MOE_DOWN, t);
+
+    /* The shared expert runs dense on every token and carries a scalar gate. */
+    t = q4e_phase_begin();
+    if (!q4e_matmul(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, n_tok)) return 0;
+    if (!q4e_matmul(g->sh_up, m, l->ffn_up_shexp, g->mixed, n_tok)) return 0;
+    if (!ds4_gpu_q4e_swiglu(g->sh_mid, g->sh_gate, g->sh_up,
+                            (uint64_t)n_tok * DS4_N_FF_EXP)) return 0;
+    q4e_trace("ffn_shexp_gate", (int)il, g->sh_gate, (uint64_t)n_tok * DS4_N_FF_EXP);
+    q4e_trace("ffn_shexp_up", (int)il, g->sh_up, (uint64_t)n_tok * DS4_N_FF_EXP);
+    q4e_trace("ffn_shexp_mid", (int)il, g->sh_mid, (uint64_t)n_tok * DS4_N_FF_EXP);
+    if (!q4e_matmul(g->sh_out, m, l->ffn_down_shexp, g->sh_mid, n_tok)) return 0;
+    q4e_trace("ffn_shexp", (int)il, g->sh_out, (uint64_t)n_tok * DS4_N_EMBD);
+    if (!q4e_matmul(g->sh_logit, m, l->ffn_gate_inp_shexp, g->mixed, n_tok)) return 0;
+    const int rc = ds4_gpu_q4e_shared_add(g->blk_out, g->sh_out, g->sh_logit,
+                                          DS4_N_EMBD, n_tok);
+    q4e_phase_end(Q4E_PH_MOE_SHARED, t);
+    return rc;
+}
+
+/* A decoder layer runs as two islands: everything from the attention-side
+ * hyper-connection mix to its combine, then the same for the FFN side.  The
+ * split exists so each half can be captured as a CUDA graph -- at one token
+ * the ~35 kernels a layer launches cost more in launch overhead than they do
+ * on the GPU, and a replayed graph pays that once at capture. */
+static int q4e_encode_attn_island(ds4_q4e_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  uint32_t n_tok) {
+    double t;
+    if (ds4_qwen4exp_layer_has_ple(il)) {
+        t = q4e_phase_begin();
+        if (!q4e_ple_block(g, m, l, n_tok)) return 0;
+        q4e_phase_end(Q4E_PH_PLE_BLOCK, t);
+    }
+
+    t = q4e_phase_begin();
+    if (!q4e_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up,
+                    l->hc_attn_inject, n_tok)) return 0;
+    q4e_phase_end(Q4E_PH_HC_MIX, t);
+    q4e_trace("hc_mixed", (int)il, g->mixed, (uint64_t)n_tok * DS4_N_EMBD);
+
+    t = q4e_phase_begin();
+    if (ds4_qwen4exp_layer_is_full_attn(il)) {
+        if (!q4e_qsa_layer(g, m, l, il, n_tok)) return 0;
+        q4e_phase_end(Q4E_PH_QSA, t);
+    } else {
+        if (!q4e_gdn_layer(g, m, l, il, n_tok)) return 0;
+        q4e_phase_end(Q4E_PH_GDN, t);
+    }
+
+    t = q4e_phase_begin();
+    if (!ds4_gpu_q4e_hc_combine(g->res, g->blk_out, g->inject,
+                                DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+    q4e_phase_end(Q4E_PH_HC_COMBINE, t);
+    q4e_trace("hc_combine", (int)il, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
+    return 1;
+}
+
+static int q4e_encode_ffn_island(ds4_q4e_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il,
+                                 uint32_t n_tok) {
+    double t = q4e_phase_begin();
+    if (!q4e_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up,
+                    l->hc_ffn_inject, n_tok)) return 0;
+    q4e_phase_end(Q4E_PH_HC_MIX, t);
+
+    if (!q4e_moe(g, m, l, il, n_tok)) return 0;
+    q4e_trace("ffn_out", (int)il, g->blk_out, (uint64_t)n_tok * DS4_N_EMBD);
+
+    t = q4e_phase_begin();
+    if (!ds4_gpu_q4e_hc_combine(g->res, g->blk_out, g->inject,
+                                DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+    q4e_phase_end(Q4E_PH_HC_COMBINE, t);
+    q4e_trace("l_last", (int)il, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
+    return 1;
+}
+
+static int q4e_encode_island(ds4_q4e_graph *g, const ds4_model *m,
+                             const ds4_layer_weights *l, uint32_t il,
+                             uint32_t island, uint32_t n_tok) {
+    return island == 0u ? q4e_encode_attn_island(g, m, l, il, n_tok)
+                        : q4e_encode_ffn_island(g, m, l, il, n_tok);
+}
+
+/* Run one island, replaying its captured graph when there is one.  The
+ * protocol is the GLM 5.3 FFN tail's: the first encode of an entry runs
+ * eagerly so lazy scratch reaches steady state, the second is captured, and
+ * every later token replays.  A capture that fails retires the entry and the
+ * island stays eager for the rest of the session. */
+static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
+                          const ds4_layer_weights *l, uint32_t il,
+                          uint32_t island, uint32_t n_tok, bool graphs_ok) {
+    if (!graphs_ok) return q4e_encode_island(g, m, l, il, island, n_tok);
+
+    ds4_decode_graph_key key;
+    memset(&key, 0, sizeof(key));
+    key.il = il;
+    key.island = island;
+    /* The launch sequence bakes the row count in, so a speculative verify at
+     * 1 + K tokens and a one-token decode are different captures. */
+    key.variant = n_tok;
+    /* Identity is the buffer set the island writes through; a session that
+     * reallocates its graph gets a different key and a fresh capture.  The
+     * MTP draft shares every scratch buffer but has its own residual, which
+     * is what keeps its captures apart from the target's. */
+    key.cur_hc = (void *)g->res;
+    key.after_attn_hc = (void *)g->blk_out;
+    key.after_ffn_hc = (void *)g->mixed;
+    key.attn_norm = (void *)g->xn;
+
+    for (;;) {
+        const int state = ds4_gpu_decode_graph_begin(&key);
+        if (state == 1) return 1;              /* replayed */
+        if (state == 0) {
+            if (!q4e_encode_island(g, m, l, il, island, n_tok)) {
+                ds4_gpu_decode_graph_abort(&key);
+                return q4e_encode_island(g, m, l, il, island, n_tok);
+            }
+            if (ds4_gpu_decode_graph_end(&key) == 0) return 1;
+            continue;                          /* capture failed: retry */
+        }
+        break;                                 /* warm pass, or disabled */
+    }
+    return q4e_encode_island(g, m, l, il, island, n_tok);
+}
+
+/* Gather the PLE rows for this chunk.  The hash reads up to ngram_size - 1
+ * tokens before each position, so `history` must hold the whole prefix, not
+ * just the chunk.  Doing this before the layer loop means the read latency
+ * overlaps the first layer's compute. */
+static int q4e_ple_gather(ds4_q4e_graph *g, const int *history,
+                          uint32_t pos0, uint32_t n_tok) {
+    ds4_ple_params params;
+    qwen4exp_ple_params(&params);
+    const uint32_t row_bytes = ds4_ple_row_bytes(&params);
+    const uint32_t n_rows = n_tok * params.n_heads;
+
+    ds4_ple_row_ids(&params, history, pos0, n_tok, g->ple_row_ids);
+    char err[256] = {0};
+    if (ds4_ple_stream_fetch(g->ple_stream, g->ple_row_ids, n_rows,
+                             g->ple_row_data, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp PLE gather failed: %s\n", err);
+        return 0;
+    }
+    return ds4_gpu_tensor_write(g->ple_rows, 0, g->ple_row_data,
+                                (uint64_t)n_rows * row_bytes) ? 0 : 1;
+}
+
+/* Run the target on history[pos0, pos0 + n_tok).  `logit_rows` is how many
+ * trailing rows go through the vocabulary head: 0 for a prefill chunk that is
+ * not the last, 1 for ordinary decode (into s->logits), 1 + K for a
+ * speculative verify (into g->verify_logits, row-major). */
+static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32_t n_tok,
+                       uint32_t logit_rows) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    ds4_engine *e = s->engine;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+
+    if (n_tok == 0 || n_tok > g->tok_cap) return 1;
+    if (pos0 + n_tok > g->ctx_size) return 1;
+    if (logit_rows > n_tok || logit_rows > g->logit_rows) return 1;
+
+    g_q4e_trace_ntok = n_tok;
+    int32_t *ids = xmalloc((size_t)n_tok * sizeof(int32_t));
+    int32_t *pos = xmalloc((size_t)n_tok * sizeof(int32_t));
+    for (uint32_t i = 0; i < n_tok; i++) {
+        ids[i] = history[pos0 + i];
+        pos[i] = (int32_t)(pos0 + i);
+    }
+    const bool uploaded =
+        ds4_gpu_tensor_write(g->tokens, 0, ids, (uint64_t)n_tok * sizeof(int32_t)) &&
+        ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n_tok * sizeof(int32_t));
+    free(ids);
+    free(pos);
+    if (!uploaded) return 1;
+
+    double tph = q4e_phase_begin();
+    if (q4e_ple_gather(g, history, pos0, n_tok) != 0) return 1;
+    q4e_phase_end(Q4E_PH_PLE_GATHER, tph);
+
+    tph = q4e_phase_begin();
+    if (!ds4_gpu_embed_tokens_quant_tensor(g->embed, g->tokens, m->map, m->size,
+                                           w->token_embd->abs_offset, w->token_embd->type,
+                                           DS4_N_VOCAB, n_tok, DS4_N_EMBD)) return 1;
+    /* The residual starts as the embedding tiled across the streams. */
+    if (!ds4_gpu_q4e_hc_init(g->res, g->embed, DS4_N_EMBD, DS4_N_HC, n_tok)) return 1;
+    q4e_phase_end(Q4E_PH_EMBED, tph);
+    q4e_trace("hc_init", -1, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
+    g_q4e_steps++;
+
+    /* Graph capture is a decode-only optimization: it needs a fixed launch
+     * sequence, which prefill's varying token count breaks, and the tracing
+     * and profiling hooks read back device memory mid-island.  A speculative
+     * verify runs a fixed 1 + K rows and captures too when
+     * DS4_QWEN4EXP_VERIFY_GRAPHS=1: every kernel on that path now uses
+     * persistent scratch, but a pool allocation inside a capture aborts the
+     * process rather than failing the capture, so it stays opt-in until it
+     * has run long enough to trust. */
+    const bool graphs_ok = (n_tok == 1u ||
+                            (g->spec_k && n_tok == 1u + g->spec_k && q4e_verify_graphs_enabled())) &&
+                           !q4e_trace_enabled() &&
+                           !q4e_profile_enabled() &&
+                           ds4_gpu_decode_graphs_supported() != 0;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (!q4e_run_island(g, m, l, il, 0u, n_tok, graphs_ok)) return 1;
+        if (!q4e_run_island(g, m, l, il, 1u, n_tok, graphs_ok)) return 1;
+    }
+
+    if (logit_rows == 0u) {
+        g->pos = pos0 + n_tok;
+        return 0;
+    }
+
+    tph = q4e_phase_begin();
+    /* The final hyper-connection mix collapses the streams and stands in for
+     * the output norm; there is no separate output_norm tensor, and nothing
+     * to inject. */
+    if (!q4e_hc_mix(g, m, w->output_mix_norm, w->output_mix_down,
+                    w->output_mix_up, NULL, n_tok)) return 1;
+    q4e_trace("result_norm", -1, g->mixed, (uint64_t)n_tok * DS4_N_EMBD);
+
+    /* Only the final rows are sampled, so the vocabulary projection -- the
+     * single widest matmul in the model -- runs on those instead of the
+     * whole chunk. */
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+            g->mixed, (uint64_t)(n_tok - logit_rows) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)logit_rows * DS4_N_EMBD * sizeof(float));
+    if (!last) return 1;
+    const int projected = q4e_matmul(g->logits, m, w->output, last, logit_rows);
+    ds4_gpu_tensor_free(last);
+    if (!projected) return 1;
+    q4e_trace("result_output", -1, g->logits, (uint64_t)DS4_N_VOCAB);
+    q4e_phase_end(Q4E_PH_OUTPUT, tph);
+
+    if (!ds4_gpu_synchronize()) return 1;
+    if (!ds4_gpu_tensor_read(g->logits, 0,
+                             logit_rows == 1u ? s->logits : g->verify_logits,
+                             (uint64_t)logit_rows * DS4_N_VOCAB * sizeof(float))) {
+        return 1;
+    }
+    g->pos = pos0 + n_tok;
+    return 0;
+}
+
+/* =========================================================================
+ * qwen4exp MTP speculative decoding.
+ * =========================================================================
+ *
+ * The head predicts the token *after* the next one: at position p it takes the
+ * target's pre-final-mixer residual for p and the embedding of the token at
+ * p + 1, and its logits are for p + 2.  K drafts chain the single layer K
+ * times, each step feeding the previous step's four-stream residual back in
+ * (vllm/models/qwen4_exp/nvidia/mtp.py).  The target then verifies the sampled
+ * token plus the K drafts in one 1 + K row pass and keeps the longest prefix
+ * whose argmax agrees.
+ *
+ * The draft layer has its own KV cache; it is written by the same store kernel
+ * as the target's, at explicit positions, so a rejected suffix simply gets
+ * overwritten by the next step and needs no rollback.  The target's recurrent
+ * state does: see the checkpoint arguments to the GDN and PLE kernels.
+ */
+
+/* Draft layer slot.  The last target layer is always full attention and never
+ * carries the PLE block, so its index makes the shared island code take the
+ * right branches for the draft; only the KV cache at that index is the
+ * draft's. */
+#define Q4E_MTP_SLOT (DS4_N_LAYER - 1u)
+
+/* One draft pass over n rows.  `hidden` is [n, hc * n_embd]: target residual
+ * rows on the first step, the previous draft step's residual afterwards.
+ * tokens[i] is the token at positions[i] + 1.  When out_logits is set the last
+ * row goes through the target's vocabulary head and lands there. */
+static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
+                         const int32_t *tokens, const int32_t *positions, uint32_t n,
+                         float *out_logits) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    ds4_engine *e = s->engine;
+    const ds4_model *tm = &e->model;
+    const ds4_model *mm = &e->mtp_model;
+    const ds4_q4e_mtp_weights *mw = &e->q4e_mtp_weights;
+    if (!g->mtp_ready || n == 0 || n > g->tok_cap) return 1;
+
+    /* The draft's view of the graph: its own residual, inputs, KV and logits,
+     * every scratch buffer shared with the target. */
+    ds4_q4e_graph d = *g;
+    d.res = g->mtp_res;
+    d.embed = g->mtp_embed;
+    d.tokens = g->mtp_tokens;
+    d.positions = g->mtp_positions;
+    d.logits = g->mtp_logits;
+    d.k_cache[Q4E_MTP_SLOT] = g->mtp_k_cache;
+    d.v_cache[Q4E_MTP_SLOT] = g->mtp_v_cache;
+    /* The draft layer has no recurrent state to checkpoint. */
+    d.spec_k = 0;
+
+    if (!ds4_gpu_tensor_write(d.tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(d.positions, 0, positions, (uint64_t)n * sizeof(int32_t))) {
+        return 1;
+    }
+
+    /* emb = fc_embedding(norm(embed(token))) -> g->mixed [n, n_embd] */
+    if (!ds4_gpu_embed_tokens_quant_tensor(d.embed, d.tokens, tm->map, tm->size,
+                                           e->weights.token_embd->abs_offset,
+                                           e->weights.token_embd->type,
+                                           DS4_N_VOCAB, n, DS4_N_EMBD)) return 1;
+    q4e_trace("mtp_embed", -1, d.embed, (uint64_t)n * DS4_N_EMBD);
+    if (!ds4_gpu_q4e_hc_norm(g->blk_out, d.embed, mm->map, mm->size,
+                             mw->pre_fc_norm_embedding->abs_offset,
+                             DS4_N_EMBD, 1u, n, DS4_RMS_EPS)) return 1;
+    q4e_trace("mtp_embed_norm", -1, g->blk_out, (uint64_t)n * DS4_N_EMBD);
+    if (!q4e_matmul(g->mixed, mm, mw->fc_embedding, g->blk_out, n)) return 1;
+    q4e_trace("mtp_fc_embedding", -1, g->mixed, (uint64_t)n * DS4_N_EMBD);
+
+    /* h = fc_hidden(norm_10240(hidden)) per stream -> g->up [n, hc * n_embd].
+     * The norm is one RMS over the whole 10240 vector with a 10240 affine,
+     * which the grouped kernel does with a single group of that width; the
+     * projection is then the same 2560x2560 matrix on every stream, i.e. a
+     * matmul over n * hc rows. */
+    q4e_trace("mtp_hidden_in", -1, hidden, (uint64_t)n * Q4E_HC_DIM);
+    if (!ds4_gpu_q4e_hc_norm(g->xn, hidden, mm->map, mm->size,
+                             mw->pre_fc_norm_hidden->abs_offset,
+                             Q4E_HC_DIM, 1u, n, DS4_RMS_EPS)) return 1;
+    q4e_trace("mtp_hidden_norm", -1, g->xn, (uint64_t)n * Q4E_HC_DIM);
+    if (!q4e_matmul(g->up, mm, mw->fc_hidden, g->xn, n * DS4_N_HC)) return 1;
+    q4e_trace("mtp_fc_hidden", -1, g->up, (uint64_t)n * Q4E_HC_DIM);
+    if (!ds4_gpu_q4e_hc_init_add(d.res, g->mixed, g->up, DS4_N_EMBD, DS4_N_HC, n)) return 1;
+    q4e_trace("mtp_res_init", -1, d.res, (uint64_t)n * Q4E_HC_DIM);
+
+    const bool graphs_ok = n == 1u &&
+                           !q4e_trace_enabled() &&
+                           !q4e_profile_enabled() &&
+                           ds4_gpu_decode_graphs_supported() != 0;
+    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 0u, n, graphs_ok)) return 1;
+    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 1u, n, graphs_ok)) return 1;
+    if (!out_logits) return 0;
+
+    /* The collapsing mixer has no inject; the vocabulary head is the
+     * target's, shared with the draft exactly as the embedding is. */
+    if (!q4e_hc_mix(&d, mm, mw->hc_norm, mw->hc_down, mw->hc_up, NULL, n)) return 1;
+    q4e_trace("mtp_result_norm", -1, g->mixed, (uint64_t)n * DS4_N_EMBD);
+    ds4_gpu_tensor *last = ds4_gpu_tensor_view(
+            g->mixed, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float),
+            (uint64_t)DS4_N_EMBD * sizeof(float));
+    if (!last) return 1;
+    const int projected = q4e_matmul(d.logits, tm, e->weights.output, last, 1u);
+    ds4_gpu_tensor_free(last);
+    if (!projected) return 1;
+    q4e_trace("mtp_result_output", -1, d.logits, (uint64_t)DS4_N_VOCAB);
+    if (!ds4_gpu_synchronize()) return 1;
+    return ds4_gpu_tensor_read(d.logits, 0, out_logits,
+                               (uint64_t)DS4_N_VOCAB * sizeof(float)) ? 0 : 1;
+}
+
+/* Write the draft KV for the pending target rows.  history supplies the
+ * token after each row; `last_token` overrides it for the final row, which
+ * is how the freshly sampled token gets in before it is part of history.
+ * Returns the draft's logits for the row after the last one in out_logits
+ * when asked. */
+static int q4e_mtp_flush_pending(ds4_session *s, const int *history, int last_token,
+                                 float *out_logits) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (!g->mtp_ready || !g->pend_valid) return 0;
+    const uint32_t n = g->pend_n;
+    int32_t *tok = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *pos = xmalloc((size_t)n * sizeof(int32_t));
+    for (uint32_t i = 0; i < n; i++) {
+        pos[i] = (int32_t)(g->pend_pos0 + i);
+        tok[i] = (i + 1u < n || last_token < 0) ? history[g->pend_pos0 + i + 1u] : last_token;
+    }
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
+            g->res, (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
+            (uint64_t)n * Q4E_HC_DIM * sizeof(float));
+    int rc = 1;
+    if (hidden) rc = q4e_mtp_draft(s, hidden, tok, pos, n, out_logits);
+    ds4_gpu_tensor_free(hidden);
+    free(tok);
+    free(pos);
+    g->pend_valid = false;
+    return rc;
+}
+
+/* After a target chunk at [pos0, pos0 + n_tok) whose next tokens are known
+ * from history, draft every row but the last and leave that one pending. */
+static int q4e_mtp_after_prefill_chunk(ds4_session *s, const int *history,
+                                       uint32_t pos0, uint32_t n_tok) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (!g->mtp_ready) return 0;
+    g->pend_valid = true;
+    g->pend_row0 = 0;
+    g->pend_n = n_tok;
+    g->pend_pos0 = pos0;
+    if (n_tok >= 2u) {
+        g->pend_n = n_tok - 1u;
+        if (q4e_mtp_flush_pending(s, history, -1, NULL) != 0) return 1;
+        g->pend_valid = true;
+        g->pend_row0 = n_tok - 1u;
+        g->pend_n = 1u;
+        g->pend_pos0 = pos0 + n_tok - 1u;
+    }
+    return 0;
+}
+
+/* Restore the recurrent state as it stood after row `keep` of the last
+ * verify pass (0-based), discarding the rows after it. */
+static int q4e_spec_rollback(ds4_q4e_graph *g, uint32_t keep) {
+    if (keep >= g->spec_k) return 0;
+    const uint64_t f = sizeof(float);
+    const uint64_t conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                 DS4_N_GDN_HEAD_DIM * f;
+    const uint64_t ple_bytes = (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->gdn_conv[il]) continue;
+        if (!ds4_gpu_tensor_copy(g->gdn_conv[il], 0, g->gdn_conv_ckpt[il],
+                                 (uint64_t)keep * conv_bytes, conv_bytes) ||
+            !ds4_gpu_tensor_copy(g->gdn_state[il], 0, g->gdn_state_ckpt[il],
+                                 (uint64_t)keep * state_bytes, state_bytes)) return 1;
+    }
+    if (!ds4_gpu_tensor_copy(g->ple_conv, 0, g->ple_conv_ckpt,
+                             (uint64_t)keep * ple_bytes, ple_bytes)) return 1;
+    return 0;
+}
+
+/* One decode step: commit `first_token`, draft up to K tokens after it,
+ * verify them all in one target pass and keep the accepted prefix.  Returns
+ * the number of committed tokens (first_token plus accepted drafts) written
+ * to accepted[], or -1.  s->logits ends up holding the distribution for the
+ * position after the last committed token, as after a plain eval.  K = 0 is
+ * the plain path and still keeps the draft KV current. */
+static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_token,
+                         int *accepted, int accepted_cap, char *err, size_t errlen) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+    if (accepted_cap < 1) return -1;
+    if (pos0 + 1u > g->ctx_size) {
+        if (errlen) snprintf(err, errlen, "qwen4exp context is full");
+        return -1;
+    }
+    /* K is the caller's ceiling; each drafter has its own below it. */
+    if (K > g->spec_k) K = g->spec_k;
+    if (pos0 + 1u + K > g->ctx_size) K = g->ctx_size - pos0 - 1u;
+    if ((int)K > accepted_cap - 1) K = (uint32_t)(accepted_cap - 1);
+
+    int drafts[Q4E_SPEC_MAX_DRAFT];
+    uint32_t n_draft = 0;
+    bool from_ngram = false;
+    const double t_draft = now_sec();
+
+    /* Prompt lookup first: when the recent tokens repeat something earlier
+     * in the context, the continuation there is a better and longer guess
+     * than the head's, and it costs nothing on the GPU. */
+    {
+        uint32_t ng_k = q4e_ngram_k();
+        if (ng_k > K) ng_k = K;
+        if (ng_k) {
+            n_draft = q4e_ngram_propose(s->checkpoint.v, pos0, first_token, drafts, ng_k);
+            from_ngram = n_draft != 0;
+        }
+    }
+
+    uint32_t mtp_k = 0;
+    if (g->mtp_ready && g->pend_valid && !from_ngram) {
+        mtp_k = s->engine->mtp_draft_tokens > 0 ? (uint32_t)s->engine->mtp_draft_tokens : 0;
+        if (mtp_k > K) mtp_k = K;
+    }
+    K = mtp_k;
+    if (g->mtp_ready && g->pend_valid) {
+        /* The draft KV follows every committed token whether or not the head
+         * proposes this step. */
+        const uint32_t flushed_n = g->pend_n;
+        if (q4e_mtp_flush_pending(s, s->checkpoint.v, first_token,
+                                  K ? g->mtp_host_logits : NULL) != 0) {
+            if (errlen) snprintf(err, errlen, "qwen4exp MTP draft failed");
+            ds4_session_invalidate(s);
+            return -1;
+        }
+        if (K) {
+            /* The pending rows ended at position pos0 - 1; the draft residual
+             * for that row is the last of the rows just written. */
+            uint32_t last_row = flushed_n - 1u;
+            drafts[n_draft++] = sample_argmax(g->mtp_host_logits, DS4_N_VOCAB);
+            while (n_draft < K && drafts[n_draft - 1u] != eos_token) {
+                ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
+                        g->mtp_res, (uint64_t)last_row * Q4E_HC_DIM * sizeof(float),
+                        (uint64_t)Q4E_HC_DIM * sizeof(float));
+                const int32_t tok = drafts[n_draft - 1u];
+                const int32_t pos = (int32_t)(pos0 - 1u + n_draft);
+                const int rc = hidden ? q4e_mtp_draft(s, hidden, &tok, &pos, 1u,
+                                                      g->mtp_host_logits) : 1;
+                ds4_gpu_tensor_free(hidden);
+                if (rc != 0) {
+                    if (errlen) snprintf(err, errlen, "qwen4exp MTP draft failed");
+                    ds4_session_invalidate(s);
+                    return -1;
+                }
+                last_row = 0;
+                drafts[n_draft++] = sample_argmax(g->mtp_host_logits, DS4_N_VOCAB);
+            }
+        }
+    }
+    K = n_draft;
+    const double t_verify = now_sec();
+    if (from_ngram) {
+        g->spec_ngram_steps++;
+        g->spec_ngram_drafted += K;
+    }
+
+    /* Verify: the whole prefix must be in history before the forward pass
+     * because the PLE hash reads the tokens before each position. */
+    token_vec_push(&s->checkpoint, first_token);
+    for (uint32_t i = 0; i < K; i++) token_vec_push(&s->checkpoint, drafts[i]);
+    if (q4e_forward(s, s->checkpoint.v, pos0, 1u + K, 1u + K) != 0) {
+        s->checkpoint.len = (int)pos0;
+        if (errlen) snprintf(err, errlen, "qwen4exp decode failed");
+        ds4_session_invalidate(s);
+        return -1;
+    }
+
+    /* Accept the longest prefix of drafts the target's argmax agrees with.
+     * Row i holds the distribution after token pos0 + i, i.e. the target's
+     * choice for the token drafts[i] proposed. */
+    uint32_t a = 0;
+    const float *rows = K ? g->verify_logits : s->logits;
+    while (a < K) {
+        if (sample_argmax(rows + (size_t)a * DS4_N_VOCAB, DS4_N_VOCAB) != drafts[a]) break;
+        a++;
+        if (drafts[a - 1u] == eos_token) break;
+    }
+    if (from_ngram) g->spec_ngram_accepted += a;
+    if (K && getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+        fprintf(stderr, "q4e spec pos=%u first=%d %s drafts=", pos0, first_token,
+                from_ngram ? "ngram" : "mtp");
+        for (uint32_t i = 0; i < K; i++) fprintf(stderr, "%s%d", i ? "," : "", drafts[i]);
+        fprintf(stderr, " target=");
+        for (uint32_t i = 0; i < K; i++) {
+            fprintf(stderr, "%s%d", i ? "," : "",
+                    sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB));
+        }
+        fprintf(stderr, " accepted=%u\n", a);
+    }
+    if (a < K && q4e_spec_rollback(g, a) != 0) {
+        s->checkpoint.len = (int)pos0;
+        if (errlen) snprintf(err, errlen, "qwen4exp speculative rollback failed");
+        ds4_session_invalidate(s);
+        return -1;
+    }
+    s->checkpoint.len = (int)(pos0 + 1u + a);
+    g->pos = pos0 + 1u + a;
+    if (K) memcpy(s->logits, rows + (size_t)a * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+
+    /* The committed rows' residuals wait in g->res for the next step, whose
+     * sampled token completes the last one. */
+    if (g->mtp_ready) {
+        g->pend_valid = true;
+        g->pend_row0 = 0;
+        g->pend_n = 1u + a;
+        g->pend_pos0 = pos0;
+    }
+
+    accepted[0] = first_token;
+    for (uint32_t i = 0; i < a; i++) accepted[1u + i] = drafts[i];
+    g->spec_steps++;
+    g->spec_drafted += K;
+    g->spec_accepted += a;
+    if (K) {
+        const double now = now_sec();
+        g->spec_draft_ms += (t_verify - t_draft) * 1e3;
+        g->spec_verify_ms += (now - t_verify) * 1e3;
+    }
+    return (int)(1u + a);
+}
+#endif /* DS4_NO_GPU */
+
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (!out || !e || ctx_size <= 0) return 1;
     if (e->backend == DS4_BACKEND_CPU) {
@@ -63607,6 +66365,17 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     ds4_session *s = xcalloc(1, sizeof(*s));
     s->engine = e;
     s->ctx_size = ctx_size;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
+        if (q4e_graph_alloc(&s->q4e_graph, e, (uint32_t)ctx_size) != 0) {
+            free(s);
+            return 1;
+        }
+        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
+        s->prefill_cap = (int)s->q4e_graph.tok_cap;
+        *out = s;
+        return 0;
+    }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
         const uint32_t normal_layers = glm_graph_normal_layer_count();
         uint32_t layer_start = 0;
@@ -63904,6 +66673,7 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     ds4_session_print_dspark_stats(s);
+    q4e_graph_free(&s->q4e_graph);
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
@@ -65375,6 +68145,65 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                      err,
                                      errlen);
     }
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) {
+        /* Every layer carries recurrent state -- the DeltaNet matrices, the two
+         * conv windows -- and none of it can be rewound partway, so a prompt
+         * that is not an extension of the live checkpoint rebuilds from zero.
+         * Prefix reuse still covers the common agent case of appending turns. */
+        ds4_q4e_graph *g = &s->q4e_graph;
+        uint32_t start = 0;
+        if (s->checkpoint_valid && ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+            (uint32_t)s->checkpoint.len == g->pos) {
+            start = g->pos;
+        } else {
+            q4e_graph_reset(g);
+            s->checkpoint.len = 0;
+        }
+        if (start == (uint32_t)prompt->len) {
+            /* The prompt is exactly the live checkpoint, so s->logits already
+             * holds the last row's distribution.  Re-running that row would
+             * advance the DeltaNet and conv states a second time on the same
+             * token, so the answer is to not run anything. */
+            s->mtp_draft_valid = false;
+            return 0;
+        }
+
+        for (uint32_t pos = start; pos < (uint32_t)prompt->len; ) {
+            const uint32_t take = ((g->tok_cap < (uint32_t)prompt->len - pos) ? g->tok_cap : (uint32_t)prompt->len - pos);
+            const bool last = (pos + take) == (uint32_t)prompt->len;
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            /* The draft KV for the previous chunk's last row (or the last
+             * decode's committed rows) needs this chunk's first token, and its
+             * residual rows are about to be overwritten. */
+            if (q4e_mtp_flush_pending(s, prompt->v, -1, NULL) != 0) {
+                snprintf(err, errlen, "qwen4exp MTP prefill failed at %u", pos);
+                ds4_session_invalidate(s);
+                return 1;
+            }
+            if (q4e_forward(s, prompt->v, pos, take, last ? 1u : 0u) != 0) {
+                snprintf(err, errlen, "qwen4exp prefill failed at %u", pos);
+                ds4_session_invalidate(s);
+                return 1;
+            }
+            if (q4e_mtp_after_prefill_chunk(s, prompt->v, pos, take) != 0) {
+                snprintf(err, errlen, "qwen4exp MTP prefill failed at %u", pos);
+                ds4_session_invalidate(s);
+                return 1;
+            }
+            pos += take;
+            ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
+        }
+        s->checkpoint.len = 0;
+        for (int i = 0; i < prompt->len; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -67217,6 +70046,36 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      err,
                                      errlen);
     }
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) {
+        if (s->q4e_graph.spec_k > 0) {
+            /* The draft KV has to follow every committed token, speculative or
+             * not, so the plain step goes through the same routine with no
+             * drafts. */
+            int one = -1;
+            if (q4e_spec_step(s, token, 0u, -1, &one, 1, err, errlen) < 0) return 1;
+            s->checkpoint_valid = true;
+            s->mtp_draft_valid = false;
+            (void)probe_mtp;
+            return 0;
+        }
+        /* The PLE hash reads the two tokens before each position, so the whole
+         * prefix has to be present before the forward pass, not just the new
+         * token. */
+        token_vec_push(&s->checkpoint, token);
+        const uint32_t pos = (uint32_t)s->checkpoint.len - 1u;
+        if (q4e_forward(s, s->checkpoint.v, pos, 1u, 1u) != 0) {
+            s->checkpoint.len--;
+            if (errlen) snprintf(err, errlen, "qwen4exp decode failed");
+            ds4_session_invalidate(s);
+            return 1;
+        }
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        (void)probe_mtp;
+        return 0;
+    }
+#endif
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         forward_token_raw_swa_cpu_decode_scratch(s->logits,
@@ -72577,13 +75436,18 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
      * cross-device events.  Encoding several independent graphs before the
      * final synchronization lets their packets fill different pipeline stages
      * while preserving the exact one-token kernels and per-session KV order. */
+    /* qwen4exp is excluded the same way GLM is: it builds q4e_graph, not the
+     * DeepSeek graph this path drives, so entering here would dereference a
+     * graph that was never allocated. */
     if (e->backend == DS4_BACKEND_CUDA &&
         !ds4_session_is_glm(first) &&
+        !ds4_session_is_qwen4exp(first) &&
         e->support_kind == DS4_SUPPORT_NONE) {
         bool ok = ds4_gpu_begin_commands() != 0;
         for (int i = 0; ok && i < count; i++) {
             ds4_session *s = items[i].session;
             if (ds4_session_is_cpu(s) || ds4_session_is_glm(s) ||
+                ds4_session_is_qwen4exp(s) ||
                 !s->checkpoint_valid || s->engine->support_kind != DS4_SUPPORT_NONE) {
                 ok = false;
             }
@@ -72656,6 +75520,106 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
 
 #ifdef DS4_TEST_HOOKS
 static uint64_t ds4_test_mixed_native_evals = 0;
+
+int ds4_test_qwen4exp_ple_embed(const char *model_path,
+                                const int *tokens, uint32_t n_tokens,
+                                uint64_t cache_bytes,
+                                float *out, uint32_t *out_embd,
+                                ds4_ple_stats *stats,
+                                char *err, size_t errlen) {
+    ds4_model m;
+    model_open(&m, model_path, false, false);
+    config_validate_model(&m);
+    if (!ds4_model_is_qwen4exp()) {
+        snprintf(err, errlen, "model is not qwen4exp");
+        model_close(&m);
+        return 1;
+    }
+    if (out_embd) *out_embd = DS4_N_EMBD;
+
+    ds4_tensor *table = model_find_tensor(&m, "per_layer_token_embd.weight");
+    if (!table) {
+        snprintf(err, errlen, "model has no per_layer_token_embd.weight");
+        model_close(&m);
+        return 1;
+    }
+
+    /* The table lives wholly inside one shard; the streamer reads that shard's
+     * descriptor directly rather than going through the joined mapping. */
+    uint64_t file_offset = 0;
+    const uint32_t shard = model_shard_of(&m, table->abs_offset, &file_offset);
+
+    ds4_ple_params params;
+    qwen4exp_ple_params(&params);
+
+    ds4_ple_stream *stream = NULL;
+    if (ds4_ple_stream_open(&stream, &params, m.shard_fd[shard], file_offset,
+                            table->dim[1], cache_bytes, err, errlen) != 0) {
+        model_close(&m);
+        return 1;
+    }
+
+    const uint32_t n_heads = params.n_heads;
+    const uint32_t row_bytes = ds4_ple_row_bytes(&params);
+    uint64_t *rows = malloc((size_t)n_tokens * n_heads * sizeof(*rows));
+    uint8_t  *raw  = malloc((size_t)n_tokens * n_heads * row_bytes);
+    int rc = 1;
+    if (!rows || !raw) {
+        snprintf(err, errlen, "out of memory");
+        goto done;
+    }
+
+    ds4_ple_row_ids(&params, tokens, 0, n_tokens, rows);
+    if (ds4_ple_stream_fetch(stream, rows, n_tokens * n_heads, raw, err, errlen) != 0) {
+        goto done;
+    }
+    for (uint32_t i = 0; i < n_tokens * n_heads; i++) {
+        ds4_ple_dequant_row(&params, raw + (size_t)i * row_bytes,
+                            out + (size_t)i * params.head_dim);
+    }
+    if (stats) ds4_ple_stream_get_stats(stream, stats);
+    rc = 0;
+
+done:
+    free(rows);
+    free(raw);
+    ds4_ple_stream_close(stream);
+    model_close(&m);
+    return rc;
+}
+
+int ds4_test_model_tensor_digest(const char *path, uint64_t *out_digest,
+                                 uint64_t *out_tensors, uint64_t *out_bytes) {
+    ds4_model m;
+    model_open(&m, path, false, false);
+
+    /* FNV-1a over the fields that must survive the split -> single-file
+     * round trip.  Offsets are folded in as data read through the mapping, not
+     * as raw numbers: a split necessarily places later shards at different
+     * absolute offsets, but the bytes a tensor resolves to must be identical. */
+    uint64_t h = 1469598103934665603ull;
+    uint64_t bytes = 0;
+    for (uint64_t i = 0; i < m.n_tensors; i++) {
+        const ds4_tensor *t = &m.tensors[i];
+        const uint8_t *fields = (const uint8_t *)t->name.ptr;
+        for (uint64_t k = 0; k < t->name.len; k++) {
+            h = (h ^ fields[k]) * 1099511628211ull;
+        }
+        h = (h ^ t->type) * 1099511628211ull;
+        h = (h ^ t->ndim) * 1099511628211ull;
+        for (uint32_t d = 0; d < t->ndim; d++) h = (h ^ t->dim[d]) * 1099511628211ull;
+        h = (h ^ t->bytes) * 1099511628211ull;
+        const uint8_t *data = m.map + t->abs_offset;
+        for (uint64_t k = 0; k < t->bytes; k++) h = (h ^ data[k]) * 1099511628211ull;
+        bytes += t->bytes;
+    }
+
+    if (out_digest) *out_digest = h;
+    if (out_tensors) *out_tensors = m.n_tensors;
+    if (out_bytes) *out_bytes = bytes;
+    model_close(&m);
+    return 0;
+}
 
 uint64_t ds4_test_mixed_native_count(void) {
     return ds4_test_mixed_native_evals;
@@ -72779,7 +75743,27 @@ static int ds4_session_eval_speculative_argmax_impl(
         accepted[0] = first_token;
         return 1;
     }
-    if (ds4_session_is_cpu(s)) {
+#ifndef DS4_NO_GPU
+    if (ds4_session_is_qwen4exp(s) && !ds4_session_is_cpu(s) &&
+        s->q4e_graph.spec_k > 0 && accepted) {
+        /* MTP or n-gram drafts verified against the target's argmax.  Under
+         * ignore_eos the caller steers around stop tokens itself, one token
+         * at a time, so speculation stays off there. */
+        uint32_t K = s->q4e_graph.spec_k;
+        if (ignore_eos || first_token == eos_token) K = 0;
+        if (max_tokens > 0 && K > (uint32_t)max_tokens - 1u) K = (uint32_t)max_tokens - 1u;
+        (void)think_mode;
+        const int n = q4e_spec_step(s, first_token, K, eos_token,
+                                    accepted, accepted_cap, err, errlen);
+        if (n < 0) return -1;
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return n;
+    }
+#endif
+    if (ds4_session_is_cpu(s) || ds4_session_is_qwen4exp(s)) {
+        /* qwen4exp without an MTP head has no speculative path: one token,
+         * one step. */
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
@@ -73585,6 +76569,16 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     if (!s || !accepted || !rng || max_tokens <= 0 || accepted_cap <= 0) {
         return 0;
+    }
+    if (ds4_session_is_qwen4exp(s)) {
+        /* first_token was sampled at the requested temperature; the drafts
+         * after it are committed while they match the target's greedy path,
+         * and the caller samples the next boundary token from the returned
+         * logits.  Same trade as opportunistic DSpark: exact p/q acceptance
+         * is not implemented for this head yet. */
+        return ds4_session_eval_speculative_argmax(
+            s, first_token, max_tokens, eos_token,
+            accepted, accepted_cap, err, errlen);
     }
     if (s->distributed || ds4_session_is_cpu(s)) {
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;

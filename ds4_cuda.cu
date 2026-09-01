@@ -94,7 +94,42 @@ static thread_local bool g_glm_mtp_verify_mode;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
 static int g_model_hmm_direct;
+/* Set when the caller knows the weights can be read straight from the mapping:
+ * on an integrated GPU the model is already device addressable, so copying it
+ * into an arena would just hold a second copy of the same bytes. */
+static int g_model_direct_requested;
 static int g_model_fd = -1;
+/* Whether the map g_model_fd_host_base names is the split model whose shard
+ * table g_model_shard[] describes.  A support model (an MTP sidecar) registers
+ * its own single descriptor for a different map; its reads must not be routed
+ * through the target's shards just because those happen to be registered. */
+static int g_model_fd_map_is_sharded = 0;
+/* A GGUF split is mapped as one contiguous range but lives in several files,
+ * so an absolute offset does not name a position in any single descriptor.
+ * This table maps the joined offset back to (file, offset within file) for the
+ * staging reads and the page-cache drops that follow them. */
+#define CUDA_MAX_MODEL_SHARDS 32
+struct cuda_model_shard {
+    int      fd;
+    int      direct_fd;
+    uint64_t base;
+    uint64_t size;
+};
+static cuda_model_shard g_model_shard[CUDA_MAX_MODEL_SHARDS];
+static uint32_t g_model_shard_count;
+
+/* Resolve a joined offset.  Returns the shard or NULL, and writes the offset
+ * within that shard's file. */
+static const cuda_model_shard *cuda_model_shard_for(uint64_t offset, uint64_t *local) {
+    for (uint32_t i = g_model_shard_count; i-- > 0; ) {
+        if (offset >= g_model_shard[i].base) {
+            if (offset - g_model_shard[i].base >= g_model_shard[i].size) return NULL;
+            if (local) *local = offset - g_model_shard[i].base;
+            return &g_model_shard[i];
+        }
+    }
+    return NULL;
+}
 static const void *g_model_fd_host_base;
 static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
@@ -723,7 +758,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         return cuda_model_ptr(model_map, offset);
     }
     const char *direct_env = getenv("DS4_CUDA_DIRECT_MODEL");
-    if (model_map == g_model_host_base && direct_env && direct_env[0]) {
+    if (model_map == g_model_host_base &&
+        (g_model_direct_requested || (direct_env && direct_env[0]))) {
         return cuda_model_ptr(model_map, offset);
     }
 
@@ -2011,7 +2047,16 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 
 static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_shard_count > 0) {
+        /* A range never straddles shards: tensors are bounded to their own
+         * file at parse time. */
+        uint64_t local = 0;
+        const cuda_model_shard *sh = cuda_model_shard_for(offset, &local);
+        if (sh) (void)posix_fadvise(sh->fd, (off_t)local, (off_t)bytes, POSIX_FADV_DONTNEED);
+        return;
+    }
+    if (g_model_fd < 0) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
     (void)offset;
@@ -2097,6 +2142,27 @@ static int cuda_model_stage_read(void *stage, uint64_t stage_bytes,
                                  uint64_t offset, uint64_t bytes,
                                  const char **payload) {
     *payload = (const char *)stage;
+
+    /* Split model: pick the shard that owns this offset and read from it. */
+    if (g_model_shard_count > 0 && g_model_fd_map_is_sharded) {
+        uint64_t local = 0;
+        const cuda_model_shard *sh = cuda_model_shard_for(offset, &local);
+        if (!sh) return 0;
+#if defined(__linux__) && defined(O_DIRECT)
+        if (sh->direct_fd >= 0 && g_model_direct_align > 1) {
+            const uint64_t aligned_off = cuda_round_down(local, g_model_direct_align);
+            const uint64_t delta = local - aligned_off;
+            const uint64_t read_size = cuda_round_up(delta + bytes, g_model_direct_align);
+            if (read_size <= stage_bytes && aligned_off + read_size <= sh->size &&
+                cuda_pread_full(sh->direct_fd, stage, read_size, aligned_off)) {
+                *payload = (const char *)stage + delta;
+                return 1;
+            }
+        }
+#endif
+        return cuda_pread_full(sh->fd, stage, bytes, local);
+    }
+
 #if defined(__linux__) && defined(O_DIRECT)
     if (g_model_direct_fd >= 0 && g_model_direct_align > 1 && g_model_file_size != 0) {
         const uint64_t aligned_off = cuda_round_down(offset, g_model_direct_align);
@@ -2200,7 +2266,7 @@ static int cuda_model_copy_to_device_streamed(
         return 0;
     }
     if (bytes == 0) return 1;
-    if (g_model_fd < 0 ||
+    if ((g_model_fd < 0 && g_model_shard_count == 0) ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
         return cuda_ok(cudaMemcpy(dst,
                                   (const char *)model_map + offset,
@@ -2355,7 +2421,7 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what) {
-    if (g_model_fd < 0 || bytes == 0) return NULL;
+    if ((g_model_fd < 0 && g_model_shard_count == 0) || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || bytes > limit - g_model_range_bytes) {
@@ -2401,6 +2467,25 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)copied / 1048576.0,
                     strerror(errno));
             return NULL;
+        }
+        /* Diagnostic: the staged bytes must equal what the mapping shows at
+         * the same offset.  A split model resolves the read through the shard
+         * table, so an off-by-one there would silently cache wrong weights. */
+        if (getenv("DS4_CUDA_WEIGHT_CACHE_VERIFY") != NULL) {
+            const char *src = (const char *)model_map + offset + copied;
+            if (memcmp(payload, src, (size_t)n) != 0) {
+                uint64_t bad = 0;
+                while (bad < n && payload[bad] == src[bad]) bad++;
+                fprintf(stderr,
+                        "ds4: CUDA weight cache MISMATCH for %s at model offset %llu "
+                        "(chunk %llu, first bad byte +%llu: staged %02x vs mapped %02x)\n",
+                        what ? what : "weights",
+                        (unsigned long long)(offset + copied),
+                        (unsigned long long)chunk_idx,
+                        (unsigned long long)bad,
+                        (unsigned)(unsigned char)payload[bad],
+                        (unsigned)(unsigned char)src[bad]);
+            }
         }
         err = cudaMemcpyAsync(dev + copied, payload, (size_t)n,
                               cudaMemcpyHostToDevice, g_model_upload_stream);
@@ -4388,6 +4473,7 @@ extern "C" int ds4_gpu_lookup_cache_strict(uint64_t source_offset,
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
+    g_model_fd_map_is_sharded = 0;
     g_model_file_size = 0;
     if (g_model_direct_fd >= 0) {
         (void)close(g_model_direct_fd);
@@ -14599,7 +14685,20 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * raw dense MMQ fallback is allocator-dependent for other GLM shapes on
      * GB10, including short prefills, so retain the deterministic kernels
      * below. DeepSeek keeps its established MMQ prefill path. */
-    if (n_tok > 1 && (in_dim % 256u) == 0 &&
+    /* mmq bounds its K loop by ncols_x / qk using the true K --
+     * MATRIX_ROW_PADDING only sizes the activation buffer -- so a whole
+     * number of the type's blocks is the real requirement, and qwen4exp's
+     * hyper-connection up (K=320) and shared-expert down (K=640) can use the
+     * batched path instead of the per-row kernels below, which re-read the
+     * whole weight matrix once per token.
+     *
+     * Only for a chunk worth tiling, though: below 32 rows mmq's tiles are
+     * mostly padding and its coarser activation quantization shows up, which
+     * on a five-token prompt moved the logit-sum drift from 0.3% to 4%.  K a
+     * multiple of 256 keeps the old behaviour at any size. */
+    const bool k_tileable = (in_dim % 256u) == 0 ||
+                            ((in_dim % 32u) == 0 && n_tok >= 32);
+    if (n_tok > 1 && k_tileable &&
         !g_q8_dequant_gemm_enabled && cuda_use_mmq()) {
         int rc = ds4_mmq_q8_0_dense(wptr, (const float *)x->ptr, (float *)out->ptr,
                                     (int)out_dim, (int)n_tok, (int)in_dim,
@@ -32539,6 +32638,84 @@ extern "C" int ds4_gpu_commit_and_wait_selected_readback(
                    label ? label : "selected readback wait");
 }
 
+/* Ask the backend to address model weights in place.  Returns 0 when the
+ * device cannot do it, in which case the caller keeps the copying path. */
+extern "C" int ds4_gpu_set_direct_model_mapping(int enable) {
+    if (!enable) {
+        g_model_direct_requested = 0;
+        return 1;
+    }
+    int device = 0, integrated = 0, pageable = 0;
+    if (cudaGetDevice(&device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device) != cudaSuccess ||
+        !integrated || !pageable) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_model_direct_requested = 1;
+    return 1;
+}
+
+/* Migrate the given spans to the device without copying them into a second
+ * allocation.  Direct mapping alone leaves the weights as ordinary pageable
+ * host memory, and every MoE expert read then faults over the interconnect;
+ * prefetching moves the pages once and keeps a single copy. */
+extern "C" int ds4_gpu_prefetch_model_spans(
+        const void *model_map, uint64_t model_size,
+        const uint64_t *offsets, const uint64_t *sizes, uint32_t count) {
+    if (!model_map || !offsets || !sizes || count == 0) return 0;
+    int ok = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (cuda_model_prefetch_range(model_map, model_size, offsets[i], sizes[i])) ok = 1;
+    }
+    return ok;
+}
+
+/* Register the descriptors of a GGUF split so weight staging can read from the
+ * right file, and so the page cache each read populates can be dropped again.
+ * Without this a split model has to be copied out of its mapping, which keeps
+ * every weight resident twice. */
+extern "C" int ds4_gpu_set_model_shard_fds(
+        const void *model_map, const int *fds,
+        const uint64_t *bases, const uint64_t *sizes, uint32_t count) {
+    if (!model_map || !fds || !bases || !sizes || count == 0 ||
+        count > CUDA_MAX_MODEL_SHARDS) {
+        return 0;
+    }
+    /* Re-registration (after a support model borrowed the descriptor slot)
+     * must not leak the direct descriptors of the previous registration. */
+    for (uint32_t i = 0; i < g_model_shard_count && i < CUDA_MAX_MODEL_SHARDS; i++) {
+        if (g_model_shard[i].direct_fd >= 0) {
+            (void)close(g_model_shard[i].direct_fd);
+            g_model_shard[i].direct_fd = -1;
+        }
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        g_model_shard[i].fd = fds[i];
+        g_model_shard[i].base = bases[i];
+        g_model_shard[i].size = sizes[i];
+        g_model_shard[i].direct_fd = -1;
+#if defined(__linux__) && defined(O_DIRECT)
+        char proc[64];
+        snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fds[i]);
+        const int dfd = open(proc, O_RDONLY | O_DIRECT);
+        if (dfd >= 0) {
+            g_model_shard[i].direct_fd = dfd;
+            if (g_model_direct_align <= 1) g_model_direct_align = 4096;
+        }
+#endif
+    }
+    g_model_shard_count = count;
+    g_model_fd_host_base = model_map;
+    g_model_fd_map_is_sharded = 1;
+    return 1;
+}
+
+extern "C" int ds4_gpu_direct_model_mapping_active(void) {
+    return g_model_direct_requested;
+}
+
 extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     const int ok = ds4_gpu_set_model_fd(fd);
     if (ok) g_model_fd_host_base = model_map;
@@ -32860,4 +33037,5 @@ extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
 #pragma GCC diagnostic pop
 
 #define DS4_GLM53_VISION_STREAM cuda_decode_stream()
+#include "ds4_qwen4exp_gpu.cuh"
 #include "ds4_glm53_vision_gpu.cuh"

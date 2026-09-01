@@ -212,7 +212,9 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--min-p F", "Keep tokens scoring at least F times the top token.");
     opt(fp, c, "--seed N", "Sampling seed for reproducible non-greedy runs.");
     para(fp, c, "GLM CLI and agent runs default to temperature 1.0, top-p 0.95, and min-p 0 unless those options are set explicitly.");
-    opt(fp, c, "--think", "Use normal thinking mode.");
+    opt(fp, c, "--think", "Use normal (high) thinking mode.");
+    opt(fp, c, "--think-low", "Low reasoning effort. Qwen3.8 gets its own sentence; DeepSeek and GLM treat it as high.");
+    opt(fp, c, "--think-medium", "Medium reasoning effort. Qwen3.8 thinks with no effort sentence; others treat it as high.");
     opt(fp, c, "--think-max", "Use Think Max when context is large enough.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
     if (full) {
@@ -299,7 +301,7 @@ static void print_cli_diagnostics(FILE *fp, const help_colors *c) {
 static void print_cli_commands(FILE *fp, const help_colors *c) {
     title_red(fp, c, "Interactive Commands");
     opt(fp, c, "/help", "Show interactive commands.");
-    opt(fp, c, "/think, /think-max, /nothink", "Switch thinking mode.");
+    opt(fp, c, "/think, /think-low, /think-medium, /think-max, /nothink", "Switch thinking mode.");
     opt(fp, c, "/ctx N", "Restart the interactive session with a new context size.");
     opt(fp, c, "/power N", "Set GPU duty cycle percentage, 1..100.");
     opt(fp, c, "/read FILE", "Submit a text file, PNG, or JPEG as the next user message.");
@@ -351,7 +353,10 @@ static void print_server_api(FILE *fp, const help_colors *c) {
 
 static void print_server_thinking(FILE *fp, const help_colors *c) {
     title(fp, c, "Server Thinking Defaults");
-    para(fp, c, "DeepSeek-compatible chat requests default to high-effort thinking.");
+    para(fp, c, "Chat requests default to high-effort thinking.");
+    para(fp, c, "reasoning_effort (OpenAI), reasoning.effort (Responses) and output_config.effort (Anthropic) accept none, low/minimal, medium, high/xhigh and max.");
+    para(fp, c, "Qwen3.8-Flash renders low, medium and xhigh exactly as its chat template does; DeepSeek and GLM treat low and medium as high.");
+    para(fp, c, "Anthropic thinking.budget_tokens without an effort picks a level: <=2048 low, <=8192 medium, above high; thinking.type=adaptive is thinking on.");
     para(fp, c, "reasoning_effort=max or output_config.effort=max requests Think Max.");
     para(fp, c, "Think Max requires --ctx >= 393216; smaller contexts use high.");
     para(fp, c, "thinking={type:disabled}, think=false, or model=deepseek-chat selects non-thinking mode.");

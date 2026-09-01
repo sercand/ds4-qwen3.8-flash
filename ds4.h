@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "ds4_ple_stream.h"
 #include "ds4_ssd.h"
 
 /* Public engine boundary.
@@ -22,8 +23,14 @@ typedef enum {
     DS4_BACKEND_CPU,
 } ds4_backend;
 
+/* Reasoning effort, in increasing order.  Families that know fewer levels
+ * fold the others in: DeepSeek and GLM treat LOW and MEDIUM as HIGH; Qwen3.8
+ * has its own sentence for LOW, none at all for MEDIUM, and renders HIGH and
+ * MAX both as its "xhigh". */
 typedef enum {
     DS4_THINK_NONE,
+    DS4_THINK_LOW,
+    DS4_THINK_MEDIUM,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
 } ds4_think_mode;
@@ -145,6 +152,10 @@ typedef struct {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
+    /* qwen4exp only: host budget for the PLE n-gram row cache.  Zero picks
+     * the default, which holds one full context's working set; the hit rate
+     * is bounded by n-gram repetition, so a much larger cache buys nothing. */
+    uint64_t ple_cache_bytes;
     bool warm_weights;
     bool quality;
     bool glm_mtp;
@@ -300,11 +311,15 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
+bool ds4_engine_is_qwen4exp(ds4_engine *e);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
+/* The reasoning-effort sentence qwen4exp's own chat template injects as a
+ * system message; NULL when thinking is disabled. */
+const char *ds4_qwen4exp_reasoning_effort_text(ds4_think_mode mode);
 uint32_t ds4_think_max_min_context(void);
 ds4_think_mode ds4_think_mode_for_context(ds4_think_mode mode, int ctx_size);
 /* Uses the active model shape selected by ds4_engine_open(); call after opening
@@ -467,6 +482,21 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+/* Open a GGUF (single file or split), fold every tensor's name, type, shape and
+ * resolved byte range into one digest, and close it again.  A split and the
+ * equivalent single file must produce the same digest. */
+int ds4_test_model_tensor_digest(const char *path, uint64_t *out_digest,
+                                 uint64_t *out_tensors, uint64_t *out_bytes);
+/* Produce the qwen4exp PLE embedding for a token sequence the way the engine
+ * will: load the model, take the PLE metadata and table location from it,
+ * stream the hashed rows off the shard that holds them, and dequantize.
+ * out holds n_tokens * n_embd floats. */
+int ds4_test_qwen4exp_ple_embed(const char *model_path,
+                                const int *tokens, uint32_t n_tokens,
+                                uint64_t cache_bytes,
+                                float *out, uint32_t *out_embd,
+                                ds4_ple_stats *stats,
+                                char *err, size_t errlen);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
