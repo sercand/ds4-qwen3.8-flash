@@ -1430,6 +1430,296 @@ __global__ static void q4e_qsa_attention_tiled_kernel(
     }
 }
 
+/* Split-key attention for decode and the speculative verify batch.
+ *
+ * The per-query kernel above gives one block per (head, query) and walks the
+ * whole cache from that block, so at 26k context a 4-row verify pass ran 96
+ * blocks that each streamed 53 MB serially: 230 ms of a 390 ms step, latency
+ * bound at a few GB/s.  Here the key range is cut into Q4E_ATTN_SPLITS pieces
+ * and a block owns one piece for one key/value head and up to Q4E_ATTN_QG of
+ * the queries that share it -- every query head in the group, every row of the
+ * batch -- so each K/V tile is staged once for 16 queries and the grid covers
+ * the GPU.  Blocks leave (max, denominator, accumulator) partials that
+ * q4e_qsa_attention_combine_kernel merges; with one split the result is
+ * written directly.
+ *
+ * The split count is fixed rather than derived from the context length so the
+ * launch geometry is stable under graph capture: the tiles per split come from
+ * pos[] on the device, and splits past the end write an empty partial.
+ *
+ * Inner loops follow the tiled prefill kernel -- key l lives in lane l for the
+ * scores, lane l owns dims 8l..8l+7 for the accumulation -- staged in 16-byte
+ * f16 chunks so each shared load carries 8 dims and neither loop reduces.
+ * Specialised to head_dim 256 (every qwen4exp attention layer). */
+#define Q4E_ATTN_QG      16u          /* queries per block: 2 per warp */
+#define Q4E_ATTN_SPLITS  48u          /* key splits per (kv head, query group) */
+#define Q4E_ATTN_SPLIT_HD 256u
+#define Q4E_ATTN_PART_STRIDE (Q4E_ATTN_SPLIT_HD + 8u)   /* m, l, pad, acc[256] */
+
+__global__ static void __launch_bounds__(256, 2)
+q4e_qsa_attention_split_kernel(
+        float *out, float *part, const __half *k_cache, const __half *v_cache,
+        const float *q, uint32_t n_head, uint32_t n_head_kv,
+        const int32_t *pos, uint32_t n_tok, uint32_t n_splits) {
+    constexpr uint32_t HD = Q4E_ATTN_SPLIT_HD;
+    constexpr uint32_t KT = Q4E_ATTN_KT;
+    constexpr uint32_t C8 = HD / 8u;                    /* 16-byte chunks per row */
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t hkv = blockIdx.z;
+    const uint32_t split = blockIdx.y;
+    const uint32_t G = n_head / n_head_kv;              /* query heads per kv head */
+    const uint32_t NQ = G * n_tok;
+    const uint32_t q0 = blockIdx.x * Q4E_ATTN_QG;
+    if (q0 >= NQ) return;
+    const uint32_t n_q = (NQ - q0 < Q4E_ATTN_QG) ? (NQ - q0) : Q4E_ATTN_QG;
+    const float scale = rsqrtf((float)HD);
+
+    /* Everything staged is f16: a 16-byte shared load then carries 8 dims,
+     * which halves the shared-memory wavefronts of an f32 layout, and the
+     * 41 KB footprint lets two blocks share an SM so one block's cache loads
+     * overlap the other's arithmetic.  Accumulation stays f32. */
+    extern __shared__ __align__(16) uint4 q4e_split_smem[];
+    uint4 *s_k8 = q4e_split_smem;                          /* [C8][KT]: chunk-major */
+    uint4 *s_v8 = s_k8 + (size_t)C8 * KT;                  /* [KT][C8]: key-major */
+    uint4 *s_q8 = s_v8 + (size_t)KT * C8;                  /* [QG][C8] */
+    float *s_w  = (float *)(s_q8 + (size_t)Q4E_ATTN_QG * C8); /* [warps][KT] */
+
+    /* This block's key range. */
+    const uint32_t last = (uint32_t)pos[n_tok - 1u];
+    const uint32_t n_tiles = (last + KT) / KT;
+    const uint32_t tiles_per_split = (n_tiles + n_splits - 1u) / n_splits;
+    const uint32_t k_begin = split * tiles_per_split * KT;
+    uint32_t k_end = k_begin + tiles_per_split * KT;
+    if (k_end > last + 1u) k_end = last + 1u;
+
+    float acc[2][8];
+    float m[2] = { -INFINITY, -INFINITY };
+    float l[2] = { 0.0f, 0.0f };
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc[s][j] = 0.0f;
+    }
+
+    if (k_begin < k_end) {
+        /* Stage the scaled queries as f16. */
+        for (uint32_t idx = tid; idx < n_q * C8; idx += blockDim.x) {
+            const uint32_t qi = idx / C8, c = idx % C8;
+            const uint32_t t = (q0 + qi) / G, h = hkv * G + (q0 + qi) % G;
+            const float4 *src = (const float4 *)(q + ((uint64_t)t * n_head + h) * HD + 8u * c);
+            const float4 v0 = src[0], v1 = src[1];
+            union { uint4 u; __half2 h2[4]; } pk;
+            pk.h2[0] = __floats2half2_rn(v0.x * scale, v0.y * scale);
+            pk.h2[1] = __floats2half2_rn(v0.z * scale, v0.w * scale);
+            pk.h2[2] = __floats2half2_rn(v1.x * scale, v1.y * scale);
+            pk.h2[3] = __floats2half2_rn(v1.z * scale, v1.w * scale);
+            s_q8[(size_t)qi * C8 + c] = pk.u;
+        }
+        __syncthreads();
+
+        for (uint32_t p0 = k_begin; p0 < k_end; p0 += KT) {
+            const uint32_t n_k = (k_end - p0 < KT) ? (k_end - p0) : KT;
+            /* K: lane = key, warp = chunk (4 passes cover 32 chunks); stored
+             * chunk-major so a lane's score loop reads its own column. */
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const uint32_t key = lane, c = warp + 8u * i;
+                if (key < n_k) {
+                    s_k8[(size_t)c * KT + key] = *(const uint4 *)(k_cache +
+                            (((uint64_t)(p0 + key) * n_head_kv + hkv) * HD + 8u * c));
+                }
+            }
+            /* V: lane = chunk, warp = key (4 passes cover 32 keys); key-major
+             * so the accumulation reads a lane's own 8 dims of each key. */
+#pragma unroll
+            for (uint32_t i = 0; i < 4u; i++) {
+                const uint32_t key = warp + 8u * i, c = lane;
+                if (key < n_k) {
+                    s_v8[(size_t)key * C8 + c] = *(const uint4 *)(v_cache +
+                            (((uint64_t)(p0 + key) * n_head_kv + hkv) * HD + 8u * c));
+                } else {
+                    /* The accumulation runs the whole tile with zero weights on
+                     * the tail, and 0 * NaN from stale memory is NaN. */
+                    s_v8[(size_t)key * C8 + c] = make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+            __syncthreads();
+
+            /* Scores: key p0 + lane against both of this warp's queries in one
+             * pass over the staged K, four partial sums each so the FMA chain
+             * is 64 deep rather than 256. */
+            const uint32_t qi0 = warp * 2u;
+            const uint32_t nq_w = (qi0 >= n_q) ? 0u : ((n_q - qi0 >= 2u) ? 2u : 1u);
+            if (nq_w == 0u) { __syncthreads(); continue; }
+            const uint4 *qrow0 = s_q8 + (size_t)qi0 * C8;
+            const uint4 *qrow1 = s_q8 + (size_t)(qi0 + (nq_w - 1u)) * C8;
+            float dot[2] = { -INFINITY, -INFINITY };
+            if (lane < n_k) {
+                float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+                float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+#pragma unroll 4
+                for (uint32_t c = 0; c < C8; c++) {
+                    union { uint4 u; __half2 h2[4]; } kk, qa, qb;
+                    kk.u = s_k8[(size_t)c * KT + lane];
+                    qa.u = qrow0[c];
+                    qb.u = qrow1[c];
+                    const float2 k0 = __half22float2(kk.h2[0]), k1 = __half22float2(kk.h2[1]);
+                    const float2 k2 = __half22float2(kk.h2[2]), k3 = __half22float2(kk.h2[3]);
+                    const float2 x0 = __half22float2(qa.h2[0]), x1 = __half22float2(qa.h2[1]);
+                    const float2 x2 = __half22float2(qa.h2[2]), x3 = __half22float2(qa.h2[3]);
+                    const float2 y0 = __half22float2(qb.h2[0]), y1 = __half22float2(qb.h2[1]);
+                    const float2 y2 = __half22float2(qb.h2[2]), y3 = __half22float2(qb.h2[3]);
+                    a0 = fmaf(x0.x, k0.x, a0); a1 = fmaf(x0.y, k0.y, a1);
+                    a2 = fmaf(x1.x, k1.x, a2); a3 = fmaf(x1.y, k1.y, a3);
+                    a0 = fmaf(x2.x, k2.x, a0); a1 = fmaf(x2.y, k2.y, a1);
+                    a2 = fmaf(x3.x, k3.x, a2); a3 = fmaf(x3.y, k3.y, a3);
+                    b0 = fmaf(y0.x, k0.x, b0); b1 = fmaf(y0.y, k0.y, b1);
+                    b2 = fmaf(y1.x, k1.x, b2); b3 = fmaf(y1.y, k1.y, b3);
+                    b0 = fmaf(y2.x, k2.x, b0); b1 = fmaf(y2.y, k2.y, b1);
+                    b2 = fmaf(y3.x, k3.x, b2); b3 = fmaf(y3.y, k3.y, b3);
+                }
+                dot[0] = (a0 + a1) + (a2 + a3);
+                dot[1] = (b0 + b1) + (b2 + b3);
+            }
+
+#pragma unroll
+            for (int s = 0; s < 2; s++) {
+                if ((uint32_t)s >= nq_w) break;
+                const uint32_t qi = qi0 + (uint32_t)s;
+                const uint32_t qpos = (uint32_t)pos[(q0 + qi) / G];
+                const float d = (lane < n_k && p0 + lane <= qpos) ? dot[s] : -INFINITY;
+                float tile_max = d;
+                for (int off = 16; off > 0; off >>= 1) {
+                    tile_max = fmaxf(tile_max, __shfl_xor_sync(0xffffffffu, tile_max, off));
+                }
+                if (tile_max == -INFINITY) continue;
+                const float m_new = fmaxf(m[s], tile_max);
+                const float corr = __expf(m[s] - m_new);
+                const float w = __expf(d - m_new);          /* 0 where masked */
+                s_w[(size_t)warp * KT + lane] = w;
+                float wsum = w;
+                for (int off = 16; off > 0; off >>= 1) wsum += __shfl_xor_sync(0xffffffffu, wsum, off);
+                l[s] = l[s] * corr + wsum;
+                m[s] = m_new;
+                __syncwarp();
+
+                /* Lane owns dims 8*lane .. 8*lane+7: one 16-byte load per key,
+                 * lanes contiguous, so no bank conflicts.  Masked keys carry a
+                 * zero weight, so the loop always runs the full tile. */
+#pragma unroll
+                for (int j = 0; j < 8; j++) acc[s][j] *= corr;
+                const float *wrow = s_w + (size_t)warp * KT;
+                const uint4 *vcol = s_v8 + lane;
+#pragma unroll 4
+                for (uint32_t k = 0; k < KT; k++) {
+                    const float wk = wrow[k];
+                    union { uint4 u; __half2 h2[4]; } vv;
+                    vv.u = vcol[(size_t)k * C8];
+                    const float2 v0 = __half22float2(vv.h2[0]), v1 = __half22float2(vv.h2[1]);
+                    const float2 v2 = __half22float2(vv.h2[2]), v3 = __half22float2(vv.h2[3]);
+                    acc[s][0] = fmaf(wk, v0.x, acc[s][0]);
+                    acc[s][1] = fmaf(wk, v0.y, acc[s][1]);
+                    acc[s][2] = fmaf(wk, v1.x, acc[s][2]);
+                    acc[s][3] = fmaf(wk, v1.y, acc[s][3]);
+                    acc[s][4] = fmaf(wk, v2.x, acc[s][4]);
+                    acc[s][5] = fmaf(wk, v2.y, acc[s][5]);
+                    acc[s][6] = fmaf(wk, v3.x, acc[s][6]);
+                    acc[s][7] = fmaf(wk, v3.y, acc[s][7]);
+                }
+                __syncwarp();
+            }
+            __syncthreads();
+        }
+    }
+
+    /* Epilogue: the final row when there is one split, a partial otherwise. */
+#pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const uint32_t qi = warp * 2u + (uint32_t)s;
+        if (qi >= n_q) break;
+        const uint32_t t = (q0 + qi) / G, h = hkv * G + (q0 + qi) % G;
+        const uint64_t qg = (uint64_t)t * n_head + h;
+        if (n_splits == 1u) {
+            const float inv = 1.0f / l[s];
+            float4 *dst = (float4 *)(out + qg * HD + 8u * lane);
+            dst[0] = make_float4(acc[s][0] * inv, acc[s][1] * inv, acc[s][2] * inv, acc[s][3] * inv);
+            dst[1] = make_float4(acc[s][4] * inv, acc[s][5] * inv, acc[s][6] * inv, acc[s][7] * inv);
+        } else {
+            float *prow = part + (qg * n_splits + split) * Q4E_ATTN_PART_STRIDE;
+            if (lane == 0u) { prow[0] = m[s]; prow[1] = l[s]; }
+            float4 *dst = (float4 *)(prow + 8u + 8u * lane);
+            dst[0] = make_float4(acc[s][0], acc[s][1], acc[s][2], acc[s][3]);
+            dst[1] = make_float4(acc[s][4], acc[s][5], acc[s][6], acc[s][7]);
+        }
+    }
+}
+
+/* One block per (row, head); thread d merges dim d across the splits. */
+__global__ static void q4e_qsa_attention_combine_kernel(
+        float *out, const float *part, uint32_t n_splits) {
+    constexpr uint32_t HD = Q4E_ATTN_SPLIT_HD;
+    const uint64_t qg = blockIdx.x;
+    const float *base = part + qg * n_splits * Q4E_ATTN_PART_STRIDE;
+    const uint32_t d = threadIdx.x;
+    float gm = -INFINITY;
+    for (uint32_t sp = 0; sp < n_splits; sp++) gm = fmaxf(gm, base[(size_t)sp * Q4E_ATTN_PART_STRIDE]);
+    float den = 0.0f, num = 0.0f;
+    for (uint32_t sp = 0; sp < n_splits; sp++) {
+        const float *prow = base + (size_t)sp * Q4E_ATTN_PART_STRIDE;
+        const float ms = prow[0];
+        if (ms == -INFINITY) continue;
+        const float wgt = __expf(ms - gm);
+        den = fmaf(prow[1], wgt, den);
+        num = fmaf(prow[8u + d], wgt, num);
+    }
+    out[qg * HD + d] = num / den;
+}
+
+/* Greedy choice per logits row, on the device.  Reading a 9-row verify batch
+ * (8.9 MB) back to pageable host memory cost 12-83 ms per step at 26k
+ * context; the step only needs the argmax of every row and the logits of the
+ * one row it commits.  Ties go to the lower index, as the host sampler's. */
+__global__ static void q4e_argmax_rows_kernel(int32_t *out, const float *logits, uint32_t n_vocab) {
+    const float *row = logits + (uint64_t)blockIdx.x * n_vocab;
+    float best = -INFINITY;
+    int32_t best_i = -1;
+    for (uint32_t i = threadIdx.x; i < n_vocab; i += blockDim.x) {
+        const float v = row[i];
+        if (v > best) { best = v; best_i = (int32_t)i; }
+    }
+    float ov;
+    int32_t oi;
+    q4e_block_argmax(best, best_i, &ov, &oi);
+    if (threadIdx.x == 0u) out[blockIdx.x] = oi;
+}
+
+extern "C" int ds4_gpu_q4e_argmax_rows(ds4_gpu_tensor *out_idx, const ds4_gpu_tensor *logits,
+                                       uint32_t n_vocab, uint32_t n_rows) {
+    if (!out_idx || !logits || !n_vocab || !n_rows) return 0;
+    if (out_idx->bytes < (uint64_t)n_rows * sizeof(int32_t) ||
+        logits->bytes < (uint64_t)n_rows * n_vocab * sizeof(float)) return 0;
+    q4e_argmax_rows_kernel<<<n_rows, 1024, 0, cuda_decode_stream()>>>(
+            (int32_t *)out_idx->ptr, (const float *)logits->ptr, n_vocab);
+    return cuda_ok(cudaGetLastError(), "qwen4exp argmax rows");
+}
+
+/* Pinned host memory for the per-step logits landing buffer: a pageable
+ * 1 MB device-to-host copy ran at ~5 GB/s here, a pinned one is 10x that. */
+extern "C" void *ds4_gpu_q4e_host_alloc(uint64_t bytes) {
+    void *p = NULL;
+    if (cudaMallocHost(&p, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return p;
+}
+
+extern "C" void ds4_gpu_q4e_host_free(void *p) {
+    if (p) (void)cudaFreeHost(p);
+}
+
 /* out = attn * sigmoid(gate), then the caller projects with attn_output. */
 __global__ static void q4e_qsa_gate_kernel(float *x, const float *gate, uint64_t n) {
     const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
@@ -1517,6 +1807,56 @@ extern "C" int ds4_gpu_q4e_qsa_attention(
         /* Fall through to the per-query kernel if the launch was rejected. */
     }
 
+    /* Decode and the verify batch: the split-key kernel, unless
+     * DS4_QWEN4EXP_NO_SPLIT_ATTN=1 asks for the per-query kernel (A/B). */
+    static const int split_off = getenv("DS4_QWEN4EXP_NO_SPLIT_ATTN") != NULL;
+    if (!split_off && head_dim == Q4E_ATTN_SPLIT_HD && n_head_kv != 0u &&
+        (n_head % n_head_kv) == 0u && n_tok < Q4E_ATTN_QT) {
+        const size_t smem = (size_t)Q4E_ATTN_SPLIT_HD * Q4E_ATTN_KT * sizeof(__half) * 2u +
+                            (size_t)Q4E_ATTN_QG * Q4E_ATTN_SPLIT_HD * sizeof(__half) +
+                            (size_t)Q4E_ATTN_TILE_WARPS * Q4E_ATTN_KT * sizeof(float);
+        static bool split_opted_in = false;
+        static float *part = NULL;
+        static uint64_t part_cap = 0;
+        /* Sized for the largest batch this path takes, so the buffer never
+         * moves once a graph has captured its address. */
+        const uint64_t part_need = (uint64_t)n_head * (Q4E_ATTN_QT - 1u) * Q4E_ATTN_SPLITS *
+                                   Q4E_ATTN_PART_STRIDE * sizeof(float);
+        if (!split_opted_in) {
+            if (cudaFuncSetAttribute(q4e_qsa_attention_split_kernel,
+                                     cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     (int)smem) != cudaSuccess) {
+                (void)cudaGetLastError();
+            }
+            split_opted_in = true;
+        }
+        if (part_cap < part_need) {
+            if (part) (void)cudaFree(part);
+            part = NULL;
+            if (cudaMalloc(&part, (size_t)part_need) != cudaSuccess) {
+                (void)cudaGetLastError();
+                part = NULL;
+                part_cap = 0;
+            } else {
+                part_cap = part_need;
+            }
+        }
+        if (part) {
+            const uint32_t G = n_head / n_head_kv;
+            const uint32_t n_groups = (G * n_tok + Q4E_ATTN_QG - 1u) / Q4E_ATTN_QG;
+            const dim3 sgrid(n_groups, Q4E_ATTN_SPLITS, n_head_kv);
+            q4e_qsa_attention_split_kernel<<<sgrid, 256, smem, cuda_decode_stream()>>>(
+                    (float *)out->ptr, part, (const __half *)k_cache->ptr,
+                    (const __half *)v_cache->ptr, (const float *)q->ptr,
+                    n_head, n_head_kv, (const int32_t *)pos->ptr, n_tok, Q4E_ATTN_SPLITS);
+            if (!cuda_ok(cudaGetLastError(), "qwen4exp qsa attention split")) return 0;
+            q4e_qsa_attention_combine_kernel<<<n_head * n_tok, Q4E_ATTN_SPLIT_HD, 0,
+                                               cuda_decode_stream()>>>(
+                    (float *)out->ptr, part, Q4E_ATTN_SPLITS);
+            return cuda_ok(cudaGetLastError(), "qwen4exp qsa attention combine");
+        }
+    }
+
     const dim3 grid(n_head, n_tok, 1);
     q4e_qsa_attention_kernel<<<grid, 32u * Q4E_ATTN_WARPS,
                                Q4E_ATTN_WARPS * head_dim * sizeof(float),
@@ -1584,9 +1924,13 @@ __device__ __forceinline__ static float q4e_down_weight(const uint8_t *blk, uint
 template <int TYPE, int BLOCKS>
 __global__ static void q4e_moe_down_grouped_kernel(
         float *dst, const uint8_t *W, const float *x,
-        const int32_t *sorted_cols, const int32_t *bounds,
-        uint32_t out_dim, uint32_t in_dim, uint32_t expert_bytes) {
-    const uint32_t expert = blockIdx.y;
+        const int32_t *sorted_cols, const int32_t *bounds, const int32_t *active,
+        uint32_t n_expert, uint32_t out_dim, uint32_t in_dim, uint32_t expert_bytes) {
+    /* blockIdx.y indexes the experts that received a column, not all 512: a
+     * verify batch touches ~40 of them, and 300k empty blocks per layer were
+     * half the kernel's time. */
+    if ((int32_t)blockIdx.y >= active[n_expert]) return;
+    const uint32_t expert = (uint32_t)active[blockIdx.y];
     const int32_t c0 = bounds[expert];
     const int32_t c1 = bounds[expert + 1u];
     if (c1 <= c0) return;
@@ -1628,16 +1972,20 @@ __global__ static void q4e_moe_sort_count_kernel(
 }
 
 __global__ static void q4e_moe_sort_scan_kernel(
-        int32_t *bounds, const int32_t *counts, uint32_t n_expert) {
+        int32_t *bounds, int32_t *active, const int32_t *counts, uint32_t n_expert) {
     /* One block, serial over the experts: 512 entries once per layer is far
-     * below the point where a parallel scan would pay for itself. */
+     * below the point where a parallel scan would pay for itself.  Also lists
+     * the experts with at least one column; the count goes in active[n_expert]. */
     if (threadIdx.x != 0u) return;
     int32_t total = 0;
+    int32_t n_active = 0;
     for (uint32_t e = 0; e < n_expert; e++) {
         bounds[e] = total;
         total += counts[e];
+        if (counts[e] > 0) active[n_active++] = (int32_t)e;
     }
     bounds[n_expert] = total;
+    active[n_expert] = n_active;
 }
 
 __global__ static void q4e_moe_sort_scatter_kernel(
@@ -1658,11 +2006,12 @@ __global__ static void q4e_moe_sort_scatter_kernel(
 static int q4e_moe_sort_columns(const int32_t *ids, uint32_t n_rows,
                                 uint32_t n_expert,
                                 const int32_t **sorted_out,
-                                const int32_t **bounds_out) {
+                                const int32_t **bounds_out,
+                                const int32_t **active_out) {
     static int32_t *scratch = NULL;
     static uint32_t scratch_rows = 0;
     static uint32_t scratch_experts = 0;
-    const uint32_t need = n_rows + 2u * n_expert + 1u;
+    const uint32_t need = n_rows + 3u * n_expert + 2u;
     if (!scratch || n_rows > scratch_rows || n_expert > scratch_experts) {
         if (scratch) (void)cudaFree(scratch);
         scratch = NULL;
@@ -1677,18 +2026,20 @@ static int q4e_moe_sort_columns(const int32_t *ids, uint32_t n_rows,
     int32_t *sorted = scratch;                 /* n_rows */
     int32_t *counts = sorted + n_rows;         /* n_expert, reused as cursor */
     int32_t *bounds = counts + n_expert;       /* n_expert + 1 */
+    int32_t *active = bounds + n_expert + 1u;  /* n_expert + 1 */
 
     cudaStream_t stream = cuda_decode_stream();
     (void)cudaMemsetAsync(counts, 0, (size_t)n_expert * sizeof(int32_t), stream);
     const unsigned grid = (n_rows + 255u) / 256u;
     q4e_moe_sort_count_kernel<<<grid, 256, 0, stream>>>(counts, ids, n_rows, n_expert);
-    q4e_moe_sort_scan_kernel<<<1, 32, 0, stream>>>(bounds, counts, n_expert);
+    q4e_moe_sort_scan_kernel<<<1, 32, 0, stream>>>(bounds, active, counts, n_expert);
     (void)cudaMemsetAsync(counts, 0, (size_t)n_expert * sizeof(int32_t), stream);
     q4e_moe_sort_scatter_kernel<<<grid, 256, 0, stream>>>(sorted, counts, bounds,
                                                           ids, n_rows, n_expert);
     if (!cuda_ok(cudaGetLastError(), "qwen4exp moe column sort")) return 0;
     *sorted_out = sorted;
     *bounds_out = bounds;
+    *active_out = active;
     return 1;
 }
 
@@ -1804,20 +2155,26 @@ extern "C" int ds4_gpu_q4e_moe_down(
     if (n_tok > 1u && in_dim == 640u) {
         const int32_t *sorted = NULL;
         const int32_t *bounds = NULL;
+        const int32_t *active = NULL;
         if (q4e_moe_sort_columns((const int32_t *)ids->ptr, n_rows, n_expert,
-                                 &sorted, &bounds)) {
+                                 &sorted, &bounds, &active)) {
+            /* At most one expert per column can be active, so n_rows bounds
+             * the active list and the grid stays fixed per row count. */
+            const uint32_t max_active = n_rows < n_expert ? n_rows : n_expert;
             const dim3 ggrid((out_dim + rows_per_block - 1u) / rows_per_block,
-                             n_expert, 1);
+                             max_active, 1);
             if (weight_type == 7u) {
                 q4e_moe_down_grouped_kernel<7, 20><<<ggrid, threads, 0,
                                                      cuda_decode_stream()>>>(
                         (float *)out->ptr, (const uint8_t *)w, (const float *)x->ptr,
-                        sorted, bounds, out_dim, in_dim, (uint32_t)expert_bytes);
+                        sorted, bounds, active, n_expert, out_dim, in_dim,
+                        (uint32_t)expert_bytes);
             } else {
                 q4e_moe_down_grouped_kernel<8, 20><<<ggrid, threads, 0,
                                                      cuda_decode_stream()>>>(
                         (float *)out->ptr, (const uint8_t *)w, (const float *)x->ptr,
-                        sorted, bounds, out_dim, in_dim, (uint32_t)expert_bytes);
+                        sorted, bounds, active, n_expert, out_dim, in_dim,
+                        (uint32_t)expert_bytes);
             }
             return cuda_ok(cudaGetLastError(), "qwen4exp moe down grouped");
         }

@@ -3165,6 +3165,9 @@ int ds4_gpu_q4e_qsa_store_kv( ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, 
 int ds4_gpu_q4e_qsa_attention( ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok);
 
 int ds4_gpu_q4e_qsa_gate(ds4_gpu_tensor *x, const ds4_gpu_tensor *gate, uint64_t n);
+int ds4_gpu_q4e_argmax_rows(ds4_gpu_tensor *out_idx, const ds4_gpu_tensor *logits, uint32_t n_vocab, uint32_t n_rows);
+void *ds4_gpu_q4e_host_alloc(uint64_t bytes);
+void ds4_gpu_q4e_host_free(void *p);
 
 int ds4_gpu_q4e_moe_gate_up( ds4_gpu_tensor *mid, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used, int *fused_silu);
 

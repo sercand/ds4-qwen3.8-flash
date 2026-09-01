@@ -54680,7 +54680,8 @@ typedef struct {
     ds4_gpu_tensor *gdn_conv_ckpt[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state_ckpt[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv_ckpt;
-    float          *verify_logits;   /* host, logit_rows * n_vocab */
+    ds4_gpu_tensor *argmax_dev;      /* int32 per logits row */
+    int32_t        *argmax_host;     /* the verify rows' greedy picks */
 
     /* The MTP draft head.  It is one full-attention layer plus its own
      * projections, and it runs through the same island code as the target
@@ -54694,7 +54695,6 @@ typedef struct {
     ds4_gpu_tensor *mtp_k_cache;
     ds4_gpu_tensor *mtp_v_cache;
     ds4_gpu_tensor *mtp_logits;
-    float          *mtp_host_logits;
 
     /* Target residual rows whose draft-side KV has not been written yet:
      * rows [pend_row0, pend_row0 + pend_n) of `res`, at positions pend_pos0
@@ -54751,6 +54751,7 @@ struct ds4_session {
     size_t sync_image_count;
     token_vec greedy_splitkv_segment;
     float *logits;
+    bool   logits_pinned;      /* cudaMallocHost, freed with ds4_gpu_q4e_host_free */
     float *sample_probs;
     float *mtp_logits;
     int greedy_splitkv_anchor_len;
@@ -65289,13 +65290,13 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         g->ple_v, g->ple_q, g->ple_gv, g->ple_cv, g->logits,
         g->ple_conv_ckpt, g->mtp_res, g->mtp_embed, g->mtp_tokens,
         g->mtp_positions, g->mtp_k_cache, g->mtp_v_cache, g->mtp_logits,
+        g->argmax_dev,
     };
     for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
     ds4_ple_stream_close(g->ple_stream);
     free(g->ple_row_ids);
     free(g->ple_row_data);
-    free(g->verify_logits);
-    free(g->mtp_host_logits);
+    free(g->argmax_host);
     memset(g, 0, sizeof(*g));
 }
 
@@ -65442,7 +65443,10 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
 
     if (ok && g->spec_k) {
         ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
-        if (ok) g->verify_logits = xmalloc((size_t)g->logit_rows * DS4_N_VOCAB * sizeof(float));
+    }
+    if (ok) {
+        ok = q4e_alloc(&g->argmax_dev, (uint64_t)(g->logit_rows + 1u) * sizeof(int32_t));
+        if (ok) g->argmax_host = xmalloc((size_t)(g->logit_rows + 1u) * sizeof(int32_t));
     }
     if (ok && mtp) {
         ok = q4e_alloc(&g->mtp_res, (uint64_t)T * Q4E_HC_DIM * f)
@@ -65452,10 +65456,7 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
           && q4e_alloc(&g->mtp_k_cache, (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t))
           && q4e_alloc(&g->mtp_v_cache, (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t))
           && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
-        if (ok) {
-            g->mtp_host_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-            g->mtp_ready = true;
-        }
+        if (ok) g->mtp_ready = true;
     }
 
     if (!ok) {
@@ -65991,11 +65992,17 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     q4e_trace("result_output", -1, g->logits, (uint64_t)DS4_N_VOCAB);
     q4e_phase_end(Q4E_PH_OUTPUT, tph);
 
-    if (!ds4_gpu_synchronize()) return 1;
-    if (!ds4_gpu_tensor_read(g->logits, 0,
-                             logit_rows == 1u ? s->logits : g->verify_logits,
-                             (uint64_t)logit_rows * DS4_N_VOCAB * sizeof(float))) {
-        return 1;
+    if (logit_rows == 1u) {
+        if (!ds4_gpu_synchronize()) return 1;
+        if (!ds4_gpu_tensor_read(g->logits, 0, s->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float))) return 1;
+    } else {
+        /* The verify batch: only the greedy pick of every row comes back now;
+         * q4e_spec_step copies the one row it commits. */
+        if (!ds4_gpu_q4e_argmax_rows(g->argmax_dev, g->logits, DS4_N_VOCAB, logit_rows)) return 1;
+        if (!ds4_gpu_synchronize()) return 1;
+        if (!ds4_gpu_tensor_read(g->argmax_dev, 0, g->argmax_host,
+                                 (uint64_t)logit_rows * sizeof(int32_t))) return 1;
     }
     g->pos = pos0 + n_tok;
     return 0;
@@ -66031,7 +66038,7 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
  * row goes through the target's vocabulary head and lands there. */
 static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
                          const int32_t *tokens, const int32_t *positions, uint32_t n,
-                         float *out_logits) {
+                         int *out_argmax) {
     ds4_q4e_graph *g = &s->q4e_graph;
     ds4_engine *e = s->engine;
     const ds4_model *tm = &e->model;
@@ -66091,7 +66098,7 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
                            ds4_gpu_decode_graphs_supported() != 0;
     if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 0u, n, graphs_ok)) return 1;
     if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 1u, n, graphs_ok)) return 1;
-    if (!out_logits) return 0;
+    if (!out_argmax) return 0;
 
     /* The collapsing mixer has no inject; the vocabulary head is the
      * target's, shared with the draft exactly as the embedding is. */
@@ -66105,18 +66112,22 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     ds4_gpu_tensor_free(last);
     if (!projected) return 1;
     q4e_trace("mtp_result_output", -1, d.logits, (uint64_t)DS4_N_VOCAB);
+    /* Greedy drafts need the argmax alone: 4 bytes back instead of 1 MB. */
+    if (!ds4_gpu_q4e_argmax_rows(g->argmax_dev, d.logits, DS4_N_VOCAB, 1u)) return 1;
     if (!ds4_gpu_synchronize()) return 1;
-    return ds4_gpu_tensor_read(d.logits, 0, out_logits,
-                               (uint64_t)DS4_N_VOCAB * sizeof(float)) ? 0 : 1;
+    int32_t pick = -1;
+    if (!ds4_gpu_tensor_read(g->argmax_dev, 0, &pick, sizeof(pick))) return 1;
+    *out_argmax = (int)pick;
+    return 0;
 }
 
 /* Write the draft KV for the pending target rows.  history supplies the
  * token after each row; `last_token` overrides it for the final row, which
  * is how the freshly sampled token gets in before it is part of history.
- * Returns the draft's logits for the row after the last one in out_logits
- * when asked. */
+ * Returns the draft's greedy pick for the row after the last one in
+ * out_argmax when asked. */
 static int q4e_mtp_flush_pending(ds4_session *s, const int *history, int last_token,
-                                 float *out_logits) {
+                                 int *out_argmax) {
     ds4_q4e_graph *g = &s->q4e_graph;
     if (!g->mtp_ready || !g->pend_valid) return 0;
     const uint32_t n = g->pend_n;
@@ -66130,7 +66141,7 @@ static int q4e_mtp_flush_pending(ds4_session *s, const int *history, int last_to
             g->res, (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
             (uint64_t)n * Q4E_HC_DIM * sizeof(float));
     int rc = 1;
-    if (hidden) rc = q4e_mtp_draft(s, hidden, tok, pos, n, out_logits);
+    if (hidden) rc = q4e_mtp_draft(s, hidden, tok, pos, n, out_argmax);
     ds4_gpu_tensor_free(hidden);
     free(tok);
     free(pos);
@@ -66204,6 +66215,13 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
     uint32_t n_draft = 0;
     bool from_ngram = false;
     const double t_draft = now_sec();
+    /* DS4_QWEN4EXP_SPEC_LOG=2 adds a host-side phase breakdown per step. */
+    static int spec_log = -1;
+    if (spec_log < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_SPEC_LOG");
+        spec_log = (env && env[0]) ? atoi(env) : 0;
+    }
+    double t_ngram = t_draft, t_flush = t_draft;
 
     /* Prompt lookup first: when the recent tokens repeat something earlier
      * in the context, the continuation there is a better and longer guess
@@ -66216,6 +66234,7 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
             from_ngram = n_draft != 0;
         }
     }
+    t_ngram = now_sec();
 
     uint32_t mtp_k = 0;
     if (g->mtp_ready && g->pend_valid && !from_ngram) {
@@ -66227,25 +66246,26 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         /* The draft KV follows every committed token whether or not the head
          * proposes this step. */
         const uint32_t flushed_n = g->pend_n;
+        int pick = -1;
         if (q4e_mtp_flush_pending(s, s->checkpoint.v, first_token,
-                                  K ? g->mtp_host_logits : NULL) != 0) {
+                                  K ? &pick : NULL) != 0) {
             if (errlen) snprintf(err, errlen, "qwen4exp MTP draft failed");
             ds4_session_invalidate(s);
             return -1;
         }
+        t_flush = now_sec();
         if (K) {
             /* The pending rows ended at position pos0 - 1; the draft residual
              * for that row is the last of the rows just written. */
             uint32_t last_row = flushed_n - 1u;
-            drafts[n_draft++] = sample_argmax(g->mtp_host_logits, DS4_N_VOCAB);
+            drafts[n_draft++] = pick;
             while (n_draft < K && drafts[n_draft - 1u] != eos_token) {
                 ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
                         g->mtp_res, (uint64_t)last_row * Q4E_HC_DIM * sizeof(float),
                         (uint64_t)Q4E_HC_DIM * sizeof(float));
                 const int32_t tok = drafts[n_draft - 1u];
                 const int32_t pos = (int32_t)(pos0 - 1u + n_draft);
-                const int rc = hidden ? q4e_mtp_draft(s, hidden, &tok, &pos, 1u,
-                                                      g->mtp_host_logits) : 1;
+                const int rc = hidden ? q4e_mtp_draft(s, hidden, &tok, &pos, 1u, &pick) : 1;
                 ds4_gpu_tensor_free(hidden);
                 if (rc != 0) {
                     if (errlen) snprintf(err, errlen, "qwen4exp MTP draft failed");
@@ -66253,7 +66273,7 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
                     return -1;
                 }
                 last_row = 0;
-                drafts[n_draft++] = sample_argmax(g->mtp_host_logits, DS4_N_VOCAB);
+                drafts[n_draft++] = pick;
             }
         }
     }
@@ -66274,14 +66294,14 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         ds4_session_invalidate(s);
         return -1;
     }
+    const double t_forward = now_sec();
 
     /* Accept the longest prefix of drafts the target's argmax agrees with.
      * Row i holds the distribution after token pos0 + i, i.e. the target's
      * choice for the token drafts[i] proposed. */
     uint32_t a = 0;
-    const float *rows = K ? g->verify_logits : s->logits;
     while (a < K) {
-        if (sample_argmax(rows + (size_t)a * DS4_N_VOCAB, DS4_N_VOCAB) != drafts[a]) break;
+        if (g->argmax_host[a] != drafts[a]) break;
         a++;
         if (drafts[a - 1u] == eos_token) break;
     }
@@ -66291,10 +66311,7 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
                 from_ngram ? "ngram" : "mtp");
         for (uint32_t i = 0; i < K; i++) fprintf(stderr, "%s%d", i ? "," : "", drafts[i]);
         fprintf(stderr, " target=");
-        for (uint32_t i = 0; i < K; i++) {
-            fprintf(stderr, "%s%d", i ? "," : "",
-                    sample_argmax(rows + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB));
-        }
+        for (uint32_t i = 0; i < K; i++) fprintf(stderr, "%s%d", i ? "," : "", g->argmax_host[i]);
         fprintf(stderr, " accepted=%u\n", a);
     }
     if (a < K && q4e_spec_rollback(g, a) != 0) {
@@ -66303,9 +66320,16 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         ds4_session_invalidate(s);
         return -1;
     }
+    const double t_rollback = now_sec();
     s->checkpoint.len = (int)(pos0 + 1u + a);
     g->pos = pos0 + 1u + a;
-    if (K) memcpy(s->logits, rows + (size_t)a * DS4_N_VOCAB, (size_t)DS4_N_VOCAB * sizeof(float));
+    /* The committed row's distribution, for the caller's sampler. */
+    if (K && !ds4_gpu_tensor_read(g->logits, (uint64_t)a * DS4_N_VOCAB * sizeof(float),
+                                  s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float))) {
+        if (errlen) snprintf(err, errlen, "qwen4exp logits read failed");
+        ds4_session_invalidate(s);
+        return -1;
+    }
 
     /* The committed rows' residuals wait in g->res for the next step, whose
      * sampled token completes the last one. */
@@ -66325,6 +66349,13 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         const double now = now_sec();
         g->spec_draft_ms += (t_verify - t_draft) * 1e3;
         g->spec_verify_ms += (now - t_verify) * 1e3;
+        if (spec_log >= 2) {
+            fprintf(stderr, "q4e spec timing pos=%u K=%u a=%u ngram=%.2f flush=%.2f drafts=%.2f "
+                    "forward=%.2f rollback=%.2f tail=%.2f ms\n", pos0, K, a,
+                    (t_ngram - t_draft) * 1e3, (t_flush - t_ngram) * 1e3,
+                    (t_verify - t_flush) * 1e3, (t_forward - t_verify) * 1e3,
+                    (t_rollback - t_forward) * 1e3, (now - t_rollback) * 1e3);
+        }
     }
     return (int)(1u + a);
 }
@@ -66370,7 +66401,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s);
             return 1;
         }
-        s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->logits = ds4_gpu_q4e_host_alloc((uint64_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+        s->logits_pinned = s->logits != NULL;
+        if (!s->logits) s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         s->prefill_cap = (int)s->q4e_graph.tok_cap;
         *out = s;
@@ -66692,6 +66725,10 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
+#ifndef DS4_NO_GPU
+    if (s->logits_pinned) ds4_gpu_q4e_host_free(s->logits);
+    else
+#endif
     free(s->logits);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
@@ -68201,6 +68238,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         for (int i = 0; i < prompt->len; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
         s->checkpoint_valid = true;
         s->mtp_draft_valid = false;
+        /* Under the profiler, report the prefill's phases here and start the
+         * decode steps from zero, so the session-free report is decode only. */
+        q4e_profile_report();
         return 0;
     }
 #endif

@@ -63,6 +63,10 @@ int main(void) {
     }
     int ctx = prefill_tokens + decode_tokens + 64;
     if (ctx < 512) ctx = 512;
+    /* DS4_QWEN4EXP_CTX sizes the context without running the prefill
+     * benchmark, for long DS4_QWEN4EXP_PROMPT_IDS runs. */
+    const char *ctx_env = getenv("DS4_QWEN4EXP_CTX");
+    if (ctx_env && ctx_env[0] && atoi(ctx_env) > ctx) ctx = atoi(ctx_env);
 
     ds4_engine_options opt;
     memset(&opt, 0, sizeof(opt));
