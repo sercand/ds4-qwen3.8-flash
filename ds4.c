@@ -54523,7 +54523,16 @@ typedef struct {
  * one host-side scan per step, and strongest exactly where an agent echoes
  * tool output back.  It never replaces the MTP draft, only extends it (see
  * q4e_spec_step), so a bad lookup costs nothing on the GPU.
- * DS4_QWEN4EXP_NGRAM_K caps the proposal (0 disables, default 8);
+ *
+ * DS4_QWEN4EXP_NGRAM_K caps the proposal and defaults to 0, off.  Even gated,
+ * a hit turns a 4-row verify into a 9-row one, which measured 2.4x the cost
+ * and so only pays when most of the eight drafts are accepted.  Measured
+ * 2026-09-02 at matched machine state: on a verbatim tool-result echo it
+ * accepts 88% of its drafts and decode goes 36.4 -> 49.1 tok/s, but on the
+ * 27.5k agent turn it fires on 4.6% of steps, accepts 54%, and decode goes
+ * 29.2 -> 27.6 tok/s.  It has to win on both to be on by default, so it ships
+ * off and DS4_QWEN4EXP_NGRAM_K=8 turns it on for echo-shaped work.
+ *
  * DS4_QWEN4EXP_NGRAM_MIN is the shortest match accepted.  The minimum is 5:
  * a 3-token key matches template scaffolding all over an agent context, and
  * every firing measured at 3 was such a false positive. */
@@ -54531,7 +54540,7 @@ static uint32_t q4e_ngram_k(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_QWEN4EXP_NGRAM_K");
-        long v = (env && env[0]) ? strtol(env, NULL, 10) : 8;
+        long v = (env && env[0]) ? strtol(env, NULL, 10) : 0;
         if (v < 0) v = 0;
         if (v > (long)Q4E_SPEC_MAX_DRAFT) v = Q4E_SPEC_MAX_DRAFT;
         cached = (int)v;
