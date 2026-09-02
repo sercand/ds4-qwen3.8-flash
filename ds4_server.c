@@ -9704,8 +9704,6 @@ struct server {
     int mixed_prefill_quantum;
     int last_prefill_slot;
     int last_decode_slot;
-    /* The widest chunk the engine will run, for the startup log line only. */
-    int prefill_chunk_rows;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -9724,6 +9722,11 @@ struct server {
     uint64_t cache_hits;
     uint64_t cache_reused_tokens;
     uint64_t cache_prefilled_tokens;
+    /* The disk tier, counted separately: it is the only reuse tier that
+     * survives a restart, so its hit and write counts say whether
+     * --kv-disk-dir is earning its bytes. */
+    uint64_t cache_disk_hits;
+    uint64_t cache_disk_writes;
     int cache_log_every;
 };
 
@@ -10780,7 +10783,48 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    server_inference_lock(s);
+    /* A family whose payload is hundreds of megabytes (qwen4exp: 113 MB of
+     * recurrent state plus ~30 KiB per position, 700 MB at 21.7k) is staged
+     * here instead of inside the store.  Reading it out of the shared KV
+     * buffers needs the model; writing the file does not.  Splitting the two
+     * stalls a peer context for one device copy -- about 0.1 s on this box's
+     * unified memory -- instead of for the whole NVMe write.  The other
+     * families keep the single-call flow: their payloads are one to two
+     * orders smaller.
+     *
+     * Staged unconditionally rather than after asking whether the store would
+     * write anything: a conditional stage would leave the store to read the
+     * graph itself -- with the model unlocked -- whenever the question and the
+     * store's own answer disagreed, which is the wrong failure to trade for.
+     * The cost is one wasted stage when a compatible file turns out to be
+     * there already, which for this family is the shutdown store of a path a
+     * previous run wrote. */
+    ds4_session_payload_file staged = {0};
+    const bool stage_first = ds4_engine_stages_session_payload(s->engine);
+    if (stage_first) {
+        const double stage_t0 = now_sec();
+        server_inference_lock(s);
+        const int rc = ds4_session_stage_payload(slot->session, &staged,
+                                                 err, sizeof(err));
+        server_inference_unlock(s);
+        if (rc != 0) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache skipped tokens=%d reason=%s because "
+                       "KV payload staging failed: %s",
+                       store_len, reason, err[0] ? err : "unknown error");
+            return false;
+        }
+        /* This is the model-lock hold, which is the number that matters to
+         * the other contexts; the store's own `save=` is the file write, and
+         * runs with the model free. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache staged tokens=%d reason=%s size=%.2f MiB stage=%.1f ms",
+                   store_len, reason,
+                   (double)staged.bytes / (1024.0 * 1024.0),
+                   (now_sec() - stage_t0) * 1000.0);
+    } else {
+        server_inference_lock(s);
+    }
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
@@ -10788,9 +10832,20 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_override,
                                                   cache_text_ext,
                                                   cache_text_key,
+                                                  stage_first ? &staged : NULL,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
-    server_inference_unlock(s);
+    if (!stage_first) server_inference_unlock(s);
+    const uint64_t staged_bytes = staged.bytes;
+    ds4_session_payload_file_free(&staged);
+    /* Only the staging path can say a file was really written rather than
+     * found already compatible; the families that do not stage do not report
+     * a reuse tier either. */
+    if (ok && staged_bytes != 0) {
+        pthread_mutex_lock(&s->mu);
+        s->cache_disk_writes++;
+        pthread_mutex_unlock(&s->mu);
+    }
     return ok;
 }
 
@@ -10981,6 +11036,8 @@ typedef struct {
     uint64_t hits;
     uint64_t reused_tokens;
     uint64_t prefilled_tokens;
+    uint64_t disk_hits;
+    uint64_t disk_writes;
     ds4_session_cache_stats engine;
     ds4_session_path_info path;
 } server_cache_report;
@@ -10993,6 +11050,8 @@ static void server_cache_report_get(server *s, server_cache_report *out) {
     out->hits = s->cache_hits;
     out->reused_tokens = s->cache_reused_tokens;
     out->prefilled_tokens = s->cache_prefilled_tokens;
+    out->disk_hits = s->cache_disk_hits;
+    out->disk_writes = s->cache_disk_writes;
     pthread_mutex_unlock(&s->mu);
     /* The families that report a reuse tier at all (qwen4exp) keep one cache
      * shared by every session, so slot 0's numbers are the engine's; the rest
@@ -11033,7 +11092,7 @@ static void server_cache_note_request(server *s, const char *source,
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: cache totals requests=%llu hits=%llu hit_rate=%.2f "
                "reused=%llu prefilled=%llu checkpoints=%d/%d evicted=%llu "
-               "pages=%u/%u spans=%u evicted=%llu",
+               "pages=%u/%u spans=%u evicted=%llu disk=%llu/%llu",
                (unsigned long long)rep.requests,
                (unsigned long long)rep.hits,
                server_cache_hit_rate(&rep),
@@ -11043,7 +11102,9 @@ static void server_cache_note_request(server *s, const char *source,
                (unsigned long long)rep.engine.evictions,
                rep.engine.pool_pages_used, rep.engine.pool_pages,
                rep.engine.tree_nodes,
-               (unsigned long long)rep.engine.page_evictions);
+               (unsigned long long)rep.engine.page_evictions,
+               (unsigned long long)rep.disk_hits,
+               (unsigned long long)rep.disk_writes);
 }
 
 /* The cache-source name for a prefix the engine supplied.  A new
@@ -11054,6 +11115,10 @@ static const char *cache_source_for_reuse(ds4_reuse_source source) {
     case DS4_REUSE_TREE:       return "memory-tree";
     case DS4_REUSE_CHECKPOINT: return "memory-checkpoint";
     case DS4_REUSE_LIVE:       return "memory-token";
+    /* The disk tier is the server's own, not something the engine reports
+     * from a sync; the request path fills the report in after a load so the
+     * label and the counters treat it like any other tier. */
+    case DS4_REUSE_DISK:       return "disk-text";
     case DS4_REUSE_COLD:       break;
     }
     return "none";
@@ -11851,12 +11916,17 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
  * goes before a queued prefill quantum until every generating context has had
  * its step since the last quantum, and then the prefiller takes one -- or a
  * long prompt would never finish while anyone is decoding.  Round-robin
- * inside each class.  A prefill quantum is one engine prefill chunk
- * (--prefill-chunk; 512 rows for qwen4exp once there is more than one
- * context), so a decoding stream waits at most one chunk for the model.  The
- * quantum is the chunk width rather than a cap on top of it because chunk
- * width perturbs the router logits of a 512-expert MoE: an answer must not
- * depend on whether the request happened to share the model.
+ * inside each class.
+ *
+ * A prefill quantum is one engine prefill chunk (--prefill-chunk), narrowed
+ * to --mixed-prefill-quantum rows while another context has work: the cap is
+ * applied on top of the chunk, per chunk, by server_prefill_chunk_rows, so a
+ * prefill that is alone runs at the engine's full width and a decoding stream
+ * never waits more than the narrow quantum for the model.  Chunk width
+ * perturbs the router logits of a 512-expert MoE, so a request that shared
+ * the model with a peer can answer differently from the same request run
+ * solo, at a near-tie -- the alternative was making every solo prefill pay
+ * the narrow width, which costs several times the prefill throughput.
  *
  * D5, true batched decode, would replace the per-context steps with one
  * forward carrying rows from both contexts.  Nothing here assumes a step is
@@ -13098,10 +13168,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
     if (!multimodal && s->kv.enabled && cached == 0 &&
-        old_pos >= s->kv.opt.min_tokens) {
+        old_pos >= s->kv.opt.min_tokens &&
+        !ds4_engine_shares_prefix_cache(s->engine)) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
-         * would silently discard the newer conversation state. */
+         * would silently discard the newer conversation state.
+         *
+         * A family that shares one prefix cache across sessions does not need
+         * this: the path this context is standing on is already in the radix
+         * tree, and its own request wrote it to disk at its prompt's end.  The
+         * store would be a second several-hundred-megabyte write per
+         * conversation switch, for state that is not being lost. */
         kv_cache_store_current(s, slot, "evict");
     }
     if (!multimodal && cached == 0) {
@@ -13112,6 +13189,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cached = disk_cached;
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
+            /* The engine did not answer this one, the server's disk tier did
+             * -- but it is a reuse tier like the others, so it gets the same
+             * `source@position` label and the same counters.  For a family
+             * with a prefix cache the load also put the path back in the
+             * tree, so the sync that follows is a live extension. */
+            reuse.source = DS4_REUSE_DISK;
+            reuse.reused_tokens = disk_cached;
+            reuse.matched_tokens = disk_cached;
+            pthread_mutex_lock(&s->mu);
+            s->cache_disk_hits++;
+            pthread_mutex_unlock(&s->mu);
         }
     }
     const bool responses_reasoning_state_preserved =
@@ -13233,6 +13321,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                                                     ds4_token_assistant(s->engine));
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (ds4_engine_shares_prefix_cache(s->engine)) {
+            /* The trimmed, 2048-aligned anchor exists so a *different* next
+             * prompt still matches the stored prefix.  A family with a prefix
+             * cache does not need it: after a restart the position that
+             * matters is the prompt's own end, which makes an exact re-send
+             * prefill nothing -- and a follow-up turn's rendered prompt has
+             * this prompt's bytes as a prefix anyway, so it hits the same
+             * file.  It also halves the writes: the anchor and the prompt end
+             * would be two several-hundred-megabyte files for one request. */
+            cold_store_len = prompt_for_sync->len;
+        }
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -14613,6 +14712,7 @@ static bool send_cache_report(server *s, int fd) {
         "\"tokens_reused\":%llu,\"tokens_prefilled\":%llu,"
         "\"states\":{\"entries\":%d,\"capacity\":%d,\"evictions\":%llu},"
         "\"pages\":{\"used\":%u,\"total\":%u,\"spans\":%u,\"evictions\":%llu},"
+        "\"disk\":{\"hits\":%llu,\"writes\":%llu},"
         "\"path\":{\"tokens\":%d,\"pages\":%d,\"page_bytes\":%llu,"
         "\"state_bytes\":%llu}}\n",
         (unsigned long long)rep.requests,
@@ -14625,6 +14725,8 @@ static bool send_cache_report(server *s, int fd) {
         rep.engine.pool_pages_used, rep.engine.pool_pages,
         rep.engine.tree_nodes,
         (unsigned long long)rep.engine.page_evictions,
+        (unsigned long long)rep.disk_hits,
+        (unsigned long long)rep.disk_writes,
         rep.path.tokens, rep.path.pages,
         (unsigned long long)rep.path.page_bytes,
         (unsigned long long)rep.path.state_bytes);
@@ -14680,7 +14782,6 @@ static void server_cancel_job(server *s, job *j) {
     job_mark_cancelled(j);
 
     bool detached = false;
-    int detached_slot = -1;
     pthread_mutex_lock(&s->mu);
     job *prev = NULL;
     for (job *it = s->head; it; prev = it, it = it->next) {
@@ -14700,7 +14801,20 @@ static void server_cancel_job(server *s, job *j) {
             slot->work = NULL;
             slot->busy = false;
             detached = true;
-            detached_slot = i;
+            /* A job cancelled between dispatch and its worker picking it up
+             * never reaches generate_job, which is the only other place that
+             * clears this.  Leaving it set would make
+             * server_startup_pending_locked report a startup that never
+             * finishes, and every prefill quantum on every context would wait
+             * for it -- for the life of the process.
+             *
+             * Clear it here, *before* the dispatch: dispatch_jobs_locked can
+             * hand this very slot to a queued job and set the flag again for
+             * that job, so a clear after the loop would clear the new job's
+             * flag and leave the cancelled one's effect in place. */
+            pthread_mutex_lock(&s->model_mu);
+            slot->awaiting_first_grant = false;
+            pthread_mutex_unlock(&s->model_mu);
             dispatch_jobs_locked(s);
             break;
         }
@@ -14709,12 +14823,6 @@ static void server_cancel_job(server *s, job *j) {
     pthread_mutex_unlock(&s->mu);
 
     pthread_mutex_lock(&s->model_mu);
-    /* A job cancelled between dispatch and its worker picking it up never
-     * reaches generate_job, which is the only other place that clears this.
-     * Leaving it set would make server_startup_pending_locked report a
-     * startup that never finishes, and every prefill quantum on every context
-     * would wait for it -- for the life of the process. */
-    if (detached_slot >= 0) s->slots[detached_slot].awaiting_first_grant = false;
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (slot->running == j) {
@@ -15392,7 +15500,6 @@ int main(int argc, char **argv) {
     s.batched_mode = cfg.batched_sessions > 0;
     s.multi_ctx_mode = multi_ctx_mode;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
-    s.prefill_chunk_rows = (int)ds4_engine_prefill_chunk(engine);
     /* The executor's contended quantum.  128 -- this flag's default, sized for
      * DeepSeek -- is far too small for a 512-expert MoE, where a chunk that
      * thin leaves each expert two rows; multi-context mode asks for about a
@@ -15441,14 +15548,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (cfg.kv_disk_dir && !ds4_engine_supports_session_payload(engine)) {
-        /* The disk store serializes the engine's graph payload.  Without a
-         * writer for this family it would save a file describing a different
-         * graph, so the server runs as if no disk checkpoint could exist. */
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: --kv-disk-dir ignored: %s sessions have no KV payload format yet",
-                   ds4_engine_model_name(engine));
-    } else if (cfg.kv_disk_dir) {
+    if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
@@ -15709,8 +15809,9 @@ static void test_multi_ctx_executor_alternation(void) {
 }
 
 /* The adaptive quantum: a solo prefill runs the engine's own chunk width (0),
- * a contended one is capped -- and "contended" is queued or starting, not
- * generating, because the request that matters has not decoded anything yet. */
+ * a contended one is capped -- and "contended" is any peer with a request in
+ * flight, queued, starting, or between steps doing host work, since all four
+ * are a stream that would otherwise wait a full-width chunk. */
 static void test_multi_ctx_adaptive_chunk(void) {
     server s = {0};
     server_slot slots[2] = {0};
@@ -19631,6 +19732,34 @@ static void test_cancel_clears_awaiting_first_grant(void) {
     TEST_ASSERT(!slot.awaiting_first_grant);
     TEST_ASSERT(!server_startup_pending_locked(&s, -1));
 
+    /* And the clear has to land on the cancelled job's slot before the
+     * dispatch that re-fills it.  server_cancel_job frees the slot and calls
+     * dispatch_jobs_locked while it still holds s->mu, so a queued job can
+     * take the same slot and set the flag for itself; a clear after that
+     * would clear the *new* job's flag and leave the request that just
+     * started with no startup pending. */
+    job assigned, queued;
+    test_cancel_job_init(&assigned);
+    test_cancel_job_init(&queued);
+    slot.assigned = &assigned;
+    slot.work = &assigned;
+    slot.busy = true;
+    slot.awaiting_first_grant = true;
+    s.head = &queued;
+    s.tail = &queued;
+
+    server_cancel_job(&s, &assigned);
+    TEST_ASSERT(assigned.done);
+    TEST_ASSERT(!queued.done);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(slot.assigned == &queued);
+    TEST_ASSERT(slot.work == &queued);
+    TEST_ASSERT(slot.busy);
+    TEST_ASSERT(slot.awaiting_first_grant);
+    TEST_ASSERT(server_startup_pending_locked(&s, -1));
+
+    test_cancel_job_destroy(&queued);
+    test_cancel_job_destroy(&assigned);
     test_cancel_job_destroy(&j);
     test_cancel_server_destroy(&s);
 }

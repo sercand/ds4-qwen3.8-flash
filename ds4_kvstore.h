@@ -168,6 +168,9 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
 
+/* `pre_staged` is a payload the caller already took out of the graph (see
+ * ds4_session_stage_payload); NULL means this call stages it.  The caller
+ * owns and frees what it passes. */
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -177,6 +180,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const ds4_session_payload_file *pre_staged,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len);
