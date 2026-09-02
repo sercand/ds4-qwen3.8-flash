@@ -107,6 +107,10 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
 
 #ifndef DS4_NO_GPU
 #include "ds4_gpu.h"
+/* qwen4exp paged-KV geometry, shared with the kernels (ds4_qwen4exp_gpu.cuh
+ * includes it too; ds4_gpu.h deliberately does not, so it does not reach the
+ * dozen translation units that only want the tensor API). */
+#include "ds4_q4e_page.h"
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
@@ -54915,8 +54919,8 @@ typedef struct {
     /* QSA indexer state and scratch (see ds4_gpu_q4e_idx_*): raw f16 indexer
      * keys and pooled/normed/rotated block keys per attention layer; the
      * per-forward scratch is sized for Q4E_IDX_QB rows at a time. */
-    ds4_gpu_tensor *idx_k_cache[DS4_MAX_LAYER];   /* [ctx][128] f16 */
-    ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];    /* [ctx/4 + 1][128] f16 */
+    ds4_gpu_tensor *idx_k_cache[DS4_MAX_LAYER];   /* [pool_slots][128] f16 */
+    ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];    /* [pool_slots/4][128] f16 */
     ds4_gpu_tensor *idx_k;        /* [tok_cap][128] f32 */
     ds4_gpu_tensor *idx_q;        /* [tok_cap][4*128] f32 */
     ds4_gpu_tensor *idx_qn;       /* [tok_cap][4*128] f16 */
@@ -65760,9 +65764,6 @@ static int q4e_snapshot_restore(ds4_session *s, struct q4e_snapshot *sn) {
     ds4_q4e_graph *g = &s->q4e_graph;
     if (q4e_snapshot_copy(g, sn, false) != 0) return 1;
     g->pos = sn->pos;
-    /* The frontier retreats to sn->pos, so the pages above it go back to the
-     * pool: with the longer snapshots dropped below, nothing refers to them. */
-    q4e_kv_trim(g, sn->pos);
     s->checkpoint.len = 0;
     for (int i = 0; i < sn->tokens.len; i++) token_vec_push(&s->checkpoint, sn->tokens.v[i]);
     if (sn->logits_valid) memcpy(s->logits, sn->logits, (size_t)DS4_N_VOCAB * sizeof(float));
@@ -65781,6 +65782,11 @@ static int q4e_snapshot_restore(ds4_session *s, struct q4e_snapshot *sn) {
             g->snap_evictions++;
         }
     }
+    /* Only now that no snapshot above sn->pos survives can the pages holding
+     * those positions go back to the pool.  Releasing them before the loop
+     * would hand them out again while the `return 1` above still left a
+     * higher snapshot claiming them. */
+    q4e_kv_trim(g, sn->pos);
     return 0;
 }
 

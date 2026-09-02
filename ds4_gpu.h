@@ -4,9 +4,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* qwen4exp paged-KV geometry, shared with the kernels. */
-#include "ds4_q4e_page.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
