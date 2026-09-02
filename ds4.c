@@ -55496,6 +55496,14 @@ struct ds4_q4e_graph {
  * is the trade --prefill-chunk exists to make. */
 #define Q4E_MULTI_CTX_CHUNK 512u
 
+/* Admission rule 4's stride: how far apart the speculative "a slot was going
+ * spare" checkpoints stand.  It used to be the chunk width, which stopped
+ * being the same thing when the executor's quantum shrank the chunk to 512 --
+ * and a checkpoint 512 tokens above its neighbour is worth 0.7 s of prefill,
+ * low enough that a store under pressure evicts it before the positions rules
+ * 1 to 3 asked for.  So it is its own number, and it stays where it was. */
+#define Q4E_ADMISSION_STRIDE 2048u
+
 typedef struct {
     bool     used;
     bool     ready;              /* tensors allocated (they outlive eviction) */
@@ -66918,8 +66926,13 @@ static uint32_t q4e_next_admission(ds4_q4e_graph *g, uint32_t pos, uint32_t len)
         spare = q4e_ckpt_any_free(c);
         pthread_mutex_unlock(&c->mu);
     }
-    if (spare && g->tok_cap) {
-        const uint32_t next = (pos / g->tok_cap + 1u) * g->tok_cap;
+    if (spare) {
+        /* Absolute multiples, so the positions are the same for every request
+         * that walks this path -- and never inside a chunk, so a chunk always
+         * ends on one. */
+        const uint32_t stride = g->tok_cap > Q4E_ADMISSION_STRIDE
+                              ? g->tok_cap : Q4E_ADMISSION_STRIDE;
+        const uint32_t next = (pos / stride + 1u) * stride;
         if (next > pos && next < stop) stop = next;
     }
     return stop;
