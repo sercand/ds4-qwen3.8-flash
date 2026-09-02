@@ -533,6 +533,12 @@ __global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
 
 static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
     if (!p || n == 0) return;
+    /* A full pass over every mmq output (0.125 s of a 3.35 s prefill chunk
+     * at 26k).  DS4_MMQ_NO_SANITIZE=1 skips it for measurement; the default
+     * stays on until a run without it has been shown NaN-free. */
+    static int skip = -1;
+    if (skip < 0) skip = getenv("DS4_MMQ_NO_SANITIZE") != nullptr ? 1 : 0;
+    if (skip) return;
     ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
 
