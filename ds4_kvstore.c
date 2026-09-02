@@ -1300,9 +1300,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     }
     char err[160] = {0};
     int loaded = 0;
-    if (header_ok &&
-        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) == 0)
-    {
+    int load_rc = header_ok ?
+        ds4_session_load_payload(session, fp, hdr.payload_bytes, err, sizeof(err)) : 1;
+    if (header_ok && load_rc == 0) {
         const ds4_tokens *loaded_tokens = ds4_session_tokens(session);
         if (loaded_tokens && loaded_tokens->len == (int)hdr.tokens) {
             loaded = (int)hdr.tokens;
@@ -1329,10 +1329,26 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     path);
         }
     } else {
+        const bool unreadable = header_ok && load_rc == 2;
         if (header_ok) ds4_session_invalidate(session);
+        if (unreadable) {
+            /* The file's header and text were this model's, but the payload
+             * is one this build can never read -- a graph geometry it does not
+             * have, or a format version it does not know.  Remove it.  Keeping
+             * it would cost budget on every eviction pass and, because the
+             * store's compatibility check reads only the file header, would
+             * block a fresh write of the same key forever: that conversation
+             * could never get a disk hit again.  This is the same call
+             * kv_cache_existing_compatible makes about a file whose header
+             * does not match, for the same reason.  A load that failed for
+             * some other reason keeps its file: that can be this moment
+             * rather than this file. */
+            unlink(path);
+        }
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                "%s: kv cache load failed%s%s %s: %s load=%.1f ms",
+                "%s: kv cache %s%s%s %s: %s load=%.1f ms",
                 kv_log_name(kc),
+                unreadable ? "discarded unreadable payload" : "load failed",
                 responses_protocol ? " " : "",
                 responses_protocol ? "RESPPROTO" : "",
                 path,

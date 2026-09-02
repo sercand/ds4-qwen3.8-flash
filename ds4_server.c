@@ -10793,10 +10793,12 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
      * orders smaller.
      *
      * Staged unconditionally rather than after asking whether the store would
-     * write: a store is only attempted on a request the disk tier already
-     * missed, so a compatible file is essentially never there, and a
-     * conditional stage would leave the store to read the graph itself -- with
-     * the model unlocked -- whenever the two disagreed. */
+     * write anything: a conditional stage would leave the store to read the
+     * graph itself -- with the model unlocked -- whenever the question and the
+     * store's own answer disagreed, which is the wrong failure to trade for.
+     * The cost is one wasted stage when a compatible file turns out to be
+     * there already, which for this family is the shutdown store of a path a
+     * previous run wrote. */
     ds4_session_payload_file staged = {0};
     const bool stage_first = ds4_engine_stages_session_payload(s->engine);
     if (stage_first) {

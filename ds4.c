@@ -67094,18 +67094,28 @@ static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
  * keys, budget and eviction unchanged, and read back into fresh pages and a
  * fresh checkpoint slot.
  *
- * Layout, little-endian, in the file after the kvstore's header and its
- * rendered text:
+ * Layout, little-endian and self-contained -- the kvstore's own header and
+ * rendered text sit in front of it in a cache file, and
+ * ds4_session_save_snapshot writes the same bytes with no framing at all:
  *
- *   u32 x Q4E_PAYLOAD_U32_FIELDS   magic, version, and every geometry number
- *                                  the reader depends on
- *   i32 x tokens                   the path's token ids
- *   f32 x n_vocab                  the path-final logits, so a re-send of the
+ *   u32 h[0]   magic "Q4EP"          u32 h[10]  indexer caches present
+ *   u32 h[1]   format version        u32 h[11]  draft head present
+ *   u32 h[2]   bytes per pool page   u32 h[12]  n_vocab
+ *   u32 h[3]   tokens in the path    u32 h[13]  GDN conv window elements
+ *   u32 h[4]   positions per page    u32 h[14]  GDN state matrix elements
+ *   u32 h[5]   logical pages         u32 h[15]  PLE conv window elements
+ *   u32 h[6]   KV width per row      u32 h[16]  hyper-connection width
+ *   u32 h[7]   layers                u32 h[17]  a pending draft row follows
+ *   u32 h[8]   attention layers      u32 h[18]  its first position
+ *   u32 h[9]   recurrent layers
+ *
+ *   i32 x h[3]                     the path's token ids
+ *   f32 x h[12]                    the path-final logits, so a re-send of the
  *                                  exact prompt answers without running a row
  *   per recurrent layer: f32 conv window, then f32 state matrix
- *   f32 x ple_elems                the PLE block's dilated conv window
- *   f32 x hc_dim                   the draft head's pending residual row
- *                                  (only when the payload has a draft head)
+ *   f32 x h[15]                    the PLE block's dilated conv window
+ *   f32 x h[16]                    the draft head's pending residual row
+ *                                  (only when h[11], i.e. there is a head)
  *   per logical page, in order:    that page across every KV buffer
  *
  * The state section is exactly what one checkpoint slot holds (q4e_ckpt),
@@ -67370,9 +67380,15 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
     uint64_t remaining = payload_bytes;
     uint32_t h[Q4E_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < Q4E_PAYLOAD_U32_FIELDS; i++) {
-        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
+        /* 2, not 1: a payload too short to hold its own header, or one whose
+         * header this build cannot honour, is unusable to this process for as
+         * long as it runs, and the caller may discard it.  Everything below
+         * returns 1, which can be this moment rather than this file -- a pool
+         * momentarily too small, a device call that failed -- and a good file
+         * must survive that. */
+        if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 2;
     }
-    if (q4e_payload_check(h, s, g, err, errlen) != 0) return 1;
+    if (q4e_payload_check(h, s, g, err, errlen) != 0) return 2;
 
     const uint32_t tokens = h[3];
     const uint32_t pages = h[5];

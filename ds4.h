@@ -728,6 +728,12 @@ int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
                                      FILE *fp, char *err, size_t errlen);
 void ds4_session_payload_file_free(ds4_session_payload_file *payload);
 int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen);
+/* 0 on success.  2 when the payload is not one this build can read at all --
+ * a format version or a graph geometry it does not have, or a file too short
+ * to hold its own header -- so the caller may discard the file; it will never
+ * load.  1 for any other failure, which may be this moment rather than this
+ * file (a cache momentarily too small, a device call that failed) and must not
+ * cost the caller its file.  Either way the session is left invalid. */
 int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, char *err, size_t errlen);
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen);
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
