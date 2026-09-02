@@ -2290,6 +2290,7 @@ enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
+    DS4_TENSOR_Q5_0     = 6,
     DS4_TENSOR_Q5_1     = 7,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
@@ -7303,20 +7304,30 @@ static void weights_bind_qwen4exp_layer(ds4_layer_weights *l, const ds4_model *m
  * a run of whole blocks: this is a byte copy at a block boundary, not a
  * requantization, and the draft arithmetic is then identical for both
  * layouts.  The buffer is mapped read-only afterwards because the CUDA
- * resolver registers weight pages with cudaHostRegisterReadOnly. */
+ * resolver registers weight pages with cudaHostRegisterReadOnly.
+ *
+ * Any block type whose block divides n_embd splits this way -- unsloth's
+ * Q8_0 head stores eh_proj as Q8_0 (80 blocks a half-row) and its Q4_K_M head
+ * as Q4_K (10 blocks a half-row) -- so the row split is driven by the type's
+ * block geometry rather than hard-coded to one format. */
 static bool q4e_mtp_split_eh_proj(ds4_q4e_mtp_weights *w, const ds4_model *m,
                                   const ds4_tensor *eh) {
     const uint64_t in_dim  = eh->ndim >= 1 ? eh->dim[0] : 0;
     const uint64_t out_dim = eh->ndim >= 2 ? eh->dim[1] : 0;
     const uint64_t embd    = (uint64_t)DS4_N_EMBD;
-    if (eh->type != DS4_TENSOR_Q8_0 || in_dim != 2u * embd || out_dim != embd ||
-        (embd % 32u) != 0u || eh->abs_offset > m->size ||
-        eh->bytes > m->size - eh->abs_offset) {
-        fprintf(stderr, "ds4: qwen4exp MTP nextn.eh_proj has an unexpected layout\n");
+    const gguf_type_info *info = tensor_type(eh->type);
+    if (!info || info->block_elems == 0 || (embd % info->block_elems) != 0u ||
+        in_dim != 2u * embd || out_dim != embd ||
+        eh->abs_offset > m->size || eh->bytes > m->size - eh->abs_offset) {
+        fprintf(stderr,
+                "ds4: qwen4exp MTP nextn.eh_proj has an unexpected layout "
+                "(%s, %llu x %llu)\n",
+                tensor_type_name(eh->type),
+                (unsigned long long)in_dim, (unsigned long long)out_dim);
         return false;
     }
 
-    const uint64_t half_row = embd / 32u * 34u;      /* one half-row of Q8_0 */
+    const uint64_t half_row = embd / info->block_elems * info->block_bytes;
     const uint64_t half     = out_dim * half_row;
     w->eh_split_bytes = 2u * half;
     w->eh_split = mmap(NULL, (size_t)w->eh_split_bytes, PROT_READ | PROT_WRITE,
@@ -7342,7 +7353,7 @@ static bool q4e_mtp_split_eh_proj(ds4_q4e_mtp_weights *w, const ds4_model *m,
         t->ndim = 2;
         t->dim[0] = embd;
         t->dim[1] = out_dim;
-        t->type = DS4_TENSOR_Q8_0;
+        t->type = eh->type;
         t->rel_offset = t->abs_offset = (uint64_t)i * half;
         t->elements = embd * out_dim;
         t->bytes = half;
@@ -65950,6 +65961,11 @@ static int q4e_matmul_at(ds4_gpu_tensor *out, const void *map, uint64_t map_size
         }
         /* fall through */
     case DS4_TENSOR_Q4_K:
+        /* Q5_0 and Q6_K appear only in unsloth's Q4_K_M MTP head (the
+         * hyper-connection up projections and attn_v); they have no narrow
+         * entry, so they go straight to the generic MMQ dense path. */
+    case DS4_TENSOR_Q5_0:
+    case DS4_TENSOR_Q6_K:
         return ds4_gpu_matmul_quant_tensor(out, map, map_size, w->abs_offset, w->type,
                                            w->dim[0], out_dim, x, n_tok);
     case DS4_TENSOR_BF16:

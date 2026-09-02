@@ -991,6 +991,21 @@ extern "C" int ds4_mmq_q4_K_dense(
 }
 
 
+/* Q5_0 and Q6_K: unsloth's Q4_K_M MTP head stores the hyper-connection up
+ * projections as Q5_0 and attn_v / hc_ffn_down as Q6_K.  Both are already in
+ * ds4_mmq_should_use's type list, so only the entry points were missing. */
+extern "C" int ds4_mmq_q5_0_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q5_0>("ds4_mmq_q5_0_dense", W, X, out, M, N, K, stream);
+}
+
+extern "C" int ds4_mmq_q6_K_dense(
+        const void * W, const float * X, float * out,
+        int M, int N, int K, cudaStream_t stream) {
+    return ds4_mmq_dense_impl<GGML_TYPE_Q6_K>("ds4_mmq_q6_K_dense", W, X, out, M, N, K, stream);
+}
+
 extern "C" int ds4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {
@@ -5195,4 +5210,8 @@ template void mul_mat_q_case<GGML_TYPE_Q5_K>(
 template void mul_mat_q_case<GGML_TYPE_Q5_1>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q5_0>(
+    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+template void mul_mat_q_case<GGML_TYPE_Q6_K>(
     ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);

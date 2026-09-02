@@ -32126,8 +32126,10 @@ static int cuda_matmul_mmq_dense_quant(
     uint64_t block_bytes = 0u;
     const char *label = NULL;
     switch (weight_type) {
+    case 6u:  block_elems = 32u;  block_bytes = 22u; label = "Q5_0"; break;
     case 10u: block_elems = 256u; block_bytes = 84u; label = "Q2_K"; break;
     case 12u: block_elems = 256u; block_bytes = 144u; label = "Q4_K"; break;
+    case 14u: block_elems = 256u; block_bytes = 210u; label = "Q6_K"; break;
     case 16u: block_elems = 256u; block_bytes = 66u; label = "IQ2_XXS"; break;
     case 39u: block_elems = 32u; block_bytes = 17u; label = "MXFP4"; break;
     default: return 0;
@@ -32169,6 +32171,16 @@ static int cuda_matmul_mmq_dense_quant(
             (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
             cuda_decode_stream());
         break;
+    case 6u:
+        rc = ds4_mmq_q5_0_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
+    case 14u:
+        rc = ds4_mmq_q6_K_dense(weights, (const float *)x->ptr,
+            (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
+            cuda_decode_stream());
+        break;
     case 16u:
         rc = ds4_mmq_iq2_xxs_dense(weights, (const float *)x->ptr,
             (float *)out->ptr, (int)out_dim, (int)n_tok, (int)in_dim,
@@ -32206,8 +32218,10 @@ extern "C" int ds4_gpu_matmul_quant_tensor(
         return ds4_gpu_matmul_f16_tensor(out, model_map, model_size,
                                          weight_offset, in_dim, out_dim,
                                          x, n_tok);
+    case 6u:   /* Q5_0 */
     case 10u:  /* Q2_K */
     case 12u:  /* Q4_K */
+    case 14u:  /* Q6_K */
     case 16u:  /* IQ2_XXS */
     case 39u:  /* MXFP4 */
         return cuda_matmul_mmq_dense_quant(
