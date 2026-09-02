@@ -54728,6 +54728,9 @@ typedef struct {
     } snap[Q4E_SNAP_MAX];
     uint32_t        snap_count;      /* allocated entries */
     uint64_t        snap_serial;
+    /* Valid snapshots dropped since the graph was allocated, so the server can
+     * report whether the ring is thrashing rather than reusing. */
+    uint64_t        snap_evictions;
     ds4_gpu_tensor *argmax_dev;      /* int32 per logits row */
     int32_t        *argmax_host;     /* the verify rows' greedy picks */
 
@@ -56811,9 +56814,21 @@ static void session_greedy_splitkv_reset(ds4_session *s) {
 }
 #endif
 
+/* qwen4exp's graph is per-layer recurrent state plus the QSA and indexer
+ * caches -- nothing the DeepSeek writer below the family branches understands
+ * -- and it has no payload format of its own yet.  Refuse instead of falling
+ * through, so --kv-disk-dir cannot write a file whose header claims a graph
+ * the bytes do not contain. */
+static bool session_payload_refused(const ds4_session *s, char *err, size_t errlen) {
+    if (!ds4_session_is_qwen4exp(s)) return false;
+    payload_set_err(err, errlen, "qwen4exp sessions have no KV payload format yet");
+    return true;
+}
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
     if (!s || !s->checkpoint_valid) return 0;
     if (s->distributed) return 0;
+    if (session_payload_refused(s, NULL, 0)) return 0;
     if (ds4_session_is_cpu(s)) {
         uint64_t bytes = (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t);
         bytes += (uint64_t)s->checkpoint.len * sizeof(uint32_t);
@@ -56946,6 +56961,7 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
     if (s->distributed) {
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
+    if (session_payload_refused(s, err, errlen)) return 1;
     if (ds4_session_is_glm(s)) {
 #ifdef DS4_NO_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -57286,6 +57302,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
+    if (session_payload_refused(s, err, errlen)) return 1;
     uint64_t remaining = payload_bytes;
     uint32_t h[DS4_SESSION_PAYLOAD_U32_FIELDS];
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
@@ -64995,6 +65012,10 @@ bool ds4_engine_is_qwen4exp(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP;
 }
 
+bool ds4_engine_supports_session_payload(ds4_engine *e) {
+    return e != NULL && !ds4_model_is_qwen4exp();
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
@@ -65389,7 +65410,10 @@ static void q4e_graph_reset(ds4_q4e_graph *g) {
     g->pos = 0;
     g->pend_valid = false;
     /* The prefill that follows rewrites the KV from position 0. */
-    for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) g->snap[k].valid = false;
+    for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) {
+        if (g->snap[k].valid) g->snap_evictions++;
+        g->snap[k].valid = false;
+    }
 }
 
 /* Copy the recurrent state between the live buffers and snapshot `sn`. */
@@ -65434,6 +65458,9 @@ static int q4e_snapshot_take(ds4_session *s, bool logits_valid) {
             if (g->snap[k].serial < sn->serial) sn = &g->snap[k];
         }
     }
+    /* Overwriting a live entry at another position is an eviction; rewriting
+     * the entry already at this position is only a refresh. */
+    if (sn->valid && sn->pos != g->pos) g->snap_evictions++;
     sn->valid = false;
     if (q4e_snapshot_copy(g, sn, true) != 0) return 1;
     sn->pend_valid = false;
@@ -65488,20 +65515,38 @@ static int q4e_snapshot_restore(ds4_session *s, struct q4e_snapshot *sn) {
         g->pend_pos0 = sn->pend_pos0;
     }
     for (uint32_t k = 0; k < g->snap_count; k++) {
-        if (g->snap[k].valid && g->snap[k].pos > sn->pos) g->snap[k].valid = false;
+        if (g->snap[k].valid && g->snap[k].pos > sn->pos) {
+            g->snap[k].valid = false;
+            g->snap_evictions++;
+        }
     }
     return 0;
 }
 
 /* How many leading prompt tokens the session can take as already computed:
  * the live checkpoint when the prompt extends it, else the longest snapshot
- * the prompt extends. */
-static uint32_t q4e_reusable_prefix(ds4_session *s, const ds4_tokens *prompt) {
+ * the prompt extends.  `source` names which of the two answered. */
+static uint32_t q4e_reusable_prefix(ds4_session *s, const ds4_tokens *prompt,
+                                    ds4_reuse_source *source) {
     ds4_q4e_graph *g = &s->q4e_graph;
     if (s->checkpoint_valid && (uint32_t)s->checkpoint.len == g->pos &&
-        ds4_tokens_starts_with(prompt, &s->checkpoint)) return g->pos;
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        *source = DS4_REUSE_LIVE;
+        return g->pos;
+    }
     const struct q4e_snapshot *sn = q4e_snapshot_find(g, prompt);
-    return sn ? sn->pos : 0;
+    if (!sn) return 0;
+    *source = DS4_REUSE_SNAPSHOT;
+    return sn->pos;
+}
+
+static void q4e_cache_stats(const ds4_q4e_graph *g,
+                            ds4_session_cache_stats *out) {
+    for (uint32_t k = 0; k < g->snap_count; k++) {
+        if (g->snap[k].valid) out->entries++;
+    }
+    out->capacity = (int)g->snap_count;
+    out->evictions = g->snap_evictions;
 }
 
 static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
@@ -69638,14 +69683,59 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
     return DS4_SESSION_REWRITE_ERROR;
 }
 
-int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt) {
-    if (!s || !prompt) return 0;
+void ds4_session_reuse_report(ds4_session *s, const ds4_tokens *prompt,
+                              ds4_session_reuse *out) {
+    if (!out) return;
+    out->source = DS4_REUSE_COLD;
+    out->reused_tokens = 0;
+    out->prefilled_tokens = prompt ? prompt->len : 0;
+    if (!s || !prompt) return;
+
+    int reused = 0;
+    ds4_reuse_source source = DS4_REUSE_COLD;
+    bool family_answered = false;
 #ifndef DS4_NO_GPU
-    if (ds4_model_is_qwen4exp()) return (int)q4e_reusable_prefix(s, prompt);
+    if (ds4_model_is_qwen4exp()) {
+        reused = (int)q4e_reusable_prefix(s, prompt, &source);
+        family_answered = true;
+    }
 #endif
-    if (!s->checkpoint_valid) return 0;
-    const int common = ds4_session_common_prefix(s, prompt);
-    return (common == s->checkpoint.len && prompt->len >= s->checkpoint.len) ? s->checkpoint.len : 0;
+    if (!family_answered && s->checkpoint_valid) {
+        /* Every other family can only extend the live checkpoint. */
+        const int common = ds4_session_common_prefix(s, prompt);
+        if (common == s->checkpoint.len && prompt->len >= s->checkpoint.len) {
+            reused = s->checkpoint.len;
+            source = DS4_REUSE_LIVE;
+        }
+    }
+    if (reused <= 0) return;
+    out->source = source;
+    out->reused_tokens = reused;
+    out->prefilled_tokens = prompt->len > reused ? prompt->len - reused : 0;
+}
+
+int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt) {
+    ds4_session_reuse reuse;
+    ds4_session_reuse_report(s, prompt, &reuse);
+    return reuse.reused_tokens;
+}
+
+const char *ds4_reuse_source_name(ds4_reuse_source source) {
+    switch (source) {
+    case DS4_REUSE_LIVE:     return "live";
+    case DS4_REUSE_SNAPSHOT: return "snapshot";
+    case DS4_REUSE_COLD:     break;
+    }
+    return "cold";
+}
+
+void ds4_session_cache_stats_get(ds4_session *s, ds4_session_cache_stats *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!s) return;
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) q4e_cache_stats(&s->q4e_graph, out);
+#endif
 }
 
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {

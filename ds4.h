@@ -449,6 +449,39 @@ int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
  * checkpoint when the prompt extends it, or (qwen4exp) the state snapshot
  * taken at the end of the previous prompt.  A chunked prefill starts here. */
 int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt);
+
+/* Where a reusable prefix comes from.  Callers only name the source, so a new
+ * reuse tier appends a value here without changing them. */
+typedef enum {
+    DS4_REUSE_COLD = 0,     /* nothing reusable: the prefill starts at 0 */
+    DS4_REUSE_LIVE,         /* the live checkpoint, which the prompt extends */
+    DS4_REUSE_SNAPSHOT,     /* a state snapshot below the live frontier */
+} ds4_reuse_source;
+
+typedef struct {
+    ds4_reuse_source source;
+    int reused_tokens;      /* leading prompt tokens the backend already holds */
+    int prefilled_tokens;   /* prompt tokens the next sync has to evaluate */
+} ds4_session_reuse;
+
+/* What a sync to `prompt` would reuse and what it would recompute.  A pure
+ * query: it touches no accelerator state.  Callers that log a cache decision
+ * must ask this first -- the reusable prefix is not the common prefix. */
+void ds4_session_reuse_report(ds4_session *s, const ds4_tokens *prompt,
+                              ds4_session_reuse *out);
+const char *ds4_reuse_source_name(ds4_reuse_source source);
+
+/* Occupancy of the backend's reuse tier, for cache accounting.  Zero entries
+ * for families whose only reusable state is the live checkpoint. */
+typedef struct {
+    int entries;            /* reusable states held right now */
+    int capacity;
+    /* Valid states dropped: evicted by a newer one, superseded by a restore,
+     * or invalidated by a cold prefill. */
+    uint64_t evictions;
+} ds4_session_cache_stats;
+void ds4_session_cache_stats_get(ds4_session *s, ds4_session_cache_stats *out);
+
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
@@ -592,6 +625,12 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
+
+/* False when this model family has no payload writer of its own and must not
+ * be handed to the disk KV store: the payload layer would otherwise serialize
+ * a graph the file's header does not describe.  Callers behave as if no disk
+ * checkpoint could ever exist. */
+bool ds4_engine_supports_session_payload(ds4_engine *e);
 
 uint64_t ds4_session_payload_bytes(ds4_session *s);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,

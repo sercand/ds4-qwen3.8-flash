@@ -9683,6 +9683,14 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* Prompt cache accounting, guarded by mu.  One line per request plus a
+     * rollup every cache_log_every requests (0 disables it), so a reuse tier's
+     * hit rate and evictions can be watched without a trace file. */
+    uint64_t cache_requests;
+    uint64_t cache_hits;
+    uint64_t cache_reused_tokens;
+    uint64_t cache_prefilled_tokens;
+    int cache_log_every;
 };
 
 static void server_inference_lock(server *s) {
@@ -10897,6 +10905,99 @@ static int kv_cache_try_load(server *s, server_slot *slot, const request *req,
                                   loaded_path_out,
                                   loaded_ext_flags_out,
                                   req && req->api == API_RESPONSES);
+}
+
+/* =========================================================================
+ * Prompt cache accounting.
+ * =========================================================================
+ *
+ * The reuse decision belongs to the engine: the server matchers below only
+ * pick which prompt to sync, and the engine then decides how much of it it
+ * already holds.  These counters therefore record what the engine reported,
+ * not what a matcher hoped for.
+ */
+
+#define DS4_SERVER_CACHE_LOG_EVERY_DEFAULT 20
+
+typedef struct {
+    uint64_t requests;
+    uint64_t hits;
+    uint64_t reused_tokens;
+    uint64_t prefilled_tokens;
+    ds4_session_cache_stats engine;
+} server_cache_report;
+
+static void server_cache_report_get(server *s, server_cache_report *out) {
+    if (!s || !out) return;
+    memset(out, 0, sizeof(*out));
+    pthread_mutex_lock(&s->mu);
+    out->requests = s->cache_requests;
+    out->hits = s->cache_hits;
+    out->reused_tokens = s->cache_reused_tokens;
+    out->prefilled_tokens = s->cache_prefilled_tokens;
+    pthread_mutex_unlock(&s->mu);
+    /* Each resident slot keeps its own reuse tier, so the occupancy reported
+     * here is their sum. */
+    pthread_mutex_lock(&s->inference_mu);
+    for (int i = 0; i < s->slot_count; i++) {
+        ds4_session_cache_stats st = {0};
+        ds4_session_cache_stats_get(s->slots[i].session, &st);
+        out->engine.entries += st.entries;
+        out->engine.capacity += st.capacity;
+        out->engine.evictions += st.evictions;
+    }
+    pthread_mutex_unlock(&s->inference_mu);
+}
+
+static double server_cache_hit_rate(const server_cache_report *rep) {
+    if (!rep || rep->requests == 0) return 0.0;
+    return (double)rep->hits / (double)rep->requests;
+}
+
+/* `source` is the reuse label for this request: the engine's source when the
+ * engine answered, otherwise the server matcher that supplied the prefix. */
+static void server_cache_note_request(server *s, const char *source,
+                                      int reused, int prefilled) {
+    if (!s) return;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: cache request source=%s reused=%d prefilled=%d",
+               source, reused, prefilled);
+    pthread_mutex_lock(&s->mu);
+    s->cache_requests++;
+    if (reused > 0) s->cache_hits++;
+    s->cache_reused_tokens += (uint64_t)(reused > 0 ? reused : 0);
+    s->cache_prefilled_tokens += (uint64_t)(prefilled > 0 ? prefilled : 0);
+    const int every = s->cache_log_every;
+    const bool rollup = every > 0 && s->cache_requests % (uint64_t)every == 0;
+    pthread_mutex_unlock(&s->mu);
+    if (!rollup) return;
+
+    server_cache_report rep;
+    server_cache_report_get(s, &rep);
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: cache totals requests=%llu hits=%llu hit_rate=%.2f "
+               "reused=%llu prefilled=%llu states=%d/%d evictions=%llu",
+               (unsigned long long)rep.requests,
+               (unsigned long long)rep.hits,
+               server_cache_hit_rate(&rep),
+               (unsigned long long)rep.reused_tokens,
+               (unsigned long long)rep.prefilled_tokens,
+               rep.engine.entries, rep.engine.capacity,
+               (unsigned long long)rep.engine.evictions);
+}
+
+/* The reuse label for one request: `<source>@<reused>` when the engine
+ * answered, else the matcher name, else "cold". */
+static void request_reuse_label(char *out, size_t cap,
+                                const ds4_session_reuse *reuse,
+                                const char *cache_source, int cached) {
+    if (!out || cap == 0) return;
+    if (reuse && reuse->reused_tokens > 0) {
+        snprintf(out, cap, "%s@%d", ds4_reuse_source_name(reuse->source),
+                 reuse->reused_tokens);
+        return;
+    }
+    snprintf(out, cap, "%s", cached > 0 && cache_source ? cache_source : "cold");
 }
 
 static int live_text_prefix_prompt(server *s, server_slot *slot,
@@ -12639,6 +12740,22 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    /* The engine owns the state a sync can keep: the live checkpoint, or (for a
+     * recurrent family) a snapshot below the frontier that the prompt still
+     * extends.  Ask it before calling this a miss -- the common prefix is not
+     * the reusable prefix, and the log line and the usage field used to report
+     * a cold prefill while the engine went on to restore a snapshot. */
+    ds4_session_reuse reuse = {0};
+    if (cached == 0) {
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_reuse_report(slot->session, prompt_for_sync, &reuse);
+        pthread_mutex_unlock(&s->inference_mu);
+        if (reuse.reused_tokens > 0) {
+            cached = reuse.reused_tokens;
+            cache_source = reuse.source == DS4_REUSE_SNAPSHOT ?
+                           "memory-snapshot" : "memory-token";
+        }
+    }
     if (cached == 0 && old_pos > 0) {
         server_log(DS4_LOG_WARNING,
                    "ds4-server: live kv cache miss%s live=%d prompt=%d common=%d reason=%s",
@@ -12680,6 +12797,11 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * the live KV cache and can be reused by the next request. */
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
+    char reuse_label[48];
+    request_reuse_label(reuse_label, sizeof(reuse_label), &reuse, cache_source,
+                        cached);
+    server_cache_note_request(s, reuse_label, j->req.cache_read_tokens,
+                              j->req.cache_write_tokens);
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -14050,6 +14172,26 @@ static bool send_models(server *s, int fd) {
     return ok;
 }
 
+static bool send_cache_report(server *s, int fd) {
+    server_cache_report rep;
+    server_cache_report_get(s, &rep);
+    buf b = {0};
+    buf_printf(&b,
+        "{\"requests\":%llu,\"hits\":%llu,\"hit_rate\":%.4f,"
+        "\"tokens_reused\":%llu,\"tokens_prefilled\":%llu,"
+        "\"states\":{\"entries\":%d,\"capacity\":%d,\"evictions\":%llu}}\n",
+        (unsigned long long)rep.requests,
+        (unsigned long long)rep.hits,
+        server_cache_hit_rate(&rep),
+        (unsigned long long)rep.reused_tokens,
+        (unsigned long long)rep.prefilled_tokens,
+        rep.engine.entries, rep.engine.capacity,
+        (unsigned long long)rep.engine.evictions);
+    bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
 static void client_done(server *s) {
     pthread_mutex_lock(&s->mu);
     if (s->clients > 0) s->clients--;
@@ -14173,6 +14315,11 @@ static void *client_main(void *arg) {
 
     if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/v1/models")) {
         send_models(s, fd);
+        http_request_free(&hr);
+        goto done;
+    }
+    if (!strcmp(hr.method, "GET") && !strcmp(hr.path, "/cache")) {
+        send_cache_report(s, fd);
         http_request_free(&hr);
         goto done;
     }
@@ -14309,6 +14456,7 @@ typedef struct {
     bool kv_cache_reject_different_quant;
     bool disable_exact_dsml_tool_replay;
     int tool_memory_max_ids;
+    int cache_log_every;
     bool enable_cors;
     int batched_sessions;
     int mixed_prefill_quantum;
@@ -14450,6 +14598,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .cache_log_every = DS4_SERVER_CACHE_LOG_EVERY_DEFAULT,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -14548,6 +14697,8 @@ static server_config parse_options(int argc, char **argv) {
             c.disable_exact_dsml_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cache-log-every")) {
+            c.cache_log_every = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
@@ -14749,6 +14900,7 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
+    s.cache_log_every = cfg.cache_log_every;
     s.enable_cors = cfg.enable_cors;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
@@ -14784,7 +14936,14 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (cfg.kv_disk_dir) {
+    if (cfg.kv_disk_dir && !ds4_engine_supports_session_payload(engine)) {
+        /* The disk store serializes the engine's graph payload.  Without a
+         * writer for this family it would save a file describing a different
+         * graph, so the server runs as if no disk checkpoint could exist. */
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: --kv-disk-dir ignored: %s sessions have no KV payload format yet",
+                   ds4_engine_model_name(engine));
+    } else if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
@@ -18969,6 +19128,36 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
     ds4_tokens_free(&claude);
 }
 
+/* The reuse label is what the per-request cache line prints.  It must name the
+ * engine's source when the engine answered, and never claim a hit when the
+ * request prefilled from zero. */
+static void test_request_reuse_label_names_engine_source(void) {
+    char label[48];
+
+    ds4_session_reuse snapshot = {
+        .source = DS4_REUSE_SNAPSHOT, .reused_tokens = 6144,
+        .prefilled_tokens = 512,
+    };
+    request_reuse_label(label, sizeof(label), &snapshot, "memory-snapshot", 6144);
+    TEST_ASSERT(!strcmp(label, "snapshot@6144"));
+
+    ds4_session_reuse live = {
+        .source = DS4_REUSE_LIVE, .reused_tokens = 27, .prefilled_tokens = 3,
+    };
+    request_reuse_label(label, sizeof(label), &live, "memory-token", 27);
+    TEST_ASSERT(!strcmp(label, "live@27"));
+
+    /* A server-side matcher supplied the prefix: name the matcher. */
+    ds4_session_reuse cold = {0};
+    request_reuse_label(label, sizeof(label), &cold, "disk-text", 900);
+    TEST_ASSERT(!strcmp(label, "disk-text"));
+
+    request_reuse_label(label, sizeof(label), &cold, "none", 0);
+    TEST_ASSERT(!strcmp(label, "cold"));
+    request_reuse_label(label, sizeof(label), NULL, NULL, 0);
+    TEST_ASSERT(!strcmp(label, "cold"));
+}
+
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     const int user = 9001;
     const int assistant = 9002;
@@ -20142,6 +20331,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_request_reuse_label_names_engine_source();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();

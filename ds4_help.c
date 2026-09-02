@@ -376,6 +376,8 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
     opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
+    opt(fp, c, "--cache-log-every N", "Log prompt-cache totals every N requests. 0 disables. Default: 20");
+    para(fp, c, "GET /cache reports requests, hit rate, tokens reused vs prefilled and evictions.");
     fputc('\n', fp);
 }
 
