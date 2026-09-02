@@ -10840,6 +10840,19 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
             store_len < s->kv.opt.min_tokens) {
             return false;
         }
+        /* And that the frontier's logits are its own.  The payload carries
+         * them and the loader answers an exact re-send from them, so a
+         * frontier stopped inside a prefill chunk -- a continued store, or a
+         * cancelled request -- has nothing honest to write.
+         * Skipped, not failed: nothing is wrong with the request and nothing
+         * reached the disk. */
+        if (!ds4_session_frontier_logits_current(slot->session)) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: kv cache skipped tokens=%d reason=%s because "
+                       "the live frontier holds no logits of its own",
+                       store_len, reason);
+            return false;
+        }
         const double stage_t0 = now_sec();
         server_inference_lock(s);
         const int rc = ds4_session_stage_payload(slot->session, &staged,

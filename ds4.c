@@ -67506,6 +67506,18 @@ static int q4e_payload_save(ds4_session *s, FILE *fp, char *err, size_t errlen) 
         payload_set_err(err, errlen, "qwen4exp session has no path to save");
         return 1;
     }
+    /* The file carries the frontier's logits and the loader admits them as
+     * this path's own (q4e_payload_load); a frontier that has none -- a
+     * prefill stopped inside a chunk, which is where a continued store or a
+     * cancelled job's store would land -- would put the previous request's
+     * row on disk.  Callers
+     * ask ds4_session_frontier_logits_current first and skip; this is the
+     * guarantee behind that, not a path anything should reach. */
+    if (g->logits_pos != g->pos) {
+        payload_set_err(err, errlen,
+                        "qwen4exp frontier has no logits of its own to save");
+        return 1;
+    }
     const uint32_t pages = q4e_pages_for(g->pos);
     if (pages > g->kv_table.len) {
         payload_set_err(err, errlen, "qwen4exp path is missing KV pages");
@@ -71434,7 +71446,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 /* A commit that cannot join the tree costs reuse, not
                  * correctness: the context keeps its own pages and carries
                  * on, exactly as the sequence-end caller does. */
-                if (q4e_cache_commit(s, prompt->v, pos, last, chunk_only) != 0) {
+                if (q4e_cache_commit(s, prompt->v, pos, g->logits_pos == pos,
+                                     chunk_only) != 0) {
                     fprintf(stderr, "ds4: qwen4exp prefix cache could not record "
                                     "position %u; reuse for this path is lost\n", pos);
                 }
@@ -72508,6 +72521,17 @@ void ds4_session_cache_stats_get(ds4_session *s, ds4_session_cache_stats *out) {
 #ifndef DS4_NO_GPU
     if (ds4_model_is_qwen4exp()) q4e_cache_stats(s, out);
 #endif
+}
+
+bool ds4_session_frontier_logits_current(ds4_session *s) {
+    if (!s) return false;
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) {
+        const ds4_q4e_graph *g = &s->q4e_graph;
+        return g->ready && g->pos != 0u && g->logits_pos == g->pos;
+    }
+#endif
+    return true;
 }
 
 bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out) {

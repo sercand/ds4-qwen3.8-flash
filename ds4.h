@@ -547,6 +547,14 @@ typedef struct {
 } ds4_session_path_info;
 bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out);
 
+/* Whether the row in the session's logits belongs to its own frontier.  A
+ * prefill chunk that is not the last runs no vocabulary head, so a session
+ * stopped inside a prompt -- a cancelled request, or the progress callback's
+ * continued store at a chunk boundary -- still holds whatever ran before it.
+ * A payload saved there would restore that row as this path's answer, so the
+ * store asks first and skips.  True for every family that does not track it. */
+bool ds4_session_frontier_logits_current(ds4_session *s);
+
 /* The positions a client may branch from on its next turn: the end of the
  * rendered chat scaffolding (shared by every conversation with the same system
  * prompt and tools) and the start of the last assistant turn (where a
