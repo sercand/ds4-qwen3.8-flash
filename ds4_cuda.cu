@@ -1001,7 +1001,20 @@ static cuda_decode_graph_entry *cuda_decode_graph_find(
         slot->state = 0;   /* caller advances the state machine */
         return slot;
     }
-    return NULL;           /* all variants busy with other keys: stay eager */
+    /* Every variant of this (layer, island) belongs to another key, so this
+     * one stays eager -- correct, but a silent throughput cliff.  With several
+     * execution contexts the keys multiply (each context's page table is its
+     * own key), so say it once: it is the signal to raise
+     * CUDA_DECODE_GRAPH_VARIANTS. */
+    static int warned = 0;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr,
+                "ds4: decode graph table full at layer %u island %u "
+                "(%u variants); further islands run eagerly\n",
+                key->il, key->island, CUDA_DECODE_GRAPH_VARIANTS);
+    }
+    return NULL;
 }
 
 extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {

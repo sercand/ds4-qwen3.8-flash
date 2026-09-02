@@ -176,11 +176,11 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--ssd-streaming-full-layers N", "GLM Metal streaming: keep the first N routed layers fully resident. Default: auto from NGB expert budget; use 0 to disable.");
     opt(fp, c, "--ssd-streaming-preload-experts N", "SSD streaming: upfront popularity preload count. DeepSeek auto-seeds by default; GLM demand-fills unless N is explicit.");
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
-    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096. Qwen3.8-Flash-Next: 2048, or 512 with --exec-contexts above 1, where the chunk is also the executor's hand-off quantum.");
+    opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size, and the widest chunk the qwen4exp executor runs. Default: CUDA TP 2048; PRO long prompts 8192; others 4096; Qwen3.8-Flash-Next 2048.");
     if (tool == DS4_HELP_SERVER) {
         opt(fp, c, "--kv-pool-tokens N", "Qwen3.8-Flash-Next: token positions in the shared paged KV pool, never below --ctx. Skips the pool's derivation only. Default: derived from free memory, at most 4x--ctx and 600000 (18 GB)");
         opt(fp, c, "--ssm-checkpoints N", "Qwen3.8-Flash-Next: recurrent-state checkpoints the prefix cache may hold, 113 MB each; 0 holds none. Default: derived from what the pool leaves, at most 40");
-        opt(fp, c, "--exec-contexts N", "Qwen3.8-Flash-Next: concurrent execution contexts sharing the KV pool and the prefill scratch, each a live recurrent state; the server time-slices them (one speculative step each, then one prefill quantum). 1 keeps the wide prefill chunk. Default: 2");
+        opt(fp, c, "--exec-contexts N", "Qwen3.8-Flash-Next: concurrent execution contexts sharing the KV pool and the prefill scratch, each a live recurrent state; the server time-slices them (one speculative step each, then one prefill chunk, narrowed to --mixed-prefill-quantum while contended). Default: 2");
     }
     if (full) {
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {
@@ -350,7 +350,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
-    opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
+    opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while another session or execution context is waiting for the model. Default: 128; GLM-5.3 minimum 1024; Qwen3.8-Flash-Next with --exec-contexts above 1: 512");
     opt(fp, c, "--cache-log-every N", "Log prompt-cache totals every N requests. 0 disables. Default: 20");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
     para(fp, c, "GET /cache reports requests, hit rate, tokens reused vs prefilled and evictions.");

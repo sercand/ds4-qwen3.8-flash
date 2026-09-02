@@ -55489,19 +55489,13 @@ struct ds4_q4e_graph {
  * DS4_EXEC_CONTEXTS_DEFAULT. */
 #define Q4E_CTX_MAX      ((uint32_t)DS4_EXEC_CONTEXTS_MAX)
 
-/* The prefill chunk once more than one execution context is asked for: it is
- * the executor's hand-off quantum, and 512 rows is roughly a second of
- * prefill on a GB10, so a decoding stream never waits much longer than that
- * for the model.  Wider chunks prefill faster (see q4e_scratch_ensure), which
- * is the trade --prefill-chunk exists to make. */
-#define Q4E_MULTI_CTX_CHUNK 512u
-
 /* Admission rule 4's stride: how far apart the speculative "a slot was going
  * spare" checkpoints stand.  It used to be the chunk width, which stopped
- * being the same thing when the executor's quantum shrank the chunk to 512 --
+ * being the same thing once the executor could narrow a chunk to 512 rows --
  * and a checkpoint 512 tokens above its neighbour is worth 0.7 s of prefill,
  * low enough that a store under pressure evicts it before the positions rules
- * 1 to 3 asked for.  So it is its own number, and it stays where it was. */
+ * 1 to 3 asked for.  So it is its own number, and the positions stay where
+ * they were whatever the executor does to the chunk width. */
 #define Q4E_ADMISSION_STRIDE 2048u
 
 typedef struct {
@@ -55756,8 +55750,14 @@ static int q4e_cache_free_pages(q4e_cache *c, uint32_t want, double now) {
             c->ckpt_evictions++;
         }
         /* Insist on progress.  The victim scan is deterministic, so a node the
-         * drop refuses -- one a live execution context reached in between --
-         * would be picked again on every pass and the loop would never end.
+         * drop refuses is picked again on every pass and the loop never ends.
+         * The way that happened: q4e_ckpt_release clears owner->ckpt only
+         * while the owner still names the slot, so a node whose checkpoint had
+         * been re-homed kept a stale non-negative ckpt, q4e_tree_drop refused
+         * it for that, and this loop spun.  Clearing v->ckpt above fixes the
+         * cause; this stops the loop for any other refusal (a live context
+         * reaching the node between the pick and the drop).
+         *
          * A successful drop is progress even when n_free does not grow: the
          * only page it can fail to release is the one boundary page its parent
          * also lists, and the tree is one node smaller either way, so the next
@@ -67067,8 +67067,14 @@ static void q4e_scratch_free(ds4_engine *e) {
 }
 
 /* Allocate the engine's scratch on the first execution context.  Later
- * contexts share it; one sized for a smaller context or a narrower chunk
- * cannot serve a larger one, the same rule the page pool follows. */
+ * contexts share it; one sized for a smaller context cannot serve a larger
+ * one, the same rule the page pool follows.
+ *
+ * Not thread-safe, and it does not need to be: sessions are created serially
+ * -- ds4-server creates all of them before it starts a worker, ds4_cli.c and
+ * the graph test create theirs one after another -- so the first-caller check
+ * above cannot race.  A future caller that creates sessions concurrently must
+ * serialize this (and q4e_cache_open, which has the same shape). */
 static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     if (e->q4e_scratch) {
         if (ctx_size > e->q4e_scratch->ctx_size) {
@@ -67088,18 +67094,12 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
      * memory -- the routed intermediates are tok_cap * n_used wide, and at
      * 2048 they come to roughly 700 MiB.
      *
-     * With more than one execution context the chunk is also the executor's
-     * hand-off quantum -- a decoding stream waits at most one chunk for the
-     * model -- so it drops to Q4E_MULTI_CTX_CHUNK, about a second of prefill.
-     * That is the width for every request, not only for one that happens to
-     * share the model, because chunk width perturbs the router logits (see
-     * below) and an answer must not depend on who else was running.
-     * --prefill-chunk overrides it, --exec-contexts 1 takes the wide chunk
-     * back. */
-    g->tok_cap = e->prefill_chunk;
-    if (g->tok_cap == 0u) {
-        g->tok_cap = e->exec_contexts > 1u ? Q4E_MULTI_CTX_CHUNK : 2048u;
-    }
+     * This is the *widest* chunk, and what the scratch is sized for.  The
+     * executor may run narrower ones while another execution context is
+     * waiting for the model (ds4_session_set_prefill_yield): it never needs
+     * more than this many rows, so the scratch stays sized here and a solo
+     * prefill keeps the full width. */
+    g->tok_cap = e->prefill_chunk ? e->prefill_chunk : 2048u;
     {
         /* The routed GEMMs are the reason to tune this: a chunk spreads
          * tok_cap * 10 rows over 512 experts, so 1024 tokens leaves each expert
@@ -70435,8 +70435,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * chunk width the prefill happens to land on. */
             const uint32_t stop = q4e_next_admission(g, pos, len);
             const uint32_t left = stop - pos;
-            const uint32_t take = g->tok_cap < left ? g->tok_cap : left;
-            const bool last = (pos + take) == len;
+            uint32_t take = g->tok_cap < left ? g->tok_cap : left;
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
@@ -70446,12 +70445,20 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
              * session checkpoint, the page table, the staged draft rows -- and
              * the shared scratch holds nothing of it, so another execution
              * context may run a chunk or a speculative step before this loop
-             * gets the model back. */
-            if (s->prefill_yield &&
-                s->prefill_yield(s->prefill_yield_ud, (int)pos, (int)len) != 0) {
-                snprintf(err, errlen, "interrupted");
-                return DS4_SESSION_SYNC_INTERRUPTED;
+             * gets the model back.  It also says how wide the next chunk may
+             * be: the server narrows it while another context is waiting, so a
+             * decoding stream is never behind a full-width chunk, and lets it
+             * go wide again once this prefill is alone. */
+            if (s->prefill_yield) {
+                const int rows = s->prefill_yield(s->prefill_yield_ud,
+                                                  (int)pos, (int)len);
+                if (rows < 0) {
+                    snprintf(err, errlen, "interrupted");
+                    return DS4_SESSION_SYNC_INTERRUPTED;
+                }
+                if (rows > 0 && (uint32_t)rows < take) take = (uint32_t)rows;
             }
+            const bool last = (pos + take) == len;
             /* The draft KV for the previous chunk's last row (or the last
              * decode's committed rows) needs this chunk's first token, and its
              * residual rows are about to be overwritten. */
