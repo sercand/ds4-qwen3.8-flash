@@ -726,11 +726,9 @@ int ds4_kvstore_chat_boundary_pos(const ds4_tokens *prompt,
     return last_user;
 }
 
-/* The last occurrence of a role marker.  Two of these are branch points a
- * client comes back to: the last user marker is where the current task turn
- * starts, so a conversation that shares a system prompt and tools with
- * another one rejoins there; the last assistant marker is the trailing
- * generation header, where this conversation's own next turn rejoins once the
+/* The last occurrence of a role marker.  The one that matters is the
+ * assistant marker: in a generation prompt that is the trailing generation
+ * header, which is where this conversation's own next turn rejoins once the
  * client re-renders the answer. */
 int ds4_kvstore_last_marker_pos(const ds4_tokens *prompt, int token_id) {
     if (!prompt || token_id < 0) return -1;
