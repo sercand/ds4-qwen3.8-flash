@@ -2600,9 +2600,10 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
             char *ptr = a.device_ptr + used;
             /* The tail is zeroed on the null stream while the payload copies
              * ride g_model_upload_stream; the two regions are disjoint, so
-             * they need no ordering between them.  Give the reservation back
-             * if the memset fails, so a caller that falls back to the mapping
-             * does not strand arena space. */
+             * they need no ordering between them.  The reservation is only
+             * taken once that succeeds -- a.used is advanced below, not here
+             * -- so a memset failure leaves the arena exactly as it was and
+             * the caller's fallback to the host mapping strands nothing. */
             if (!cuda_ok(cudaMemset(ptr + bytes, 0, (size_t)(aligned - bytes)),
                          "zero weight span tail pad")) {
                 return NULL;
@@ -2657,7 +2658,17 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     }
     if (!cuda_ok(cudaMemset((char *)dev + bytes, 0, (size_t)(aligned - bytes)),
                  "zero weight span tail pad")) {
-        g_model_arenas.back().used = 0;
+        /* Nothing has been handed out of this chunk, and the plan entry it
+         * consumed is gone, so keeping it would hold device memory that only
+         * a later span could ever claim back.  Give it to the driver and stop
+         * caching, exactly as the failed cudaMalloc above does: a device that
+         * cannot memset a fresh allocation will not serve the rest of the
+         * weight set either, and every caller from here falls back to the
+         * host mapping. */
+        g_model_arenas.pop_back();
+        (void)cudaFree(dev);
+        (void)cudaGetLastError();
+        g_model_cache_full = 1;
         return NULL;
     }
     return (char *)dev;

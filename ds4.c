@@ -67627,18 +67627,20 @@ static int q4e_payload_check(const uint32_t *h, const ds4_session *s,
 
 /* Restore one path into this execution context and hand it to the tree.
  *
- * The context lets go of whatever path it stood on, takes fresh pool pages
- * for the whole span, fills them and the recurrent state from the file, and
- * then commits the span -- which puts it in the shared radix tree with a
- * checkpoint at its end, so the next request resumes from memory and every
- * other execution context can share the pages.  The caller's sync then runs
- * as a plain live extension of the frontier this leaves behind.
+ * The context lets go of whatever path it stood on, adopts the tree's pages
+ * for the prefix the file shares with it and takes fresh pool pages only
+ * above that (see the split below), reads that suffix and the recurrent state
+ * from the file, and then commits the span -- which puts it in the shared
+ * radix tree with a checkpoint at its end, so the next request resumes from
+ * memory and every other execution context can share the pages.  The caller's
+ * sync then runs as a plain live extension of the frontier this leaves
+ * behind.
  *
  * A non-zero return means the caller invalidates the session -- which
  * ds4_kvstore_try_load_text does -- so this function never tries to put back
- * the path it let go of: half a path is not a path.  The pages it reserved go
- * back to the pool at the next detach, which the cold prefill that follows
- * performs. */
+ * the path it let go of: half a path is not a path.  The pages it holds, both
+ * the adopted and the fresh ones, go back to the pool at the next detach,
+ * which the cold prefill that follows performs. */
 static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
                             char *err, size_t errlen) {
     ds4_q4e_graph *g = &s->q4e_graph;
@@ -67899,10 +67901,16 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
          * ranks tenth out of 512 when two are near-tied.  Downstream MoE
          * activations then differ by ~1%.  That is inherent to top-k routing,
          * not a defect: the drift against llama.cpp is 0.3% at every chunk
-         * width tested.  Do not treat a chunk-dependent logit as a bug.  It is
-         * also why the executor's quantum is the chunk width rather than a
-         * limit on top of it: the answer must not depend on whether a request
-         * happened to share the model. */
+         * width tested.  Do not treat a chunk-dependent logit as a bug.
+         *
+         * It is also why the executor's quantum is visible here at all: the
+         * server narrows a contended prefill to --mixed-prefill-quantum rows
+         * on top of this width (server_prefill_chunk_rows), so a request that
+         * shared the model with a peer can answer differently from the same
+         * request run solo, at a near-tie.  That was the deliberate trade --
+         * making every solo prefill pay the narrow width costs several times
+         * the prefill throughput -- and the reason this is the *widest* chunk
+         * the scratch must hold rather than the only one it will see. */
         const char *env = getenv("DS4_QWEN4EXP_PREFILL_CHUNK");
         if (env && env[0]) {
             const long v = strtol(env, NULL, 10);
@@ -68298,15 +68306,24 @@ static int q4e_matmul_at(ds4_gpu_tensor *out, const void *map, uint64_t map_size
          * LAST row reads past the tensor.  The activation lanes there are
          * zero (quantize.cu fills past ne00 with 0.0f), so the products
          * vanish -- but only while the bytes decode to a finite fp16 block
-         * scale, because 0 * inf is NaN.  These rows therefore depend on the
-         * zeroed tail the weight-span arena puts past every cached span, and
-         * on the span builder keeping a row-unaligned tensor last so that
-         * tail is what its final row reads (commit 0991e49).  Until that
-         * lands here the head is read through a host-registered file mapping
-         * rather than the arena, so the over-read hits the next tensor's real
-         * file bytes; measured finite, but it is the pad that makes it safe,
-         * not the layout.  A K-unaligned tensor placed last in a file would
-         * read past the mapping itself. */
+         * scale, because 0 * inf is NaN.
+         *
+         * What makes that safe is the same machinery the target's K = 320 and
+         * K = 640 projections use: the sidecar is registered as its own fd
+         * map before accelerator_cache_model_tensors runs over it, so its
+         * tensors go through the one span builder, which seals a span after a
+         * row-unaligned tensor ((dim[0] % k_step) != 0) and so leaves each
+         * Q5_0 [320, .] tensor last in its span.  The arena zero-pads
+         * CUDA_WEIGHT_SPAN_TAIL_PAD bytes past every span, and
+         * cuda_model_range_ptr_from_fd hands the kernels that padded copy --
+         * so the final row's over-read lands in zeros, which decode to a
+         * finite (zero) block scale.
+         *
+         * The one weight here that is not in the arena is eh_proj: its two
+         * halves are de-interleaved into an anonymous host mmap
+         * (q4e_mtp_split_eh_proj), which the CUDA resolver host-registers
+         * unpadded.  They are safe only because K = 2560 is a whole number of
+         * K steps, so mmq never reads past a row of them. */
     case DS4_TENSOR_Q5_0:
     case DS4_TENSOR_Q6_K:
         return ds4_gpu_matmul_quant_tensor(out, map, map_size, w->abs_offset, w->type,

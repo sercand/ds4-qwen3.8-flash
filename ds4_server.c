@@ -13337,7 +13337,17 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * answer.  Where a second conversation sharing a system prompt diverges
      * is not a role boundary at all when the renderer folds the system block
      * and the tools into the first user turn, which this family's template
-     * does; admission rule 3 discovers that position instead. */
+     * does; admission rule 3 discovers that position instead.
+     *
+     * For qwen4exp the first hint never fires: user and assistant are the
+     * same token (<|im_start|>), so ds4_kvstore_chat_boundary_pos matches its
+     * assistant test on the very first marker and returns -1 for every prompt
+     * of this family (test_kv_cache_prev_marker_is_the_last_turn_start), and
+     * only the trailing-header hint reaches admission.  The position that
+     * shape actually wants is the second-to-last marker, which
+     * kv_cache_cold_anchor_pos already derives for the disk tier; rewiring
+     * this hint to it changes which prompts earn a slot, so it wants its own
+     * measurement rather than a quiet swap. */
     const int hints[] = {
         ds4_kvstore_chat_boundary_pos(prompt_for_sync,
                                       ds4_token_user(s->engine),
