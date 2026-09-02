@@ -539,6 +539,265 @@ __global__ static void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
     }
 }
 
+/* Chunked-parallel gated delta rule, for prefill.
+ *
+ * The recurrence above is exact but sequential: one block per value head
+ * walks the tokens one at a time, and every token pays a dependent pass over
+ * the whole 128x128 state.  At a 2048-token chunk that is 322 ms of a 26k
+ * step.  The chunked-parallel (FLA / FlashQLA) form rewrites a run of C
+ * tokens as matmuls against the state at the run's start, so the state is
+ * touched twice per run instead of C times, and the only sequential work left
+ * is the run-to-run carry.
+ *
+ * With g_t = log decay_t, G_t = sum_{s<=t} g_s inside the run and S_0 the
+ * state at its start, unrolling S_t = e^{g_t}(I - b_t k_t k_t^T) S_{t-1} +
+ * b_t k_t v_t^T gives
+ *
+ *     S_t   = e^{G_t} S_0 + sum_{u<=t} e^{G_t - G_u} k_u d_u^T
+ *     d_t   = b_t (v_t - e^{G_t} S_0^T k_t) - sum_{u<t} A[t][u] d_u
+ *     A[t][u] = b_t e^{G_t - G_u} (k_u . k_t)                       (u < t)
+ *     o_t   = (e^{G_t} S_0^T q_t + sum_{u<=t} P[t][u] d_u) / sqrt(D)
+ *     P[t][u] = e^{G_t - G_u} (q_t . k_u)                           (u <= t)
+ *
+ * Every exponent is a difference G_t - G_u with u <= t, i.e. a decay in
+ * [0, 1]: no 1/e^G rescaling and nothing to overflow, which is the reason for
+ * this arrangement rather than the textbook "divide the keys by the cumulative
+ * decay" one.
+ *
+ * C = 64 because the shared-memory working set is what bounds it: keys,
+ * deltas, the C x C coefficient matrix and a staged q tile come to 97 KiB at
+ * 64, against the 99 KiB a block may opt into here, and the per-token
+ * arithmetic grows as 3D + C (65 k MAC per token per head at C = 64 against
+ * the sequential form's 49 k), so a wider run buys fewer carries at a rising
+ * cost and does not fit beside the state anyway.
+ *
+ * The state stays in registers: thread (j, sub) holds the 16 keys
+ * [sub*16, sub*16+16) of value column j, so the block is 128 columns x
+ * Q4E_GDN_CSPLIT lanes = 1024 threads and the eight lanes of a column reduce
+ * through shuffles.  Each lane reads its slice as float4 in a rotated order
+ * (the sequential kernel's trick) so the eight lanes of a column hit eight
+ * different shared-memory bank groups.  Phases, per run: keys in,
+ * coefficients, right-hand sides, the C-step forward substitution, outputs (q
+ * staged in tiles so the key rows can stay resident), and the carry into the
+ * next run.  Only the staging phases and the two gram matrices need block
+ * barriers -- a column's deltas are written and read inside one warp, so the
+ * substitution's C dependent steps use __syncwarp().
+ *
+ * What it costs and why, measured on a 2048-token chunk with a standalone
+ * microbenchmark against the sequential kernel (same inputs, agreement 4e-5%
+ * relative L2): 8.7 -> 5.3 ms per layer, 1.65x.  The remainder is
+ * shared-memory traffic, not arithmetic: every token's keys and queries are
+ * re-read by all 32 warps (each owns one value column and 16 keys of it), so
+ * a run moves ~19 MB through shared memory for ~4 M multiply-adds.  Cutting
+ * that further means giving each thread several value columns so one shared
+ * read feeds several products; the two arrangements tried (four columns per
+ * thread with 32-lane reductions, and the wider gram tiles) both lost more to
+ * the longer reductions than they saved, so this is where it stands.
+ *
+ * Numerics differ from the sequential kernel -- these are different sums, not
+ * a reassociation of the same ones -- so this path is gated on the oracle,
+ * not on the prefill fingerprint.  It also produces no per-token state, so it
+ * cannot fill the speculative-rollback checkpoints; the launcher keeps runs
+ * that need them on the sequential kernel. */
+#define Q4E_GDN_CHUNK 64u    /* tokens per run */
+#define Q4E_GDN_QTILE 32u    /* q rows staged at a time in the output phase */
+#define Q4E_GDN_CSPLIT 8u    /* lanes per value column: 1024 threads, 32 warps */
+
+__global__ static void __launch_bounds__(128u * Q4E_GDN_CSPLIT) q4e_gdn_chunk_kernel(
+        float *attn_out, float *state,
+        const float *qkv, const float *decay, const float *beta,
+        uint32_t n_head_k, uint32_t n_head_v,
+        uint32_t k_offset, uint32_t v_offset, uint32_t stride, uint32_t n_tok) {
+    const uint32_t D = 128u;                  /* head_dim, checked by the launcher */
+    const uint32_t C = Q4E_GDN_CHUNK;
+    const uint32_t DS = D + 1u;               /* delta row stride: +1 so the
+                                               * per-column reads below spread
+                                               * over all 32 banks */
+    extern __shared__ float q4e_gdn_chunk_smem[];
+    float *s_K = q4e_gdn_chunk_smem;          /* [C][D]  keys */
+    float *s_D = s_K + (uint64_t)C * D;       /* [C][DS] rhs, then deltas */
+    float *s_A = s_D + (uint64_t)C * DS;      /* [C][C]  coefficients, then P */
+    float *s_Q = s_A + (uint64_t)C * C;       /* [QTILE][D] staged queries */
+    float *s_G = s_Q + (uint64_t)Q4E_GDN_QTILE * D;   /* [C] cumulative log decay */
+    float *s_b = s_G + C;                     /* [C] beta */
+
+    const uint32_t h = blockIdx.x;
+    const uint32_t hk = h % n_head_k;
+    const uint32_t NV4 = D / (4u * Q4E_GDN_CSPLIT);   /* float4 slots per lane */
+    const uint32_t j = threadIdx.x / Q4E_GDN_CSPLIT;
+    const uint32_t sub = threadIdx.x % Q4E_GDN_CSPLIT;
+    const uint32_t i0 = sub * (D / Q4E_GDN_CSPLIT);
+    const uint32_t rot = (sub * NV4) / Q4E_GDN_CSPLIT;  /* float4 rotation, see above */
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t n_warp = blockDim.x >> 5u;
+    const float scale = rsqrtf((float)D);
+
+    float4 *m4 = (float4 *)(state + ((uint64_t)h * D + j) * D + i0);
+    float4 sreg[NV4];
+#pragma unroll
+    for (uint32_t n4 = 0; n4 < NV4; n4++) sreg[n4] = m4[(n4 + rot) & (NV4 - 1u)];
+
+    for (uint32_t t0 = 0; t0 < n_tok; t0 += C) {
+        const uint32_t n = (n_tok - t0 < C) ? (n_tok - t0) : C;
+
+        /* Gates in parallel, then the inclusive prefix sum of the log decays
+         * by one thread over shared memory: 64 dependent adds are cheaper
+         * than a scan's barriers, but 128 strided global loads on that same
+         * serial path are not. */
+        for (uint32_t t = threadIdx.x; t < n; t += blockDim.x) {
+            const uint64_t gi = (uint64_t)(t0 + t) * n_head_v + h;
+            s_G[t] = decay[gi];
+            s_b[t] = beta[gi];
+        }
+        __syncthreads();
+        if (threadIdx.x == 0u) {
+            float acc = 0.0f;
+            for (uint32_t t = 0; t < n; t++) { acc += s_G[t]; s_G[t] = acc; }
+        }
+        for (uint32_t idx = threadIdx.x; idx < n * D; idx += blockDim.x) {
+            const uint32_t t = idx / D, i = idx - t * D;
+            s_K[idx] = qkv[(uint64_t)(t0 + t) * stride + k_offset + hk * D + i];
+        }
+        __syncthreads();
+
+        /* A[t][u] = b_t e^{G_t - G_u} (k_u . k_t), strictly below the
+         * diagonal.  One warp per entry: its 32 lanes take four keys each so
+         * both rows are read as contiguous float4. */
+        for (uint32_t rr = warp; rr < n; rr += n_warp) {
+            /* One warp per row, its own key row hoisted into registers: each
+             * column then costs one shared read instead of two.  Rows are
+             * handed out in low/high pairs (rr and C-1-rr) because row t has
+             * t columns, so a warp that takes both gets a constant C-1. */
+            const uint32_t t = ((rr / n_warp) % 2u == 0u) ? rr : (C - 1u - (rr - n_warp));
+            if (t >= n) continue;
+            const float4 kt = ((const float4 *)(s_K + t * D))[lane];
+            const float bt = s_b[t], gt = s_G[t];
+            for (uint32_t u = 0; u < t; u++) {
+                const float4 ku = ((const float4 *)(s_K + u * D))[lane];
+                float dot = kt.x * ku.x + kt.y * ku.y + kt.z * ku.z + kt.w * ku.w;
+                dot = warp_sum_f32(dot);
+                if (lane == 0u) s_A[t * C + u] = bt * __expf(gt - s_G[u]) * dot;
+            }
+        }
+        __syncthreads();
+
+        /* rhs_t = b_t (v_t - e^{G_t} S^T k_t). */
+        for (uint32_t t = 0; t < n; t++) {
+            const float4 *k4 = (const float4 *)(s_K + t * D + i0);
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+#pragma unroll
+            for (uint32_t n4 = 0; n4 < NV4; n4++) {
+                const float4 kv = k4[(n4 + rot) & (NV4 - 1u)];
+                p0 = fmaf(sreg[n4].x, kv.x, p0);
+                p1 = fmaf(sreg[n4].y, kv.y, p1);
+                p2 = fmaf(sreg[n4].z, kv.z, p2);
+                p3 = fmaf(sreg[n4].w, kv.w, p3);
+            }
+            float p = (p0 + p1) + (p2 + p3);
+#pragma unroll
+            for (uint32_t o = 1u; o < Q4E_GDN_CSPLIT; o <<= 1) p += __shfl_xor_sync(0xffffffffu, p, o);
+            if (sub == 0u) {
+                const float v = qkv[(uint64_t)(t0 + t) * stride + v_offset + h * D + j];
+                s_D[t * DS + j] = s_b[t] * (v - p * __expf(s_G[t]));
+            }
+        }
+        __syncwarp();
+
+        /* Forward substitution: d_t = rhs_t - sum_{u<t} A[t][u] d_u.  C
+         * dependent steps, but each is one rank-1 update over the value
+         * dimension instead of a pass over the state -- that trade is what
+         * the chunk buys. */
+        for (uint32_t t = 1u; t < n; t++) {
+            float acc = 0.0f;
+            for (uint32_t u = sub; u < t; u += Q4E_GDN_CSPLIT) {
+                acc = fmaf(s_A[t * C + u], s_D[u * DS + j], acc);
+            }
+#pragma unroll
+            for (uint32_t o = 1u; o < Q4E_GDN_CSPLIT; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+            if (sub == 0u) s_D[t * DS + j] -= acc;
+            __syncwarp();
+        }
+
+        /* Outputs.  The queries are staged a tile at a time so the keys stay
+         * resident: P needs both, and both at full width do not fit. */
+        for (uint32_t tb = 0; tb < n; tb += Q4E_GDN_QTILE) {
+            const uint32_t nt = (n - tb < Q4E_GDN_QTILE) ? (n - tb) : Q4E_GDN_QTILE;
+            for (uint32_t idx = threadIdx.x; idx < nt * D; idx += blockDim.x) {
+                const uint32_t tt = idx / D, i = idx - tt * D;
+                s_Q[idx] = qkv[(uint64_t)(t0 + tb + tt) * stride + hk * D + i];
+            }
+            __syncthreads();
+
+            for (uint32_t pair = warp; pair < nt * C; pair += n_warp) {
+                const uint32_t tt = pair / C, u = pair - tt * C;
+                const uint32_t t = tb + tt;
+                float v = 0.0f;
+                if (u <= t) {
+                    const float4 a = ((const float4 *)(s_Q + tt * D))[lane];
+                    const float4 b = ((const float4 *)(s_K + u * D))[lane];
+                    float dot = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+                    dot = warp_sum_f32(dot);
+                    v = __expf(s_G[t] - s_G[u]) * dot;
+                }
+                if (lane == 0u) s_A[pair] = v;
+            }
+            __syncthreads();
+
+            for (uint32_t tt = 0; tt < nt; tt++) {
+                const uint32_t t = tb + tt;
+                const float4 *q4 = (const float4 *)(s_Q + tt * D + i0);
+                float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+#pragma unroll
+                for (uint32_t n4 = 0; n4 < NV4; n4++) {
+                    const float4 qv = q4[(n4 + rot) & (NV4 - 1u)];
+                    p0 = fmaf(sreg[n4].x, qv.x, p0);
+                    p1 = fmaf(sreg[n4].y, qv.y, p1);
+                    p2 = fmaf(sreg[n4].z, qv.z, p2);
+                    p3 = fmaf(sreg[n4].w, qv.w, p3);
+                }
+                const float p = (p0 + p1) + (p2 + p3);
+                float acc = 0.0f;
+                for (uint32_t u = sub; u <= t; u += Q4E_GDN_CSPLIT) {
+                    acc = fmaf(s_A[tt * C + u], s_D[u * DS + j], acc);
+                }
+                acc = fmaf(p, __expf(s_G[t]), acc);
+#pragma unroll
+                for (uint32_t o = 1u; o < Q4E_GDN_CSPLIT; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+                if (sub == 0u) {
+                    attn_out[((uint64_t)(t0 + t) * n_head_v + h) * D + j] = acc * scale;
+                }
+            }
+            __syncthreads();
+        }
+
+        /* Carry: S <- e^{G_last} S + sum_t e^{G_last - G_t} k_t d_t^T. */
+        const float g_last = s_G[n - 1u];
+        const float dec = __expf(g_last);
+#pragma unroll
+        for (uint32_t n4 = 0; n4 < NV4; n4++) {
+            sreg[n4].x *= dec; sreg[n4].y *= dec;
+            sreg[n4].z *= dec; sreg[n4].w *= dec;
+        }
+        for (uint32_t t = 0; t < n; t++) {
+            const float d = s_D[t * DS + j] * __expf(g_last - s_G[t]);
+            const float4 *k4 = (const float4 *)(s_K + t * D + i0);
+#pragma unroll
+            for (uint32_t n4 = 0; n4 < NV4; n4++) {
+                const float4 kv = k4[(n4 + rot) & (NV4 - 1u)];
+                sreg[n4].x = fmaf(kv.x, d, sreg[n4].x);
+                sreg[n4].y = fmaf(kv.y, d, sreg[n4].y);
+                sreg[n4].z = fmaf(kv.z, d, sreg[n4].z);
+                sreg[n4].w = fmaf(kv.w, d, sreg[n4].w);
+            }
+        }
+        __syncthreads();   /* s_K / s_D are rewritten by the next run */
+    }
+
+#pragma unroll
+    for (uint32_t n4 = 0; n4 < NV4; n4++) m4[(n4 + rot) & (NV4 - 1u)] = sreg[n4];
+}
+
 /* Per-head RMSNorm of the delta-rule output, then the sigmoid output gate.
  * ssm_norm is the one norm in the model the converter does NOT offset by one,
  * so it is applied raw here just like every other weight. */
@@ -1213,6 +1472,50 @@ extern "C" int ds4_gpu_q4e_gdn_gates(
     return cuda_ok(cudaGetLastError(), "qwen4exp gdn gates");
 }
 
+/* Shared-memory working set of q4e_gdn_chunk_kernel, and the one-time opt-in
+ * for it.  A device that cannot give a block this much keeps prefill on the
+ * sequential kernel, which is correct at any shape, only slower. */
+static size_t q4e_gdn_chunk_smem_bytes(void) {
+    const size_t C = Q4E_GDN_CHUNK, D = 128u;
+    return (C * D + C * (D + 1u) + C * C + Q4E_GDN_QTILE * D + 2u * C) * sizeof(float);
+}
+
+/* Rows from which prefill takes the chunked kernel (DS4_QWEN4EXP_GDN_CHUNK_MIN,
+ * default two runs).  0 keeps every shape on the sequential kernel, which is
+ * how the two are A/B-ed against each other and against the oracle. */
+static uint32_t q4e_gdn_chunk_min_tok(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_GDN_CHUNK_MIN");
+        cached = (env && env[0]) ? atoi(env) : (int)(2u * Q4E_GDN_CHUNK);
+        if (cached < 0) cached = 0;
+    }
+    return (uint32_t)cached;
+}
+
+static int q4e_gdn_chunk_ready(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const size_t need = q4e_gdn_chunk_smem_bytes();
+    int optin = 0, dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                               dev) != cudaSuccess ||
+        (size_t)optin < need ||
+        cudaFuncSetAttribute(q4e_gdn_chunk_kernel,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)need) != cudaSuccess) {
+        (void)cudaGetLastError();
+        fprintf(stderr, "ds4: qwen4exp chunked GDN needs %zu B of shared memory per "
+                        "block, device offers %d; prefill stays sequential\n",
+                need, optin);
+        cached = 0;
+        return 0;
+    }
+    cached = 1;
+    return 1;
+}
+
 extern "C" int ds4_gpu_q4e_gdn_recurrent(
         ds4_gpu_tensor *attn_out, ds4_gpu_tensor *state, const ds4_gpu_tensor *qkv,
         const ds4_gpu_tensor *decay, const ds4_gpu_tensor *beta,
@@ -1222,6 +1525,25 @@ extern "C" int ds4_gpu_q4e_gdn_recurrent(
     if (!attn_out || !state || !qkv || !decay || !beta || !n_tok) return 0;
     if (head_dim != 128u) return 0;   /* s_k / s_q are sized for the shipped head */
     if (ckpt && ckpt->bytes < (uint64_t)ckpt_cap * n_head_v * head_dim * head_dim * sizeof(float)) return 0;
+
+    /* A prefill chunk goes to the chunked-parallel kernel.  Two runs is the
+     * floor: below that there is nothing to amortize and the sequential
+     * kernel's single pass is cheaper.  It also produces no per-token state,
+     * which is why the threshold sits far above any speculative verify (1 + K
+     * rows, K <= 8) -- those are the only calls whose checkpoints are ever
+     * read back, immediately, by q4e_spec_rollback -- and why decode, which
+     * is one row, never reaches it. */
+    const uint32_t chunk_min = q4e_gdn_chunk_min_tok();
+    if (chunk_min && n_tok >= chunk_min && q4e_gdn_chunk_ready()) {
+        const uint32_t k_offset = n_head_k * head_dim;
+        const uint32_t v_offset = 2u * n_head_k * head_dim;
+        q4e_gdn_chunk_kernel<<<(unsigned)n_head_v, (unsigned)head_dim * Q4E_GDN_CSPLIT,
+                               q4e_gdn_chunk_smem_bytes(), cuda_decode_stream()>>>(
+                (float *)attn_out->ptr, (float *)state->ptr, (const float *)qkv->ptr,
+                (const float *)decay->ptr, (const float *)beta->ptr,
+                n_head_k, n_head_v, k_offset, v_offset, stride, n_tok);
+        return cuda_ok(cudaGetLastError(), "qwen4exp gdn chunked recurrence");
+    }
     /* One float of row padding, to keep the state's shared reads off a single
      * bank -- see the kernel. */
     const size_t shared = (size_t)head_dim * (head_dim + 1u) * sizeof(float);
