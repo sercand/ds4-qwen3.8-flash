@@ -14696,6 +14696,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * mostly padding and its coarser activation quantization shows up, which
      * on a five-token prompt moved the logit-sum drift from 0.3% to 4%.  K a
      * multiple of 256 keeps the old behaviour at any size. */
+    /* Tested 2026-09-02: restricting this to K % 256 == 0 (sending the
+     * shared expert's K = 640 down projection to cuBLAS) did not remove the
+     * non-finite outputs DS4_MMQ_NAN_CHECK=1 reports there and made the
+     * 82-token oracle comparison worse (2.58% vs 1.09%), so the rule stays. */
     const bool k_tileable = (in_dim % 256u) == 0 ||
                             ((in_dim % 32u) == 0 && n_tok >= 32);
     if (n_tok > 1 && k_tileable &&

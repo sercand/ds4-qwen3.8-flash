@@ -531,6 +531,30 @@ __global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
     if (!isfinite(v)) p[i] = 0.0f;
 }
 
+/* DS4_MMQ_NAN_CHECK=1: count non-finite outputs after each mmq launch and
+ * print the wrapper tag when there are any (synchronises; diagnostic). */
+__global__ static void ds4_mmq_count_nonfinite_kernel(const float *p, uint64_t n, unsigned *count) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && !isfinite(p[i])) atomicAdd(count, 1u);
+}
+
+static void ds4_mmq_nan_check(const char *tag, const float *p, uint64_t n, cudaStream_t stream) {
+    static int on = -1;
+    if (on < 0) on = getenv("DS4_MMQ_NAN_CHECK") != nullptr ? 1 : 0;
+    if (!on || !p || n == 0) return;
+    static unsigned *d_count = nullptr;
+    static unsigned *h_count = nullptr;
+    if (!d_count && cudaMalloc(&d_count, sizeof(unsigned)) != cudaSuccess) { d_count = nullptr; return; }
+    if (!h_count && cudaMallocHost(&h_count, sizeof(unsigned)) != cudaSuccess) { h_count = nullptr; return; }
+    (void)cudaMemsetAsync(d_count, 0, sizeof(unsigned), stream);
+    ds4_mmq_count_nonfinite_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n, d_count);
+    (void)cudaMemcpyAsync(h_count, d_count, sizeof(unsigned), cudaMemcpyDeviceToHost, stream);
+    (void)cudaStreamSynchronize(stream);
+    static unsigned long long seq = 0;
+    seq++;
+    if (*h_count) fprintf(stderr, "ds4 mmq nan-check: #%llu %s: %u non-finite of %llu outputs\n", seq, tag, *h_count, (unsigned long long)n);
+}
+
 static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
     if (!p || n == 0) return;
     /* A full pass over every mmq output (0.125 s of a 3.35 s prefill chunk
@@ -718,6 +742,8 @@ int ds4_mmq_dense_impl(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
+    if (getenv("DS4_MMQ_NAN_CHECK")) fprintf(stderr, "ds4 mmq shape: %s M=%d N=%d K=%d\n", tag, M, N, K);
+    ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)N, stream);
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
@@ -832,6 +858,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
+    ds4_mmq_nan_check(tag, out, (uint64_t)M * (uint64_t)N, stream);
     ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
@@ -1240,6 +1267,7 @@ int ds4_mmq_moe_impl(
         return -4;
     }
     if (sanitize_out) {
+        ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
     return 0;
@@ -1966,7 +1994,9 @@ int ds4_mmq_moe_pair_impl(
         }
     }
     if (sanitize_out) {
+        ds4_mmq_nan_check(tag, out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+        ds4_mmq_nan_check(tag, out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
         ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     }
     return 0;
@@ -2541,6 +2571,8 @@ int ds4_mmq_moe_vec_impl(
         }
     }
 
+    ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
+
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
     return 0;
 }
@@ -3075,7 +3107,9 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     }
 
     const uint64_t out_count = (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used;
+    ds4_mmq_nan_check(tag, out_a, out_count, stream);
     ds4_mmq_sanitize_f32(out_a, out_count, stream);
+    ds4_mmq_nan_check(tag, out_b, out_count, stream);
     ds4_mmq_sanitize_f32(out_b, out_count, stream);
     return 0;
 }
@@ -3195,6 +3229,7 @@ int ds4_mmq_moe_pair_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
+    ds4_mmq_nan_check(tag, out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
     ds4_mmq_sanitize_f32(out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
 }
@@ -3301,6 +3336,8 @@ int ds4_mmq_dense_vec_impl(
                 tag, cudaGetErrorString(err));
         return -3;
     }
+    if (getenv("DS4_MMQ_NAN_CHECK")) fprintf(stderr, "ds4 mmq shape: %s M=%d N=%d K=%d\n", tag, M, N, K);
+    ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)N, stream);
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
@@ -4711,6 +4748,8 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
         }
     }
 
+    ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
+
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
     return 0;
 }
@@ -5000,6 +5039,8 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
         return -3;
     }
+
+    ds4_mmq_nan_check(tag, out_f32, (uint64_t)n_tokens * (uint64_t)M * (uint64_t)n_expert_used, stream);
 
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)n_tokens * (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
