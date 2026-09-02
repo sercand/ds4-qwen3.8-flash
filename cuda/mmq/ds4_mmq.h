@@ -238,10 +238,6 @@ int ds4_mmq_iq2_xxs_moe(
 // ds4_mmq_q2_k_aligned_bytes' comment) instead of the raw block stream.  The
 // tile loader reads the SoA sections directly -- bit-identical output to the
 // raw path, no derepack scratch.
-// CONTRACT DIFFERENCE (P3): unlike the raw entries, the output is NOT
-// nonfinite-sanitized; the routed-MoE consumers (moe_mmq_swiglu / moe_sum
-// with guard_nonfinite=1) sanitize at read, so the standalone whole-buffer
-// pass is skipped.  New callers must sanitize at consumption.
 int ds4_mmq_q2_K_moe_soa(
     const void    * W_soa,
     const float   * X_f32,
@@ -664,7 +660,7 @@ int ds4_mmq_iq2_xxs_aligned_moe_vec(
 // M1-Inc2 variants over the same aligned artifacts (n_tokens == 1 only).
 //
 // _pair_vec: one activation quantize + one launch computes both raw gate and
-// up outputs (nonfinite zeroed in-kernel; no sanitize pass needed).  The
+// up outputs (nonfinite zeroed in-kernel).  The
 // caller still runs its clamp-aware SwiGLU.
 //
 // _gate_up_mid_vec: additionally folds the clamp/SwiGLU/router-weight

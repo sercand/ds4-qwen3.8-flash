@@ -3289,7 +3289,7 @@ void dense_q8_d2r_kernel(const char * __restrict__ wd_plane,
     dq8_mainloop<tile_A, tile_B, tile_C>(acc, s_q8h, s_q8q, s_wq, s_wd, p);
 
     // Column-major out [N][M]; rows always in range (M % 128 == 0 validated).
-    // The isfinite guard preserves the sanitize contract of the mmq path.
+    // The isfinite guard keeps a poisoned accumulator out of the output.
     const int out_col_lo = col_lo + (d2r_warp() & 1) * (kDqNFragPerWarp * 8);
     const int out_row0 = cta_row0 + ((d2r_warp() >> 1) << 4);
 #pragma unroll

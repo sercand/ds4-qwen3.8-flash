@@ -537,13 +537,6 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 // device is sufficient for the dense path.
 namespace {
 
-__global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
-    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float v = p[i];
-    if (!isfinite(v)) p[i] = 0.0f;
-}
-
 /* DS4_MMQ_NAN_CHECK=1: count non-finite outputs after each mmq launch and
  * print the wrapper tag when there are any (synchronises; diagnostic). */
 __global__ static void ds4_mmq_count_nonfinite_kernel(const float *p, uint64_t n, unsigned *count) {
@@ -566,17 +559,6 @@ static void ds4_mmq_nan_check(const char *tag, const float *p, uint64_t n, cudaS
     static unsigned long long seq = 0;
     seq++;
     if (*h_count) fprintf(stderr, "ds4 mmq nan-check: #%llu %s: %u non-finite of %llu outputs\n", seq, tag, *h_count, (unsigned long long)n);
-}
-
-static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
-    if (!p || n == 0) return;
-    /* A full pass over every mmq output (0.125 s of a 3.35 s prefill chunk
-     * at 26k).  DS4_MMQ_NO_SANITIZE=1 skips it for measurement; the default
-     * stays on until a run without it has been shown NaN-free. */
-    static int skip = -1;
-    if (skip < 0) skip = getenv("DS4_MMQ_NO_SANITIZE") != nullptr ? 1 : 0;
-    if (skip) return;
-    ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
 
 ggml_backend_cuda_context * get_ctx_for_device(int device) {
@@ -757,7 +739,6 @@ int ds4_mmq_dense_impl(
     }
     if (getenv("DS4_MMQ_NAN_CHECK")) fprintf(stderr, "ds4 mmq shape: %s M=%d N=%d K=%d\n", tag, M, N, K);
     ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)N, stream);
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
@@ -872,16 +853,15 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         return -3;
     }
     ds4_mmq_nan_check(tag, out, (uint64_t)M * (uint64_t)N, stream);
-    ds4_mmq_sanitize_f32(out, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
 // Dense Q8_0 D2R entry: same activation quantize + scratch treatment as
 // ds4_mmq_dense_impl (incl. the S1.1a zero for the never-written tail), then
 // the D2R kernel on the kind-5 aligned artifact instead of mul_mat_q_case.
-// No out-memset / trailing sanitize: the D2R epilogue writes every element
-// through an isfinite guard.  Caller (ds4_cuda.cu) resolves W_aligned and
-// gates on shape (M%128, K%1024, K<=4096) + n_tok.
+// No out-memset: the D2R epilogue writes every element through an isfinite
+// guard.  Caller (ds4_cuda.cu) resolves W_aligned and gates on shape
+// (M%128, K%1024, K<=4096) + n_tok.
 extern "C" int ds4_mmq_q8_0_dense_d2r(
         const void * W_aligned, const float * X_f32, float * out_f32,
         int M, int N, int K, cudaStream_t stream) {
@@ -1032,10 +1012,6 @@ int ds4_mmq_moe_impl(
          * kernel loads tiles from it directly and W is ignored (see mmq_args). */
         const char    * x_soa      = NULL,
         int64_t         soa_blocks = 0,
-        /* ds4 (P3): false skips the whole-buffer nonfinite pass; only valid
-         * when every consumer sanitizes at read (the routed-MoE swiglu/sum
-         * kernels do). */
-        bool            sanitize_out = true,
         /* ds4: a caller-supplied upper bound on how many rows any single
          * expert can receive; 0 means "use the gathered-row total".  mmq sizes
          * its grid as ceil(ncols_max / tile) tiles per expert, so the default
@@ -1283,10 +1259,7 @@ int ds4_mmq_moe_impl(
         fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -4;
     }
-    if (sanitize_out) {
-        ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-        ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-    }
+    ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     return 0;
 }
 
@@ -1388,8 +1361,6 @@ int ds4_mmq_moe_pair_impl(
         const char    * xa_soa     = NULL,
         const char    * xb_soa     = NULL,
         int64_t         soa_blocks = 0,
-        /* ds4 (P3): see ds4_mmq_moe_impl. */
-        bool            sanitize_out = true,
         const ds4_mmq_fused_down *fused_down = nullptr,
         /* ds4: see ds4_mmq_moe_impl. */
         int64_t         max_rows_per_expert = 0) {
@@ -2014,12 +1985,8 @@ int ds4_mmq_moe_pair_impl(
             }
         }
     }
-    if (sanitize_out) {
-        ds4_mmq_nan_check(tag, out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-        ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-        ds4_mmq_nan_check(tag, out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-        ds4_mmq_sanitize_f32(out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
-    }
+    ds4_mmq_nan_check(tag, out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
+    ds4_mmq_nan_check(tag, out_b, (uint64_t)M * (uint64_t)ne_get_rows, stream);
     return 0;
 }
 
@@ -2032,7 +1999,6 @@ extern "C" int ds4_mmq_q8_0_moe(
     return ds4_mmq_moe_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             /*x_soa=*/NULL, /*soa_blocks=*/0,
-                                            /*sanitize_out=*/true,
                                             (int64_t)max_rows_per_expert);
 }
 
@@ -2066,12 +2032,10 @@ extern "C" int ds4_mmq_q2_K_moe_soa(
     }
     const int64_t npair = (int64_t)n_experts * (int64_t)(M/2) * (int64_t)(K/256);
     /* W_soa doubles as the (unused) raw pointer so the impl's null checks
-     * hold.  sanitize_out=false: the routed-MoE consumers (swiglu / moe_sum)
-     * sanitize at read, saving the whole-buffer pass (P3). */
+     * hold. */
     return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe_soa", W_soa, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
-                                            (const char *)W_soa, npair,
-                                            /*sanitize_out=*/false);
+                                            (const char *)W_soa, npair);
 }
 
 extern "C" int ds4_mmq_q4_K_moe(
@@ -2091,7 +2055,6 @@ extern "C" int ds4_mmq_q5_1_moe(
     return ds4_mmq_moe_impl<GGML_TYPE_Q5_1>("ds4_mmq_q5_1_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             /*x_soa=*/NULL, /*soa_blocks=*/0,
-                                            /*sanitize_out=*/true,
                                             (int64_t)max_rows_per_expert);
 }
 
@@ -2104,7 +2067,6 @@ extern "C" int ds4_mmq_q5_K_moe(
     return ds4_mmq_moe_impl<GGML_TYPE_Q5_K>("ds4_mmq_q5_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             /*x_soa=*/NULL, /*soa_blocks=*/0,
-                                            /*sanitize_out=*/true,
                                             (int64_t)max_rows_per_expert);
 }
 
@@ -2139,12 +2101,10 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         return -1;
     }
     const int64_t nblk = (int64_t)n_experts * (int64_t)M * (int64_t)(K/256);
-    /* sanitize_out=false: see ds4_mmq_q2_K_moe_soa. */
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair_soa", Wa_soa, Wb_soa, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
-        (const char *)Wa_soa, (const char *)Wb_soa, nblk,
-        /*sanitize_out=*/false);
+        (const char *)Wa_soa, (const char *)Wb_soa, nblk);
 }
 
 /* v0.5 inc-9 (F7, derived from Marco Palaferri's GB10 fork, MIT): fused
@@ -2195,7 +2155,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
         (const char *)W_gate, (const char *)W_up, iq2_blocks,
-        /*sanitize_out=*/false, &fused_down);
+        &fused_down);
 }
 
 extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_scratch_sizes(
@@ -2355,7 +2315,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream,
         (const char *)W_gate, (const char *)W_up, iq2_blocks,
-        /*sanitize_out=*/false, &fused_down);
+        &fused_down);
 }
 
 extern "C" int ds4_mmq_q4_K_moe_pair(
@@ -2367,7 +2327,7 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
         "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
-        /*sanitize_out=*/true, /*fused_down=*/nullptr,
+        /*fused_down=*/nullptr,
         (int64_t)max_rows_per_expert);
 }
 
@@ -2593,8 +2553,6 @@ int ds4_mmq_moe_vec_impl(
     }
 
     ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
-
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
@@ -2667,8 +2625,8 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
 }
 
 // M1-Inc2 variant P: one launch covers gate and up (blockIdx.z selects the
-// weight stream); nonfinite accs are zeroed in-kernel so no sanitize pass is
-// needed.  Same per-warp math as iq2_xxs_aligned_moe_vec_kernel.
+// weight stream); nonfinite accs are zeroed in-kernel.  Same per-warp math as
+// iq2_xxs_aligned_moe_vec_kernel.
 __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
         float             *out_gate,   // [n_tokens*n_expert_used, M]
         float             *out_up,     // [n_tokens*n_expert_used, M]
@@ -2736,7 +2694,7 @@ __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
 // each q8 activation block is loaded once), clamp/SwiGLU/router-weight
 // epilogue folded in (semantics copied from
 // ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel) -> mid directly.  Replaces
-// quantize+gate+up+sanitize+swiglu with quantize+one launch.
+// quantize+gate+up+swiglu with quantize+one launch.
 __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
         float             *mid,        // [n_tokens*n_expert_used, M]
         const uint2       *qs_gate,
@@ -3129,9 +3087,7 @@ int ds4_mmq_moe_pair_raw_vec_impl(
 
     const uint64_t out_count = (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used;
     ds4_mmq_nan_check(tag, out_a, out_count, stream);
-    ds4_mmq_sanitize_f32(out_a, out_count, stream);
     ds4_mmq_nan_check(tag, out_b, out_count, stream);
-    ds4_mmq_sanitize_f32(out_b, out_count, stream);
     return 0;
 }
 
@@ -3251,7 +3207,6 @@ int ds4_mmq_moe_pair_vec_impl(
         return -3;
     }
     ds4_mmq_nan_check(tag, out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
-    ds4_mmq_sanitize_f32(out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
@@ -3359,7 +3314,6 @@ int ds4_mmq_dense_vec_impl(
     }
     if (getenv("DS4_MMQ_NAN_CHECK")) fprintf(stderr, "ds4 mmq shape: %s M=%d N=%d K=%d\n", tag, M, N, K);
     ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)N, stream);
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
     return 0;
 }
 
@@ -4770,8 +4724,6 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
     }
 
     ds4_mmq_nan_check(tag, out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
-
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
     return 0;
 }
 
@@ -5062,8 +5014,6 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
     }
 
     ds4_mmq_nan_check(tag, out_f32, (uint64_t)n_tokens * (uint64_t)M * (uint64_t)n_expert_used, stream);
-
-    ds4_mmq_sanitize_f32(out_f32, (uint64_t)n_tokens * (uint64_t)M * (uint64_t)n_expert_used, stream);
     return 0;
 }
 
