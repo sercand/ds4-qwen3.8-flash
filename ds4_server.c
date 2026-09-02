@@ -10986,6 +10986,18 @@ static void server_cache_note_request(server *s, const char *source,
                (unsigned long long)rep.engine.evictions);
 }
 
+/* The cache-source name for a prefix the engine supplied.  A new
+ * ds4_reuse_source value must be named here too; the switch has no default, so
+ * adding one warns until it is. */
+static const char *cache_source_for_reuse(ds4_reuse_source source) {
+    switch (source) {
+    case DS4_REUSE_SNAPSHOT: return "memory-snapshot";
+    case DS4_REUSE_LIVE:     return "memory-token";
+    case DS4_REUSE_COLD:     break;
+    }
+    return "none";
+}
+
 /* The reuse label for one request: `<source>@<reused>` when the engine
  * answered, else the matcher name, else "cold". */
 static void request_reuse_label(char *out, size_t cap,
@@ -12752,8 +12764,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         pthread_mutex_unlock(&s->inference_mu);
         if (reuse.reused_tokens > 0) {
             cached = reuse.reused_tokens;
-            cache_source = reuse.source == DS4_REUSE_SNAPSHOT ?
-                           "memory-snapshot" : "memory-token";
+            cache_source = cache_source_for_reuse(reuse.source);
         }
     }
     if (cached == 0 && old_pos > 0) {
@@ -14698,7 +14709,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--cache-log-every")) {
-            c.cache_log_every = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.cache_log_every = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {

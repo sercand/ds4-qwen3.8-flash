@@ -346,7 +346,9 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     opt(fp, c, "--batched-session N", "Keep N resident sessions and batch decode-ready requests.");
     opt(fp, c, "--mixed-prefill-quantum N", "Prefill chunk while generations are active. Default: 128; GLM-5.3 minimum: 1024");
+    opt(fp, c, "--cache-log-every N", "Log prompt-cache totals every N requests. 0 disables. Default: 20");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
+    para(fp, c, "GET /cache reports requests, hit rate, tokens reused vs prefilled and evictions.");
     para(fp, c, "Model endpoint aliases include deepseek-v4-flash and deepseek-v4-pro; both serve the loaded GGUF.");
     fputc('\n', fp);
 }
@@ -376,8 +378,6 @@ static void print_kv_cache(FILE *fp, const help_colors *c) {
     opt(fp, c, "--kv-cache-reject-different-quant", "Reject checkpoints written with different routed-expert quantization.");
     opt(fp, c, "--disable-exact-dsml-tool-replay", "Disable exact sampled DSML tool replay map.");
     opt(fp, c, "--tool-memory-max-ids N", "Exact tool-call IDs kept in RAM. Default: 100000");
-    opt(fp, c, "--cache-log-every N", "Log prompt-cache totals every N requests. 0 disables. Default: 20");
-    para(fp, c, "GET /cache reports requests, hit rate, tokens reused vs prefilled and evictions.");
     fputc('\n', fp);
 }
 
