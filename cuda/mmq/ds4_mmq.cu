@@ -145,6 +145,19 @@ static __global__ void ds4_mmq_max_expert_rows_kernel(const int32_t * bounds, in
     if (threadIdx.x == 0) *out = red[0];
 }
 
+/* Column-tile cap for the routed GEMMs (DS4_MMQ_ROUTED_X_MAX, default 64).
+ * On the 26k prefill: 128 -> 64 took moe gate+up 1000 -> 784 ms and down
+ * 815 -> 727 ms per 2048-token chunk; 32 made down worse (818). */
+static int ds4_mmq_routed_x_cap() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_MMQ_ROUTED_X_MAX");
+        cached = (env && env[0]) ? atoi(env) : 64;
+        if (cached < 0) cached = 0;
+    }
+    return cached;
+}
+
 static int64_t ds4_mmq_true_max_rows(const int32_t * expert_bounds, int n_experts, int64_t fallback,
                                      int64_t n_tokens, cudaStream_t stream) {
     if (fallback <= 0 || n_tokens < 32 || !expert_bounds) return fallback;
@@ -1259,7 +1272,11 @@ int ds4_mmq_moe_impl(
         /*soa_blocks=*/soa_blocks,
     };
 
+    ds4_mmq_set_x_cap(ds4_mmq_routed_x_cap());
+
     mul_mat_q_case<type>(*ctx, args, stream);
+
+    ds4_mmq_set_x_cap(0);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1844,7 +1861,9 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/iq2_gate",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                 nvtx_prefill);
+        ds4_mmq_set_x_cap(ds4_mmq_routed_x_cap());
         mul_mat_q_case<type>(*ctx, args, stream);
+        ds4_mmq_set_x_cap(0);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "%s: mul_mat_q_case (pair a) launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -1861,7 +1880,9 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/iq2_up",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                 nvtx_prefill);
+        ds4_mmq_set_x_cap(ds4_mmq_routed_x_cap());
         mul_mat_q_case<type>(*ctx, args, stream);
+        ds4_mmq_set_x_cap(0);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));

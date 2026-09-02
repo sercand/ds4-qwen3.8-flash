@@ -113,6 +113,10 @@ struct tile_x_sizes {
     int sc;
 };
 
+static thread_local int g_ds4_mmq_x_cap = 0;
+static inline int ds4_mmq_x_cap() { return g_ds4_mmq_x_cap; }
+static inline void ds4_mmq_set_x_cap(int cap) { g_ds4_mmq_x_cap = cap; }
+
 static int get_mmq_x_max_host(const int cc) {
     const int hardware_max = (turing_mma_available(cc) || amd_wmma_available(cc)) ? 128 :
         GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA ?
@@ -140,6 +144,10 @@ static int get_mmq_x_max_host(const int cc) {
         }
     }
     if (g_override > 0) base = std::min(g_override, hardware_max);
+    /* ds4: per-call cap set by the routed-expert wrappers (see
+     * ds4_mmq_set_x_cap): an expert holds ~n_tok/51 rows, so a 128-wide
+     * column tile spends most of its MMA on padding. */
+    if (ds4_mmq_x_cap() > 0) base = std::min(base, ds4_mmq_x_cap());
     return base;
 }
 

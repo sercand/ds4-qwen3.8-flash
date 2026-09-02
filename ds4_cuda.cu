@@ -14702,7 +14702,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
      * 82-token oracle comparison worse (2.58% vs 1.09%), so the rule stays. */
     const bool k_tileable = (in_dim % 256u) == 0 ||
                             ((in_dim % 32u) == 0 && n_tok >= 32);
-    if (n_tok > 1 && k_tileable &&
+    /* DS4_Q8_SMALLK_CUBLAS=1: send small-K dense GEMMs (the hyper-connection
+     * up projection, K = 320, 10240 outputs) to cuBLAS f32 instead of mmq,
+     * where ten K steps of per-tile overhead cost 1.84 ms per launch. */
+    static int smallk_cublas = -1;
+    if (smallk_cublas < 0) smallk_cublas = getenv("DS4_Q8_SMALLK_CUBLAS") != NULL ? 1 : 0;
+    const bool smallk_to_cublas = smallk_cublas && in_dim <= 512u && n_tok >= 32 && g_cublas_ready;
+    if (n_tok > 1 && k_tileable && !smallk_to_cublas &&
         !g_q8_dequant_gemm_enabled && cuda_use_mmq()) {
         /* On the decode stream: under a graph capture the legacy stream is
          * neither captured nor allowed to allocate (the stream-k fixup
