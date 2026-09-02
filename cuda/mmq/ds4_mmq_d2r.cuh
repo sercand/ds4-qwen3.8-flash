@@ -67,8 +67,9 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     cudaStream_t    stream);
 
 // Complete target-prefill gate/up path: both IQ2_XXS projections share one
-// activation tile, then sanitize + clamp + SwiGLU + routing weight are folded
-// directly into the expert-major Q8_1 D2S6 input consumed by Q2_K down.
+// activation tile, then the isfinite guard + clamp + SwiGLU + routing weight
+// are folded directly into the expert-major Q8_1 D2S6 input consumed by
+// Q2_K down.
 //
 // flat-pool p5b: with ids_src != NULL, input_q8 is TOKEN-COMPACT (n_tokens
 // rows quantized once, no gather) and each assignment column stages its

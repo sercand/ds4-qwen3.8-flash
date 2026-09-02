@@ -719,16 +719,20 @@ static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
 
 /* Zeroed tail every cached weight span carries past its payload.
  *
- * mmq's K tile is MMQ_ITER_K = 256 weights wide while its loop bound counts
- * whole type blocks, so a row whose K is not a multiple of 256 -- qwen4exp's
- * K = 320 hyper-connection up and K = 640 down projections -- makes the last
- * tile load up to seven 32-weight blocks past the row (238 bytes at Q8_0's 34
- * bytes per block).  The activation side of those lanes is zero, so the extra
+ * mmq iterates K in whole get_iter_k() steps -- MMQ_ITER_K = 256 weights, or
+ * MMQ_ITER_K_FP4 = 512 for MXFP4/NVFP4 on Blackwell -- while its loop bound
+ * counts the row's type blocks, so a row whose K is not a multiple of that
+ * step makes the last tile load the remainder of a step past the row: up to
+ * 7 of 8 blocks for a 32-weight type at the 256 step (238 bytes at Q8_0's 34
+ * bytes per block, 6 blocks = 204 bytes at qwen4exp's K = 320, 4 blocks =
+ * 136 bytes at its K = 640) and up to 15 of 16 for MXFP4 at the 512 step
+ * (255 bytes).  The activation side of those lanes is zero, so the extra
  * products vanish for every row that reads into the next row's weights; the
  * span's LAST row instead reads whatever follows the span, and uninitialised
  * device bytes decode to inf/nan block scales, where 0 * inf poisons that
- * whole output feature.  A KiB of zeros makes the read defined and
- * contributes exactly nothing (a zero block scale is a zero dot product).
+ * whole output feature.  A KiB of zeros covers every case, makes the read
+ * defined, and contributes exactly nothing (a zero block scale is a zero dot
+ * product).
  *
  * The span builder (accelerator_prepare_model_tensor_spans in ds4.c) keeps a
  * row-unaligned tensor last in its span, so this tail is what its final row
@@ -766,6 +770,22 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
+    /* KNOWN LIMITATION, the four returns below.  These serve a weight from
+     * one image of the whole model -- a device copy of it (DS4_CUDA_COPY_MODEL
+     * / DS4_CUDA_COPY_MODEL_CHUNKED), the registered mapping, the ATS/HMM
+     * mapping, or DS4_CUDA_DIRECT_MODEL -- so there are no per-span tails to
+     * zero: only the image's own end is padded, and a row-unaligned tensor
+     * anywhere else reads the bytes of whatever tensor the GGUF put after it.
+     * Those bytes are mapped and finite-valued far more often than not, but a
+     * block scale that happens to decode to inf or nan poisons that output
+     * feature (see CUDA_WEIGHT_SPAN_TAIL_PAD; this is what the deleted
+     * whole-buffer sanitize pass used to paper over).  The span + arena path
+     * below is the one with the per-span zeroed tail, and it is what every
+     * default configuration takes -- qwen4exp included, where the engine
+     * caches its resident set span by span through
+     * ds4_gpu_cache_model_range().  A model with row-unaligned quantized rows
+     * (qwen4exp's K = 320/640, MXFP4 K = 2880) should not be run with the
+     * copy/direct switches above. */
     if (model_map == g_model_host_base &&
         (g_model_device_owned || g_model_registered)) {
         return cuda_model_ptr(model_map, offset);
@@ -793,7 +813,24 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         const uintptr_t host_addr = (uintptr_t)((const char *)model_map + offset);
         const uintptr_t reg_addr = host_addr & ~(uintptr_t)(page_sz - 1u);
         const uint64_t reg_delta = (uint64_t)(host_addr - reg_addr);
-        const uint64_t reg_bytes = (reg_delta + bytes + page_sz - 1u) & ~(page_sz - 1u);
+        /* Register the pad as well, so mmq's over-read of the last row stays
+         * inside a range the device may touch instead of faulting on an
+         * unregistered page.  The bytes it finds there are the file's, not
+         * zeros -- see the KNOWN LIMITATION above; this path is only reached
+         * when the fd cache declines (no descriptor, or the weight-cache
+         * budget is exhausted).  Never register past the end of the mapping:
+         * cudaHostRegister would fail and take the whole mapping route down
+         * with it. */
+        uint64_t reg_bytes = (reg_delta + bytes + CUDA_WEIGHT_SPAN_TAIL_PAD +
+                              page_sz - 1u) & ~(page_sz - 1u);
+        const uint64_t reg_from_base = (uint64_t)(reg_addr - (uintptr_t)model_map);
+        const uint64_t map_bytes =
+            model_map == g_model_host_base ? g_model_registered_size : offset + bytes;
+        if (map_bytes > reg_from_base) {
+            const uint64_t reg_max =
+                (map_bytes - reg_from_base + page_sz - 1u) & ~(page_sz - 1u);
+            if (reg_bytes > reg_max) reg_bytes = reg_max;
+        }
         void *reg_dev = NULL;
         err = cudaHostRegister((void *)reg_addr,
                                (size_t)reg_bytes,
@@ -822,7 +859,8 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
     }
 
     /* Same zeroed tail as the arena path: mmq over-reads the last row of a
-     * span whose K is not a multiple of 256 (see CUDA_WEIGHT_SPAN_TAIL_PAD). */
+     * span whose K is not a whole number of K steps (see
+     * CUDA_WEIGHT_SPAN_TAIL_PAD). */
     void *dev = NULL;
     err = cudaMalloc(&dev, (size_t)bytes + CUDA_WEIGHT_SPAN_TAIL_PAD);
     if (err != cudaSuccess) {
@@ -1235,6 +1273,13 @@ __global__ static void moe_mmq_swiglu_weighted_clamp_kernel(
     mid_out[gid] = s * u * w;
 }
 
+/* guard_nonfinite: skip a non-finite per-expert contribution instead of
+ * letting it swallow the token's whole output row.  It used to lean on the
+ * mmq sanitize pass having zeroed such values already; it now stands on its
+ * own, because these callers may be served a weight image with no zeroed
+ * span tails (the KNOWN LIMITATION in cuda_model_range_ptr), and one
+ * poisoned expert row is cheaper to drop here than anywhere else -- the
+ * value is already loaded, so the test is free. */
 __global__ static void moe_mmq_sum_kernel(float *out, const float *down,
         const int32_t *selected, uint32_t out_dim, uint32_t n_expert,
         uint32_t n_tokens, uint32_t guard_nonfinite) {
@@ -2411,11 +2456,16 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
         if (used <= a.bytes && aligned <= a.bytes - used) {
             char *ptr = a.device_ptr + used;
-            a.used = used + aligned;
+            /* The tail is zeroed on the null stream while the payload copies
+             * ride g_model_upload_stream; the two regions are disjoint, so
+             * they need no ordering between them.  Give the reservation back
+             * if the memset fails, so a caller that falls back to the mapping
+             * does not strand arena space. */
             if (!cuda_ok(cudaMemset(ptr + bytes, 0, (size_t)(aligned - bytes)),
                          "zero weight span tail pad")) {
                 return NULL;
             }
+            a.used = used + aligned;
             return ptr;
         }
     }
@@ -2445,6 +2495,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     }
     if (!cuda_ok(cudaMemset((char *)dev + bytes, 0, (size_t)(aligned - bytes)),
                  "zero weight span tail pad")) {
+        g_model_arenas.back().used = 0;
         return NULL;
     }
     return (char *)dev;
@@ -2577,12 +2628,16 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
 
     void *dev = NULL;
     const double t0 = cuda_wall_sec();
-    cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
+    /* Padded and zeroed like a cached span: see the DS4_CUDA_COPY_MODEL copy
+     * in ds4_gpu_set_model_map and the KNOWN LIMITATION in
+     * cuda_model_range_ptr. */
+    cudaError_t err = cudaMalloc(&dev, (size_t)model_size + CUDA_WEIGHT_SPAN_TAIL_PAD);
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model allocation skipped: %s\n", cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
+    (void)cudaMemset((char *)dev + model_size, 0, CUDA_WEIGHT_SPAN_TAIL_PAD);
 
     fprintf(stderr, "ds4: CUDA chunk-copying %.2f GiB model image\n",
             (double)model_size / 1073741824.0);
@@ -3852,10 +3907,15 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
     if (copy_env && copy_env[0]) {
         void *dev = NULL;
         const double t0 = clock() / (double)CLOCKS_PER_SEC;
-        cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
+        /* Padded and zeroed like a cached span, so mmq's over-read of the
+         * image's last row is defined; a row-unaligned tensor inside the image
+         * still reads its neighbour's bytes (see the KNOWN LIMITATION in
+         * cuda_model_range_ptr). */
+        cudaError_t err = cudaMalloc(&dev, (size_t)model_size + CUDA_WEIGHT_SPAN_TAIL_PAD);
         if (err == cudaSuccess) {
             fprintf(stderr, "ds4: CUDA copying %.2f GiB model to device memory\n",
                     (double)model_size / 1073741824.0);
+            (void)cudaMemset((char *)dev + model_size, 0, CUDA_WEIGHT_SPAN_TAIL_PAD);
             err = cudaMemcpy(dev, model_map, (size_t)model_size, cudaMemcpyHostToDevice);
             if (err == cudaSuccess) {
                 g_model_device_base = (const char *)dev;

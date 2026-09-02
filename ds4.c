@@ -3409,20 +3409,27 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             continue;
         }
 #endif
-        /* mmq's K tile is 256 weights wide, so it reads the last row of a
-         * block-quantized tensor whose row length is not a multiple of 256 --
-         * qwen4exp's K = 320 and K = 640 projections -- a few blocks past the
-         * row.  The device cache zero-pads only the tail of a span
-         * (cuda_model_arena_alloc), so such a tensor has to be the last one
-         * in its span: past it the read would land in the next tensor's
-         * bytes, where a fp16 block scale of inf or nan poisons a whole
-         * output feature. */
+        /* mmq iterates K in whole MMQ_ITER_K steps but bounds its loop by the
+         * row's block count, so it reads the last row of a block-quantized
+         * tensor whose row length is not a multiple of that step -- qwen4exp's
+         * K = 320 and K = 640 projections, or an MXFP4 K = 2880 -- a few
+         * blocks past the row.  The device cache zero-pads only the tail of a
+         * span (cuda_model_arena_alloc), so such a tensor has to be the last
+         * one in its span: past it the read would land in the next tensor's
+         * bytes, where a block scale of inf or nan poisons a whole output
+         * feature.
+         *
+         * The step is get_iter_k() in cuda/mmq/mmq.cuh: 256 weights, except
+         * 512 for the fp4 types on Blackwell (GB10 included).  Sealing on 512
+         * for MXFP4 everywhere costs only a span boundary on non-Blackwell
+         * hosts; NVFP4 joins it if ds4 ever loads that type. */
         const gguf_type_info *tinfo = tensor_type(t->type);
+        const uint64_t k_step = t->type == DS4_TENSOR_MXFP4 ? 512u : 256u;
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
             .seal = tinfo && tinfo->block_elems > 1 && t->ndim > 0 &&
-                    (t->dim[0] % 256u) != 0u,
+                    (t->dim[0] % k_step) != 0u,
         };
     }
     if (nspan == 0) {
