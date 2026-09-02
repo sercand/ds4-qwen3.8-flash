@@ -105,12 +105,15 @@ static uint32_t metal_graph_cuda_tp_output_tiers_for_head(
     return n;
 }
 
-#ifndef DS4_NO_GPU
-#include "ds4_gpu.h"
 /* qwen4exp paged-KV geometry, shared with the kernels (ds4_qwen4exp_gpu.cuh
  * includes it too; ds4_gpu.h deliberately does not, so it does not reach the
- * dozen translation units that only want the tensor API). */
+ * dozen translation units that only want the tensor API).  Macros only, and
+ * outside the GPU guard because the span tree and the page pool are as well:
+ * they are array bookkeeping that ds4_test exercises in a DS4_NO_GPU build. */
 #include "ds4_q4e_page.h"
+
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
 #endif
 
 /* Non-CUDA builds (Mac/Metal, CPU-only) never link ds4_cuda.cu. Provide
