@@ -14,6 +14,7 @@
  *    below apply neither.  Re-applying either is silent: the model stays
  *    fluent and goes subtly wrong.
  */
+#include "ds4_q4e_page.h"
 
 /* Block-wide reductions over at most 32 warps.  ds4_cuda.cu already has the
  * warp-level pair; these lift them to a whole block, which the grouped norms
@@ -1700,13 +1701,24 @@ __global__ static void q4e_qsa_q_norm_rope_kernel(
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) q_out[dst + i] = s_q[i];
 }
 
+/* Physical cache row of logical position p, through this sequence's page
+ * table (ds4_q4e_page.h carries the geometry).  Every KV-touching kernel
+ * below goes through this; a tile that is page-aligned and no wider than a
+ * page translates its first position and walks the rest contiguously, which
+ * is what keeps the translation to one lookup per tile. */
+__device__ __forceinline__ static uint32_t q4e_kv_row(const int32_t *pages, uint32_t p) {
+    return (uint32_t)pages[p >> DS4_Q4E_PAGE_SHIFT] * DS4_Q4E_PAGE_TOKENS +
+           (p & DS4_Q4E_PAGE_MASK);
+}
+
 /* Key norm + RoPE straight into the f16 KV cache, and the value beside it.
  * The cache is f16 because it is read in full on every decode step; f32 would
  * double that traffic for no accuracy that survives the softmax. */
 __global__ static void q4e_qsa_store_kv_kernel(
         __half *k_cache, __half *v_cache, const float *k, const float *v,
         const float *kw, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot,
-        float rope_base, const int32_t *pos, uint32_t cache_stride, float eps) {
+        float rope_base, const int32_t *pos, const int32_t *pages,
+        uint32_t pool_slots, float eps) {
     const uint32_t t = blockIdx.y;
     const uint32_t h = blockIdx.x;
     const uint64_t src = ((uint64_t)t * n_head_kv + h) * head_dim;
@@ -1725,8 +1737,10 @@ __global__ static void q4e_qsa_store_kv_kernel(
     q4e_rope_neox(s_k, n_rot, rope_base, (uint32_t)pos[t], threadIdx.x, blockDim.x);
     __syncthreads();
 
-    const uint64_t slot = ((uint64_t)pos[t] * n_head_kv + h) * head_dim;
-    if (slot + head_dim > (uint64_t)cache_stride * n_head_kv * head_dim) return;
+    /* The only write into the cache, and it is always at the frontier: the
+     * page holding pos[t] is the last one the sequence owns. */
+    const uint64_t slot = ((uint64_t)q4e_kv_row(pages, (uint32_t)pos[t]) * n_head_kv + h) * head_dim;
+    if (slot + head_dim > (uint64_t)pool_slots * n_head_kv * head_dim) return;
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
         k_cache[slot + i] = __float2half(s_k[i]);
         v_cache[slot + i] = __float2half(v[src + i]);
@@ -1751,7 +1765,7 @@ __global__ static void q4e_qsa_store_kv_kernel(
 __global__ static void q4e_qsa_attention_kernel(
         float *out, const __half *k_cache, const __half *v_cache, const float *q,
         uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
-        const int32_t *pos, uint32_t n_tok) {
+        const int32_t *pos, const int32_t *pages, uint32_t n_tok) {
     const uint32_t h = blockIdx.x;
     const uint32_t t = blockIdx.y;
     const uint32_t hkv = h / (n_head / n_head_kv);
@@ -1772,8 +1786,10 @@ __global__ static void q4e_qsa_attention_kernel(
     float m = -INFINITY;
     float l = 0.0f;
 
+    /* A warp walks positions Q4E_ATTN_WARPS apart, so this one pays a page
+     * lookup per position; it is the A/B fallback path, not the hot one. */
     for (uint32_t p = warp; p <= last; p += Q4E_ATTN_WARPS) {
-        const uint64_t kb = ((uint64_t)p * n_head_kv + hkv) * head_dim;
+        const uint64_t kb = ((uint64_t)q4e_kv_row(pages, p) * n_head_kv + hkv) * head_dim;
         float dot = 0.0f;
         for (uint32_t j = 0; j < slots; j++) {
             const uint32_t i = lane + 32u * j;
@@ -1837,10 +1853,15 @@ __global__ static void q4e_qsa_attention_kernel(
 #define Q4E_ATTN_KT 32u          /* keys per tile: one per lane */
 #define Q4E_ATTN_TILE_WARPS 8u
 
+/* Key tiles start at multiples of Q4E_ATTN_KT and a page is a whole number of
+ * them, so a tile never straddles a page and one translation covers it. */
+static_assert(DS4_Q4E_PAGE_TOKENS % Q4E_ATTN_KT == 0u,
+              "a key tile must not straddle a KV page");
+
 __global__ static void q4e_qsa_attention_tiled_kernel(
         float *out, const __half *k_cache, const __half *v_cache, const float *q,
         uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
-        const int32_t *pos, uint32_t n_tok) {
+        const int32_t *pos, const int32_t *pages, uint32_t n_tok) {
     const uint32_t h = blockIdx.x;
     const uint32_t t0 = blockIdx.y * Q4E_ATTN_QT;
     if (t0 >= n_tok) return;
@@ -1881,9 +1902,10 @@ __global__ static void q4e_qsa_attention_tiled_kernel(
 
     for (uint32_t p0 = 0; p0 <= last; p0 += Q4E_ATTN_KT) {
         const uint32_t n_k = (last + 1u - p0 < Q4E_ATTN_KT) ? (last + 1u - p0) : Q4E_ATTN_KT;
+        const uint32_t krow = q4e_kv_row(pages, p0);     /* one lookup per tile */
         for (uint32_t idx = threadIdx.x; idx < n_k * head_dim; idx += blockDim.x) {
             const uint32_t k = idx / head_dim, d = idx % head_dim;
-            const uint64_t src = ((uint64_t)(p0 + k) * n_head_kv + hkv) * head_dim + d;
+            const uint64_t src = ((uint64_t)(krow + k) * n_head_kv + hkv) * head_dim + d;
             s_k[(size_t)d * Q4E_ATTN_KT + k] = k_cache[src];
             s_v[(size_t)k * head_dim + d] = v_cache[src];
         }
@@ -1976,7 +1998,7 @@ __global__ static void __launch_bounds__(256, 2)
 q4e_qsa_attention_split_kernel(
         float *out, float *part, const __half *k_cache, const __half *v_cache,
         const float *q, uint32_t n_head, uint32_t n_head_kv,
-        const int32_t *pos, uint32_t n_tok, uint32_t n_splits) {
+        const int32_t *pos, const int32_t *pages, uint32_t n_tok, uint32_t n_splits) {
     constexpr uint32_t HD = Q4E_ATTN_SPLIT_HD;
     constexpr uint32_t KT = Q4E_ATTN_KT;
     constexpr uint32_t C8 = HD / 8u;                    /* 16-byte chunks per row */
@@ -2037,6 +2059,9 @@ q4e_qsa_attention_split_kernel(
 
         for (uint32_t p0 = k_begin; p0 < k_end; p0 += KT) {
             const uint32_t n_k = (k_end - p0 < KT) ? (k_end - p0) : KT;
+            /* k_begin and the stride are multiples of KT, so this tile lies in
+             * one page: one page-table lookup covers all 32 keys. */
+            const uint32_t krow = q4e_kv_row(pages, p0);
             /* K: lane = key, warp = chunk (4 passes cover 32 chunks); stored
              * chunk-major so a lane's score loop reads its own column. */
 #pragma unroll
@@ -2044,7 +2069,7 @@ q4e_qsa_attention_split_kernel(
                 const uint32_t key = lane, c = warp + 8u * i;
                 if (key < n_k) {
                     s_k8[(size_t)c * KT + key] = *(const uint4 *)(k_cache +
-                            (((uint64_t)(p0 + key) * n_head_kv + hkv) * HD + 8u * c));
+                            (((uint64_t)(krow + key) * n_head_kv + hkv) * HD + 8u * c));
                 }
             }
             /* V: lane = chunk, warp = key (4 passes cover 32 keys); key-major
@@ -2054,7 +2079,7 @@ q4e_qsa_attention_split_kernel(
                 const uint32_t key = warp + 8u * i, c = lane;
                 if (key < n_k) {
                     s_v8[(size_t)key * C8 + c] = *(const uint4 *)(v_cache +
-                            (((uint64_t)(p0 + key) * n_head_kv + hkv) * HD + 8u * c));
+                            (((uint64_t)(krow + key) * n_head_kv + hkv) * HD + 8u * c));
                 } else {
                     /* The accumulation runs the whole tile with zero weights on
                      * the tail, and 0 * NaN from stale memory is NaN. */
@@ -2251,29 +2276,37 @@ extern "C" void ds4_gpu_q4e_host_free(void *p) {
 #define Q4E_IDX_R     4u
 #define Q4E_IDX_TAIL  (Q4E_IDX_R - 1u)
 
-/* Raw indexer keys into the f16 cache at the rows' positions. */
+/* Raw indexer keys into the f16 cache at the rows' paged positions. */
 __global__ static void q4e_idx_store_k_kernel(__half *cache, const float *k, const int32_t *pos,
-                                              uint32_t n_tok) {
+                                              const int32_t *pages, uint32_t n_tok) {
     const uint32_t t = blockIdx.x;
     if (t >= n_tok) return;
-    const uint64_t dst = (uint64_t)pos[t] * Q4E_IDX_DIM;
+    const uint64_t dst = (uint64_t)q4e_kv_row(pages, (uint32_t)pos[t]) * Q4E_IDX_DIM;
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) {
         cache[dst + i] = __float2half(k[(uint64_t)t * Q4E_IDX_DIM + i]);
     }
 }
 
 extern "C" int ds4_gpu_q4e_idx_store_k(ds4_gpu_tensor *cache, const ds4_gpu_tensor *k,
-                                       const ds4_gpu_tensor *pos, uint32_t n_tok) {
-    if (!cache || !k || !pos || !n_tok) return 0;
+                                       const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages,
+                                       uint32_t n_tok) {
+    if (!cache || !k || !pos || !pages || !n_tok) return 0;
     q4e_idx_store_k_kernel<<<n_tok, 128, 0, cuda_decode_stream()>>>(
-            (__half *)cache->ptr, (const float *)k->ptr, (const int32_t *)pos->ptr, n_tok);
+            (__half *)cache->ptr, (const float *)k->ptr, (const int32_t *)pos->ptr,
+            (const int32_t *)pages->ptr, n_tok);
     return cuda_ok(cudaGetLastError(), "qwen4exp idx store k");
 }
 
 /* One block per key block b in [b0, b1): mean of its r raw keys, RMSNorm with
- * the (Gemma +1 baked) k-norm weight, RoPE at position r*b, stored f16. */
+ * the (Gemma +1 baked) k-norm weight, RoPE at position r*b, stored f16.
+ *
+ * A page holds a whole number of key blocks, so block b's r raw keys are
+ * contiguous inside one page and its pooled row sits in that page's pooled
+ * slice: both addresses come from the one translation of position r*b. */
+static_assert(DS4_Q4E_PAGE_TOKENS % Q4E_IDX_R == 0u,
+              "a pooled key block must not straddle a KV page");
 __global__ static void q4e_idx_pool_kernel(__half *pooled, const __half *cache, const float *w,
-                                           const int32_t *pos, uint32_t n_tok,
+                                           const int32_t *pos, const int32_t *pages, uint32_t n_tok,
                                            uint32_t n_rot, float rope_base, float eps) {
     /* Blocks completed by this forward: [pos0/r, (pos_last+1)/r).  Derived on
      * the device so a captured graph stays right as the context grows. */
@@ -2281,12 +2314,14 @@ __global__ static void q4e_idx_pool_kernel(__half *pooled, const __half *cache, 
     const uint32_t b1 = ((uint32_t)pos[n_tok - 1u] + 1u) / Q4E_IDX_R;
     const uint32_t b = b0 + blockIdx.x;
     if (b >= b1) return;
+    const uint32_t krow = q4e_kv_row(pages, b * Q4E_IDX_R);
+    const uint32_t brow = krow / Q4E_IDX_R;          /* pooled row of block b */
     __shared__ float s_k[Q4E_IDX_DIM];
     float sum = 0.0f;
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t j = 0; j < Q4E_IDX_R; j++) {
-            acc += __half2float(cache[((uint64_t)b * Q4E_IDX_R + j) * Q4E_IDX_DIM + i]);
+            acc += __half2float(cache[((uint64_t)krow + j) * Q4E_IDX_DIM + i]);
         }
         acc *= 1.0f / (float)Q4E_IDX_R;
         s_k[i] = acc;
@@ -2298,22 +2333,22 @@ __global__ static void q4e_idx_pool_kernel(__half *pooled, const __half *cache, 
     q4e_rope_neox(s_k, n_rot, rope_base, b * Q4E_IDX_R, threadIdx.x, blockDim.x);
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) {
-        pooled[(uint64_t)b * Q4E_IDX_DIM + i] = __float2half(s_k[i]);
+        pooled[(uint64_t)brow * Q4E_IDX_DIM + i] = __float2half(s_k[i]);
     }
 }
 
 extern "C" int ds4_gpu_q4e_idx_pool(ds4_gpu_tensor *pooled, const ds4_gpu_tensor *cache,
                                     const void *model_map, uint64_t model_size, uint64_t norm_offset,
-                                    const ds4_gpu_tensor *pos, uint32_t n_tok,
-                                    uint32_t n_rot, float rope_base, float eps) {
-    if (!pooled || !cache || !pos || !n_tok) return 0;
+                                    const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages,
+                                    uint32_t n_tok, uint32_t n_rot, float rope_base, float eps) {
+    if (!pooled || !cache || !pos || !pages || !n_tok) return 0;
     const float *w = q4e_weight(model_map, model_size, norm_offset,
                                 (uint64_t)Q4E_IDX_DIM * sizeof(float), pooled, "qwen4exp idx k norm");
     if (!w) return 0;
     /* At most n_tok/r + 1 blocks complete in one forward. */
     q4e_idx_pool_kernel<<<n_tok / Q4E_IDX_R + 1u, 128, 0, cuda_decode_stream()>>>(
-            (__half *)pooled->ptr, (const __half *)cache->ptr, w, (const int32_t *)pos->ptr, n_tok,
-            n_rot, rope_base, eps);
+            (__half *)pooled->ptr, (const __half *)cache->ptr, w, (const int32_t *)pos->ptr,
+            (const int32_t *)pages->ptr, n_tok, n_rot, rope_base, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp idx pool");
 }
 
@@ -2358,9 +2393,15 @@ extern "C" int ds4_gpu_q4e_idx_q(ds4_gpu_tensor *qn, const ds4_gpu_tensor *q,
  * rows x 64 key blocks with both operands staged as f16. */
 #define Q4E_IDX_QT 16u
 #define Q4E_IDX_BT 64u
+/* A key-block tile covers Q4E_IDX_BT * Q4E_IDX_R positions (today exactly one
+ * page) and tiles start at multiples of that, so a tile's pooled rows sit in
+ * one page, contiguous behind one page-table lookup. */
+static_assert(DS4_Q4E_PAGE_TOKENS % (Q4E_IDX_BT * Q4E_IDX_R) == 0u,
+              "a key-block tile must not straddle a KV page");
 __global__ static void __launch_bounds__(256) q4e_idx_score_kernel(
         float *score, const __half *qn, const __half *pooled, const int32_t *pos,
-        uint32_t n_head, uint32_t n_tok, uint32_t n_blocks_stride, const int32_t *pos_last) {
+        const int32_t *pages, uint32_t n_head, uint32_t n_tok,
+        uint32_t n_blocks_stride, const int32_t *pos_last) {
     /* Complete blocks so far, from the last row's position (device-derived
      * so captured graphs track the growing context); the row stride of
      * `score` is the fixed n_blocks_stride. */
@@ -2376,8 +2417,9 @@ __global__ static void __launch_bounds__(256) q4e_idx_score_kernel(
     for (uint32_t idx = threadIdx.x; idx < n_q * n_head * Q4E_IDX_DIM / 8u; idx += blockDim.x) {
         ((uint4 *)s_q)[idx] = ((const uint4 *)(qn + (uint64_t)t0 * n_head * Q4E_IDX_DIM))[idx];
     }
+    const uint32_t brow = q4e_kv_row(pages, b0 * Q4E_IDX_R) / Q4E_IDX_R;
     for (uint32_t idx = threadIdx.x; idx < n_b * Q4E_IDX_DIM / 8u; idx += blockDim.x) {
-        ((uint4 *)s_k)[idx] = ((const uint4 *)(pooled + (uint64_t)b0 * Q4E_IDX_DIM))[idx];
+        ((uint4 *)s_k)[idx] = ((const uint4 *)(pooled + (uint64_t)brow * Q4E_IDX_DIM))[idx];
     }
     __syncthreads();
     /* 1024 (row, block) pairs over 256 threads: thread owns 4 blocks of one row
@@ -2408,9 +2450,9 @@ __global__ static void __launch_bounds__(256) q4e_idx_score_kernel(
 
 extern "C" int ds4_gpu_q4e_idx_score(ds4_gpu_tensor *score, const ds4_gpu_tensor *qn,
                                      const ds4_gpu_tensor *pooled, const ds4_gpu_tensor *pos,
-                                     const ds4_gpu_tensor *pos_last,
+                                     const ds4_gpu_tensor *pos_last, const ds4_gpu_tensor *pages,
                                      uint32_t n_head, uint32_t n_tok, uint32_t max_blocks) {
-    if (!score || !qn || !pooled || !pos || !pos_last || !n_tok || !max_blocks) return 0;
+    if (!score || !qn || !pooled || !pos || !pos_last || !pages || !n_tok || !max_blocks) return 0;
     const uint32_t n_blocks = max_blocks;
     const size_t smem = ((size_t)Q4E_IDX_QT * n_head + Q4E_IDX_BT) * Q4E_IDX_DIM * sizeof(__half);
     static bool opted = false;
@@ -2422,7 +2464,8 @@ extern "C" int ds4_gpu_q4e_idx_score(ds4_gpu_tensor *score, const ds4_gpu_tensor
     const dim3 grid((n_blocks + Q4E_IDX_BT - 1u) / Q4E_IDX_BT, (n_tok + Q4E_IDX_QT - 1u) / Q4E_IDX_QT, 1);
     q4e_idx_score_kernel<<<grid, 256, smem, cuda_decode_stream()>>>(
             (float *)score->ptr, (const __half *)qn->ptr, (const __half *)pooled->ptr,
-            (const int32_t *)pos->ptr, n_head, n_tok, max_blocks, (const int32_t *)pos_last->ptr);
+            (const int32_t *)pos->ptr, (const int32_t *)pages->ptr, n_head, n_tok, max_blocks,
+            (const int32_t *)pos_last->ptr);
     return cuda_ok(cudaGetLastError(), "qwen4exp idx score");
 }
 
@@ -2556,7 +2599,7 @@ extern "C" int ds4_gpu_q4e_idx_expand(ds4_gpu_tensor *tokens, ds4_gpu_tensor *n_
 __global__ static void __launch_bounds__(256, 2)
 q4e_qsa_attention_gather_kernel(
         float *part, const __half *k_cache, const __half *v_cache, const float *q,
-        const int32_t *tokens, const int32_t *n_sel, uint32_t width,
+        const int32_t *tokens, const int32_t *n_sel, const int32_t *pages, uint32_t width,
         uint32_t n_head, uint32_t n_head_kv, uint32_t n_splits) {
     constexpr uint32_t HD = Q4E_ATTN_SPLIT_HD;
     constexpr uint32_t KT = Q4E_ATTN_KT;
@@ -2604,7 +2647,12 @@ q4e_qsa_attention_gather_kernel(
         __syncthreads();
         for (uint32_t p0 = l_begin; p0 < l_end; p0 += KT) {
             const uint32_t n_k = (l_end - p0 < KT) ? (l_end - p0) : KT;
-            if (tid < KT) s_idx[tid] = tid < n_k ? list[p0 + tid] : 0;
+            /* The token list is arbitrary positions, so translation is per key
+             * -- but it happens once here, in the same staging step that
+             * already reads the list, and the tile then indexes cache rows. */
+            if (tid < KT) {
+                s_idx[tid] = tid < n_k ? (int32_t)q4e_kv_row(pages, (uint32_t)list[p0 + tid]) : 0;
+            }
             __syncthreads();
 #pragma unroll
             for (uint32_t i = 0; i < 4u; i++) {
@@ -2712,9 +2760,10 @@ q4e_qsa_attention_gather_kernel(
 extern "C" int ds4_gpu_q4e_qsa_attention_sparse(
         ds4_gpu_tensor *out, ds4_gpu_tensor *part,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *tokens, const ds4_gpu_tensor *n_sel, uint32_t width,
+        const ds4_gpu_tensor *tokens, const ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *pages,
+        uint32_t width,
         uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok) {
-    if (!out || !part || !k_cache || !v_cache || !q || !tokens || !n_sel || !n_tok) return 0;
+    if (!out || !part || !k_cache || !v_cache || !q || !tokens || !n_sel || !pages || !n_tok) return 0;
     if (head_dim != Q4E_ATTN_SPLIT_HD || n_head_kv == 0u || (n_head % n_head_kv) != 0u ||
         n_head / n_head_kv > Q4E_ATTN_QG) return 0;
     if (part->bytes < (uint64_t)n_tok * n_head * Q4E_ATTN_GSPLITS * Q4E_ATTN_PART_STRIDE * sizeof(float)) return 0;
@@ -2732,7 +2781,7 @@ extern "C" int ds4_gpu_q4e_qsa_attention_sparse(
     q4e_qsa_attention_gather_kernel<<<grid, 256, smem, cuda_decode_stream()>>>(
             (float *)part->ptr, (const __half *)k_cache->ptr, (const __half *)v_cache->ptr,
             (const float *)q->ptr, (const int32_t *)tokens->ptr, (const int32_t *)n_sel->ptr,
-            width, n_head, n_head_kv, Q4E_ATTN_GSPLITS);
+            (const int32_t *)pages->ptr, width, n_head, n_head_kv, Q4E_ATTN_GSPLITS);
     if (!cuda_ok(cudaGetLastError(), "qwen4exp qsa attention gather")) return 0;
     q4e_qsa_attention_combine_kernel<<<n_head * n_tok, Q4E_ATTN_SPLIT_HD, 0, cuda_decode_stream()>>>(
             (float *)out->ptr, (const float *)part->ptr, Q4E_ATTN_GSPLITS);
@@ -2769,10 +2818,10 @@ extern "C" int ds4_gpu_q4e_qsa_store_kv(
         ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
-        const ds4_gpu_tensor *pos,
+        const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages,
         uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base,
-        uint32_t cache_slots, uint32_t n_tok, float eps) {
-    if (!k_cache || !v_cache || !k || !v || !pos || !n_tok) return 0;
+        uint32_t pool_slots, uint32_t n_tok, float eps) {
+    if (!k_cache || !v_cache || !k || !v || !pos || !pages || !n_tok) return 0;
     const float *w = q4e_weight(model_map, model_size, weight_offset,
                                 (uint64_t)head_dim * sizeof(float), k_cache,
                                 "qwen4exp k norm");
@@ -2783,15 +2832,15 @@ extern "C" int ds4_gpu_q4e_qsa_store_kv(
             (__half *)k_cache->ptr, (__half *)v_cache->ptr,
             (const float *)k->ptr, (const float *)v->ptr, w,
             head_dim, n_head_kv, n_rot, rope_base,
-            (const int32_t *)pos->ptr, cache_slots, eps);
+            (const int32_t *)pos->ptr, (const int32_t *)pages->ptr, pool_slots, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp qsa kv store");
 }
 
 extern "C" int ds4_gpu_q4e_qsa_attention(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
-        const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages,
         uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok) {
-    if (!out || !k_cache || !v_cache || !q || !pos || !n_tok) return 0;
+    if (!out || !k_cache || !v_cache || !q || !pos || !pages || !n_tok) return 0;
     if (head_dim > 32u * Q4E_ATTN_LANE_SLOTS) {
         fprintf(stderr, "ds4: qwen4exp attention head_dim %u exceeds %u\n",
                 head_dim, 32u * Q4E_ATTN_LANE_SLOTS);
@@ -2821,7 +2870,8 @@ extern "C" int ds4_gpu_q4e_qsa_attention(
                                          cuda_decode_stream()>>>(
                 (float *)out->ptr, (const __half *)k_cache->ptr,
                 (const __half *)v_cache->ptr, (const float *)q->ptr,
-                head_dim, n_head, n_head_kv, (const int32_t *)pos->ptr, n_tok);
+                head_dim, n_head, n_head_kv, (const int32_t *)pos->ptr,
+                (const int32_t *)pages->ptr, n_tok);
         if (cuda_ok(cudaGetLastError(), "qwen4exp qsa attention tiled")) return 1;
         /* Fall through to the per-query kernel if the launch was rejected. */
     }
@@ -2867,7 +2917,8 @@ extern "C" int ds4_gpu_q4e_qsa_attention(
             q4e_qsa_attention_split_kernel<<<sgrid, 256, smem, cuda_decode_stream()>>>(
                     (float *)out->ptr, part, (const __half *)k_cache->ptr,
                     (const __half *)v_cache->ptr, (const float *)q->ptr,
-                    n_head, n_head_kv, (const int32_t *)pos->ptr, n_tok, Q4E_ATTN_SPLITS);
+                    n_head, n_head_kv, (const int32_t *)pos->ptr,
+                    (const int32_t *)pages->ptr, n_tok, Q4E_ATTN_SPLITS);
             if (!cuda_ok(cudaGetLastError(), "qwen4exp qsa attention split")) return 0;
             q4e_qsa_attention_combine_kernel<<<n_head * n_tok, Q4E_ATTN_SPLIT_HD, 0,
                                                cuda_decode_stream()>>>(
@@ -2882,7 +2933,8 @@ extern "C" int ds4_gpu_q4e_qsa_attention(
                                cuda_decode_stream()>>>(
             (float *)out->ptr, (const __half *)k_cache->ptr,
             (const __half *)v_cache->ptr, (const float *)q->ptr,
-            head_dim, n_head, n_head_kv, (const int32_t *)pos->ptr, n_tok);
+            head_dim, n_head, n_head_kv, (const int32_t *)pos->ptr,
+            (const int32_t *)pages->ptr, n_tok);
     return cuda_ok(cudaGetLastError(), "qwen4exp qsa attention");
 }
 

@@ -132,6 +132,15 @@ void ds4_kvstore_build_prompt_from_exact_prefix_and_text_suffix(
         ds4_tokens *out);
 
 int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens);
+/* The position a client will branch from on its next turn: the end of the
+ * rendered chat scaffolding, i.e. the last user marker before the first
+ * assistant marker.  -1 when the prompt has no such boundary.  The disk
+ * cache's anchor is this gated by its minimum size; recurrent families use
+ * the raw position as a checkpoint hint. */
+int ds4_kvstore_chat_boundary_pos(const ds4_tokens *prompt,
+                                  int user_token_id,
+                                  int assistant_token_id);
+int ds4_kvstore_last_marker_pos(const ds4_tokens *prompt, int token_id);
 int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 const ds4_tokens *prompt,
                                 int user_token_id,
