@@ -38903,6 +38903,7 @@ typedef struct {
  * one GDN checkpoint store, shared by every session (see "qwen4exp prefix
  * cache" beside the qwen4exp session code).  Opaque here. */
 typedef struct q4e_cache q4e_cache;
+typedef struct ds4_q4e_graph ds4_q4e_graph;
 
 struct ds4_engine {
     ds4_model model;
@@ -38941,6 +38942,10 @@ struct ds4_engine {
     bool ssm_checkpoints_set;
     uint32_t exec_contexts;
     q4e_cache *q4e_cache;
+    /* The one prefill/decode scratch every qwen4exp execution context borrows
+     * (q4e_scratch_ensure).  A ds4_q4e_graph used only as the pointer holder;
+     * it never runs a forward. */
+    ds4_q4e_graph *q4e_scratch;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
@@ -55240,9 +55245,18 @@ bool ds4_test_q4e_span_tree(void) {
 #define Q4E_IDX_QB   512u    /* indexer/sparse-attention rows per pass */
 #define Q4E_IDX_WIDTH (2048u + 3u)
 
-/* Scratch and persistent state for one session.  Scratch is sized for the
- * prefill chunk; decode uses the same buffers with n_tok = 1. */
-typedef struct {
+/* Scratch and persistent state for one execution context.  Scratch is sized
+ * for the prefill chunk; decode uses the same buffers with n_tok = 1.
+ *
+ * Everything sized by tok_cap is *borrowed* from the engine's one shared
+ * scratch (q4e_scratch_ensure): the executor hands the model to a single
+ * context at a time -- one prefill chunk or one speculative step -- so two
+ * contexts never touch those buffers at the same instant, and nothing of a
+ * context is left in them across the hand-off.  What a context owns is its
+ * recurrent state, its page table, its pending draft rows and its
+ * per-generation bookkeeping; q4e_graph_free frees exactly that and
+ * q4e_scratch_bind is the list of it. */
+struct ds4_q4e_graph {
     uint32_t ctx_size;
     uint32_t tok_cap;
     uint32_t pos;              /* next position to write */
@@ -55390,12 +55404,15 @@ typedef struct {
     ds4_gpu_tensor *mtp_logits;
     FILE           *mtp_dump_fp;     /* DS4_QWEN4EXP_MTP_DUMP record awaiting its logits */
 
-    /* Target residual rows whose draft-side KV has not been written yet:
-     * rows [pend_row0, pend_row0 + pend_n) of `res`, at positions pend_pos0
-     * onward.  The draft for position p needs the target hidden at p and the
-     * token at p + 1, so the last row waits for the next token. */
+    /* Target residual rows whose draft-side KV has not been written yet: the
+     * first pend_n rows of pend_res, at positions pend_pos0 onward.  The
+     * draft for position p needs the target hidden at p and the token at
+     * p + 1, so the last row always waits for the next token -- across a
+     * hand-off to another execution context, which is why these rows are
+     * staged in this context's own buffer instead of being left in the shared
+     * scratch's `res` (q4e_mtp_pend_set). */
+    ds4_gpu_tensor *pend_res;    /* [1 + spec_k][hc * n_embd] f32 */
     bool     pend_valid;
-    uint32_t pend_row0;
     uint32_t pend_n;
     uint32_t pend_pos0;
 
@@ -55414,7 +55431,7 @@ typedef struct {
     q4e_ngram_memory ngram_mem;
     double   spec_draft_ms;
     double   spec_verify_ms;
-} ds4_q4e_graph;
+};
 
 /* ---------------------------------------------------------------------------
  * qwen4exp prefix cache, part 2: the GDN checkpoint store, and the cache the
@@ -55519,6 +55536,7 @@ struct q4e_cache {
 
 static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes);
 static int q4e_indexer_enabled(void);
+static void q4e_scratch_free(ds4_engine *e);
 
 /* Bytes one pool page occupies across every KV buffer, derived from the
  * geometry rather than restated: DS4_Q4E_PAGE_TOKENS positions of QSA K and V
@@ -55786,12 +55804,15 @@ static void q4e_cache_close(ds4_engine *e) {
  * the shared KV.  Later graphs share it; one sized for a smaller context
  * cannot serve a larger one, because kv_pages is only ceil(ctx/256) wide.
  *
- * `free_bytes` is the device memory left with the model and this graph's own
- * scratch already resident, and `ctx_scratch_bytes` is what that scratch cost
- * -- every other execution context will want the same again, so the budget
- * derivation holds it back.  That is why the caller opens the cache last. */
+ * `free_bytes` is the device memory left with the model, the shared prefill
+ * scratch and this graph's own state already resident, and `ctx_state_bytes`
+ * is what one more execution context costs on top -- only its recurrent
+ * state, its checkpoints and its page table, because the scratch is shared.
+ * That is small enough to hold back for every slot the cap allows instead of
+ * guessing at one, which is what the derivation does.  It is also why the
+ * caller opens the cache last. */
 static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
-                                 uint64_t free_bytes, uint64_t ctx_scratch_bytes) {
+                                 uint64_t free_bytes, uint64_t ctx_state_bytes) {
     if (e->q4e_cache) {
         if (ctx_size > e->q4e_cache->ctx_size) {
             fprintf(stderr, "ds4: the qwen4exp prefix cache was sized for context %u; "
@@ -55831,12 +55852,13 @@ static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
     uint32_t pool_pages = q4e_pages_for(pool_tokens);
 
     /* Derive whatever was not asked for from the memory actually left, holding
-     * back the flat reserve plus one more context's scratch.  One, not
-     * ctx_cap - 1: the cap is a ceiling on how many contexts may register, not
-     * a prediction of how many will, and reserving for seven idle ones leaves
-     * nothing for the cache.  A context that registers beyond that fails its
-     * own scratch allocation cleanly rather than corrupting anything. */
-    const uint64_t reserve = Q4E_MEM_RESERVE + ctx_scratch_bytes;
+     * back the flat reserve plus what the contexts that have not registered
+     * yet will want.  Every slot the cap allows, which A2 could not afford
+     * when a context meant its own 2 GB of scratch as well: at half a
+     * gigabyte of recurrent state apiece the whole ceiling costs less than
+     * one old context did. */
+    const uint64_t reserve = Q4E_MEM_RESERVE +
+                             (uint64_t)(c->ctx_cap - 1u) * ctx_state_bytes;
     const uint64_t avail = free_bytes > reserve ? free_bytes - reserve : 0u;
     /* ds4_gpu_tier_free_vram reports 0 where it cannot measure -- the Metal
      * stub, or a transient driver failure -- and deriving from 0 lands on the
@@ -66257,8 +66279,9 @@ void ds4_engine_close(ds4_engine *e) {
     ds4_expert_profile_close();
 #ifndef DS4_NO_GPU
     /* Before ds4_gpu_cleanup(): the prefix cache holds the shared KV pool and
-     * the checkpoint slots. */
+     * the checkpoint slots, and the scratch the shared prefill buffers. */
     q4e_cache_close(e);
+    q4e_scratch_free(e);
 #endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -66564,32 +66587,19 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
                 (unsigned long long)g->spec_ngram_zero,
                 (unsigned long long)g->spec_ngram_vetoed);
     }
-    /* k_cache/v_cache, the indexer caches and the draft caches are borrowed
-     * from the shared prefix cache; only the engine frees those. */
+    /* Only what this execution context owns.  Everything sized by the prefill
+     * chunk, the PLE reader, the KV pool buffers and the indexer caches belong
+     * to the engine (q4e_scratch_free, q4e_cache_close) and are shared with
+     * every other context. */
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->gdn_conv[il]);
         ds4_gpu_tensor_free(g->gdn_state[il]);
         ds4_gpu_tensor_free(g->gdn_conv_ckpt[il]);
         ds4_gpu_tensor_free(g->gdn_state_ckpt[il]);
     }
-    ds4_gpu_tensor *const flat[] = {
-        g->ple_conv, g->tokens, g->positions, g->embed, g->res, g->xn, g->lora,
-        g->up, g->mixed, g->inject, g->blk_out, g->gdn_qkv, g->gdn_conv_out,
-        g->gdn_z, g->gdn_alpha, g->gdn_betap, g->gdn_decay, g->gdn_beta,
-        g->gdn_attn, g->gdn_gated, g->qsa_qfull, g->qsa_q, g->qsa_gate,
-        g->qsa_k, g->qsa_v, g->qsa_out, g->router, g->moe_ids, g->moe_w,
-        g->moe_gate, g->moe_up, g->moe_mid, g->moe_down, g->sh_gate, g->sh_up,
-        g->sh_mid, g->sh_out, g->sh_logit, g->ple_rows, g->ple_emb, g->ple_k,
-        g->ple_v, g->ple_q, g->ple_gv, g->ple_cv, g->logits,
-        g->ple_conv_ckpt, g->mtp_res, g->mtp_embed, g->mtp_tokens,
-        g->mtp_positions, g->mtp_logits, g->argmax_dev,
-    };
-    for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
-    {
-        ds4_gpu_tensor *idx_flat[] = { g->idx_k, g->idx_q, g->idx_qn, g->idx_score, g->idx_sel,
-                                       g->idx_cnt, g->idx_tokens, g->idx_nsel, g->idx_part };
-        for (size_t i = 0; i < sizeof(idx_flat) / sizeof(idx_flat[0]); i++) ds4_gpu_tensor_free(idx_flat[i]);
-    }
+    ds4_gpu_tensor_free(g->ple_conv);
+    ds4_gpu_tensor_free(g->ple_conv_ckpt);
+    ds4_gpu_tensor_free(g->pend_res);
     ds4_gpu_tensor_free(g->kv_pages);
     if (g->cache) {
         pthread_mutex_lock(&g->cache->mu);
@@ -66598,10 +66608,14 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         pthread_mutex_unlock(&g->cache->mu);
     }
     q4e_page_table_free(&g->kv_table);
-    ds4_ple_stream_close(g->ple_stream);
     free(g->ple_row_ids);
     free(g->ple_row_data);
     free(g->argmax_host);
+    /* Captured decode islands bake in the addresses this context just gave
+     * back, and identity is a pointer (q4e_run_island): a fresh context that
+     * lands on the same page-table address would otherwise replay launches
+     * that write the freed state. */
+    ds4_gpu_decode_graphs_invalidate();
     memset(g, 0, sizeof(*g));
 }
 
@@ -66775,7 +66789,7 @@ static int q4e_cache_resume(ds4_session *s, const ds4_tokens *prompt) {
     int rc = q4e_ckpt_copy(g, k, false);
     if (rc == 0 && k_logits) memcpy(s->logits, k->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     if (rc == 0 && g->mtp_ready && k_pend &&
-        !ds4_gpu_tensor_copy(g->res, 0, k->pend_row, 0,
+        !ds4_gpu_tensor_copy(g->pend_res, 0, k->pend_row, 0,
                              (uint64_t)Q4E_HC_DIM * sizeof(float))) rc = 1;
     pthread_mutex_unlock(&c->mu);
     if (rc != 0) return 1;
@@ -66788,7 +66802,6 @@ static int q4e_cache_resume(ds4_session *s, const ds4_tokens *prompt) {
     g->pend_valid = false;
     if (g->mtp_ready && k_pend) {
         g->pend_valid = true;
-        g->pend_row0 = 0;
         g->pend_n = 1u;
         g->pend_pos0 = k_pend_pos0;
     }
@@ -66849,8 +66862,7 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
         }
         k->pend_valid = false;
         if (g->mtp_ready && g->pend_valid && g->pend_n == 1u &&
-            ds4_gpu_tensor_copy(k->pend_row, 0, g->res,
-                                (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
+            ds4_gpu_tensor_copy(k->pend_row, 0, g->pend_res, 0,
                                 (uint64_t)Q4E_HC_DIM * sizeof(float))) {
             k->pend_valid = true;
             k->pend_pos0 = g->pend_pos0;
@@ -66969,15 +66981,94 @@ static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
     return *dst != NULL;
 }
 
-static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
-    memset(g, 0, sizeof(*g));
+/* ---------------------------------------------------------------------------
+ * The shared prefill/decode scratch (D1).
+ *
+ * Everything sized by the prefill chunk is one allocation for the whole
+ * engine, not one per execution context: 0.5 GB at a 512-row chunk and
+ * 2.0 GB at 2048, against the 0.5 GB of recurrent state a context really
+ * owns.  Sharing it is sound because the server's executor hands the model to
+ * exactly one context at a time -- one prefill chunk, or one speculative step
+ * -- and nothing of a context survives in these buffers across the hand-off.
+ * The one thing that used to, the draft head's pending residual rows, is
+ * staged into the context's own pend_res (q4e_mtp_pend_set).
+ *
+ * The holder is a ds4_q4e_graph that never runs anything, so the sizes and
+ * their reasons stay where they always were and a joining context simply
+ * takes the pointers.  q4e_scratch_bind is the authority on the split: it
+ * copies the whole prototype and then clears what a context owns, so a new
+ * scratch buffer is shared by default and the short list is the reviewable
+ * one.
+ * ------------------------------------------------------------------------ */
+
+/* Device bytes one execution context owns beyond the shared scratch: the
+ * recurrent state and its speculative checkpoints, the two conv windows, the
+ * page table and the staged draft rows.  The cache's budget derivation holds
+ * this back for every context the cap allows -- it can afford to be exact
+ * about it now that the big half is shared.  Host scratch (the PLE row
+ * buffers) is not counted; the flat reserve covers that. */
+static uint64_t q4e_ctx_state_bytes(uint32_t ctx_size, uint32_t spec_k) {
+    const uint64_t f = sizeof(float);
+    const uint64_t conv = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t state = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                           DS4_N_GDN_HEAD_DIM * f;
+    uint32_t gdn = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!ds4_qwen4exp_layer_is_full_attn(il)) gdn++;
+    }
+    return (uint64_t)gdn * (conv + state) * (1u + spec_k) +
+           (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f * (1u + spec_k) +
+           (uint64_t)q4e_pages_for(ctx_size) * sizeof(int32_t) +
+           (uint64_t)(1u + spec_k) * Q4E_HC_DIM * f;
+}
+
+static void q4e_scratch_free(ds4_engine *e) {
+    ds4_q4e_graph *sc = e->q4e_scratch;
+    if (!sc) return;
+    ds4_gpu_tensor *const flat[] = {
+        sc->tokens, sc->positions, sc->embed, sc->res, sc->xn, sc->lora,
+        sc->up, sc->mixed, sc->inject, sc->blk_out, sc->gdn_qkv, sc->gdn_conv_out,
+        sc->gdn_z, sc->gdn_alpha, sc->gdn_betap, sc->gdn_decay, sc->gdn_beta,
+        sc->gdn_attn, sc->gdn_gated, sc->qsa_qfull, sc->qsa_q, sc->qsa_gate,
+        sc->qsa_k, sc->qsa_v, sc->qsa_out, sc->router, sc->moe_ids, sc->moe_w,
+        sc->moe_gate, sc->moe_up, sc->moe_mid, sc->moe_down, sc->sh_gate, sc->sh_up,
+        sc->sh_mid, sc->sh_out, sc->sh_logit, sc->ple_rows, sc->ple_emb, sc->ple_k,
+        sc->ple_v, sc->ple_q, sc->ple_gv, sc->ple_cv, sc->logits, sc->argmax_dev,
+        sc->mtp_res, sc->mtp_embed, sc->mtp_tokens, sc->mtp_positions, sc->mtp_logits,
+        sc->idx_k, sc->idx_q, sc->idx_qn, sc->idx_score, sc->idx_sel,
+        sc->idx_cnt, sc->idx_tokens, sc->idx_nsel, sc->idx_part,
+    };
+    for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
+    ds4_ple_stream_close(sc->ple_stream);
+    free(sc);
+    e->q4e_scratch = NULL;
+}
+
+/* Allocate the engine's scratch on the first execution context.  Later
+ * contexts share it; one sized for a smaller context or a narrower chunk
+ * cannot serve a larger one, the same rule the page pool follows. */
+static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
+    if (e->q4e_scratch) {
+        if (ctx_size > e->q4e_scratch->ctx_size) {
+            fprintf(stderr, "ds4: the qwen4exp prefill scratch was sized for context %u; "
+                            "a session of %u cannot share it\n",
+                    e->q4e_scratch->ctx_size, ctx_size);
+            return 1;
+        }
+        return 0;
+    }
+    ds4_q4e_graph *g = xcalloc(1, sizeof(*g));
     g->ctx_size = ctx_size;
     /* The chunk sizes every scratch buffer below.  It wants to be large: the
      * dense projections re-read their weights once per chunk, so halving the
      * chunk count halves that traffic, and with 512 experts a chunk of a few
      * hundred tokens already touches every one of them.  The ceiling is
      * memory -- the routed intermediates are tok_cap * n_used wide, and at
-     * 2048 they come to roughly 700 MiB. */
+     * 2048 they come to roughly 700 MiB.
+     *
+     * ds4-server lowers it (--prefill-chunk) when it runs more than one
+     * execution context: the chunk is also the executor's hand-off quantum,
+     * so a decoding stream waits at most one chunk for the model. */
     g->tok_cap = e->prefill_chunk ? e->prefill_chunk : 2048u;
     {
         /* The routed GEMMs are the reason to tune this: a chunk spreads
@@ -66990,7 +67081,10 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
          * ranks tenth out of 512 when two are near-tied.  Downstream MoE
          * activations then differ by ~1%.  That is inherent to top-k routing,
          * not a defect: the drift against llama.cpp is 0.3% at every chunk
-         * width tested.  Do not treat a chunk-dependent logit as a bug. */
+         * width tested.  Do not treat a chunk-dependent logit as a bug.  It is
+         * also why the executor's quantum is the chunk width rather than a
+         * limit on top of it: the answer must not depend on whether a request
+         * happened to share the model. */
         const char *env = getenv("DS4_QWEN4EXP_PREFILL_CHUNK");
         if (env && env[0]) {
             const long v = strtol(env, NULL, 10);
@@ -67009,6 +67103,7 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
 
     const uint32_t T = g->tok_cap;
     const uint64_t f = sizeof(float);
+    const uint64_t free_before = ds4_gpu_tier_free_vram(0);
     bool ok = true;
 
     /* With an MTP head the verify pass runs 1 + K tokens and needs a logit
@@ -67022,30 +67117,10 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     }
     if (g->spec_k > Q4E_SPEC_MAX_DRAFT) g->spec_k = Q4E_SPEC_MAX_DRAFT;
     g->logit_rows = 1u + g->spec_k;
-    const uint64_t gdn_conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
-    const uint64_t gdn_state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
-                                     DS4_N_GDN_HEAD_DIM * f;
-
-    /* Everything below is this context's own.  The shared prefix cache is
-     * opened after it (see the block near the end of this function) so that
-     * the memory its budget derivation sees is what is really left -- the
-     * scratch here is the larger part of a context's footprint. */
-    const uint64_t free_before_scratch = ds4_gpu_tier_free_vram(0);
-    /* One sequence cannot own more logical pages than its context. */
-    ok = q4e_alloc(&g->kv_pages, (uint64_t)q4e_pages_for(ctx_size) * sizeof(int32_t));
-    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
-        if (ds4_qwen4exp_layer_is_full_attn(il)) continue;   /* KV is borrowed */
-        ok = q4e_alloc(&g->gdn_conv[il], gdn_conv_bytes) &&
-             q4e_alloc(&g->gdn_state[il], gdn_state_bytes);
-        if (ok && g->spec_k) {
-            ok = q4e_alloc(&g->gdn_conv_ckpt[il], g->spec_k * gdn_conv_bytes) &&
-                 q4e_alloc(&g->gdn_state_ckpt[il], g->spec_k * gdn_state_bytes);
-        }
-    }
+    g->mtp_ready = mtp;      /* the scratch's copy: what it allocated for */
 
     const uint32_t row_bytes = (DS4_N_PLE_HEAD_DIM / 32u) * 18u;
     ok = ok
-      && q4e_alloc(&g->ple_conv, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f)
       && q4e_alloc(&g->tokens, (uint64_t)T * sizeof(int32_t))
       && q4e_alloc(&g->positions, (uint64_t)T * sizeof(int32_t))
       && q4e_alloc(&g->embed, (uint64_t)T * DS4_N_EMBD * f)
@@ -67094,31 +67169,23 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
        * speculative verify -- so the head runs on those rows and the buffer is
        * that wide.  At 248320 logits a per-token buffer would be gigabytes of
        * scratch for nothing. */
-      && q4e_alloc(&g->logits, (uint64_t)g->logit_rows * DS4_N_VOCAB * f);
+      && q4e_alloc(&g->logits, (uint64_t)g->logit_rows * DS4_N_VOCAB * f)
+      && q4e_alloc(&g->argmax_dev, (uint64_t)(g->logit_rows + 1u) * sizeof(int32_t));
 
-    if (ok && g->spec_k) {
-        ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
-    }
     if (ok && q4e_indexer_enabled()) {
         const uint32_t max_blocks = ctx_size / 4u + 1u;
         g->idx_max_blocks = max_blocks;
         const uint32_t qb = T < Q4E_IDX_QB ? T : Q4E_IDX_QB;
-        if (ok) {
-            ok = q4e_alloc(&g->idx_k, (uint64_t)T * 128u * f) &&
-                 q4e_alloc(&g->idx_q, (uint64_t)T * DS4_N_INDEXER_HEAD * 128u * f) &&
-                 q4e_alloc(&g->idx_qn, (uint64_t)T * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t)) &&
-                 q4e_alloc(&g->idx_score, (uint64_t)qb * max_blocks * f) &&
-                 q4e_alloc(&g->idx_sel, (uint64_t)qb * (DS4_N_INDEXER_TOP_K / 4u) * sizeof(int32_t)) &&
-                 q4e_alloc(&g->idx_cnt, (uint64_t)qb * sizeof(int32_t)) &&
-                 q4e_alloc(&g->idx_tokens, (uint64_t)qb * Q4E_IDX_WIDTH * sizeof(int32_t)) &&
-                 q4e_alloc(&g->idx_nsel, (uint64_t)qb * sizeof(int32_t)) &&
-                 q4e_alloc(&g->idx_part, (uint64_t)qb * DS4_N_HEAD * 8u * 264u * f);
-        }
+        ok = q4e_alloc(&g->idx_k, (uint64_t)T * 128u * f) &&
+             q4e_alloc(&g->idx_q, (uint64_t)T * DS4_N_INDEXER_HEAD * 128u * f) &&
+             q4e_alloc(&g->idx_qn, (uint64_t)T * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t)) &&
+             q4e_alloc(&g->idx_score, (uint64_t)qb * max_blocks * f) &&
+             q4e_alloc(&g->idx_sel, (uint64_t)qb * (DS4_N_INDEXER_TOP_K / 4u) * sizeof(int32_t)) &&
+             q4e_alloc(&g->idx_cnt, (uint64_t)qb * sizeof(int32_t)) &&
+             q4e_alloc(&g->idx_tokens, (uint64_t)qb * Q4E_IDX_WIDTH * sizeof(int32_t)) &&
+             q4e_alloc(&g->idx_nsel, (uint64_t)qb * sizeof(int32_t)) &&
+             q4e_alloc(&g->idx_part, (uint64_t)qb * DS4_N_HEAD * 8u * 264u * f);
         g->idx_ready = ok;
-    }
-    if (ok) {
-        ok = q4e_alloc(&g->argmax_dev, (uint64_t)(g->logit_rows + 1u) * sizeof(int32_t));
-        if (ok) g->argmax_host = xmalloc((size_t)(g->logit_rows + 1u) * sizeof(int32_t));
     }
     if (ok && mtp) {
         ok = q4e_alloc(&g->mtp_res, (uint64_t)T * Q4E_HC_DIM * f)
@@ -67127,7 +67194,143 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
           && q4e_alloc(&g->mtp_positions, (uint64_t)T * sizeof(int32_t))
           && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
     }
+    if (!ok) {
+        e->q4e_scratch = g;
+        q4e_scratch_free(e);
+        return 1;
+    }
 
+    /* The PLE table is read straight from the shard that holds it, never
+     * through the joined mapping: the reader wants a file descriptor.  One
+     * reader for the whole engine -- it is a read-only row cache with its own
+     * mutex and worker threads, and a second copy would halve the hit rate
+     * for 512 MiB. */
+    uint64_t file_offset = 0;
+    const uint32_t shard = model_shard_of(&e->model, e->weights.ple_table->abs_offset,
+                                          &file_offset);
+    ds4_ple_params params;
+    qwen4exp_ple_params(&params);
+    char err[256] = {0};
+    if (ds4_ple_stream_open(&g->ple_stream, &params, e->model.shard_fd[shard], file_offset,
+                            e->weights.ple_table->dim[1], e->ple_cache_bytes,
+                            err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: cannot open the qwen4exp PLE reader: %s\n", err);
+        e->q4e_scratch = g;
+        q4e_scratch_free(e);
+        return 1;
+    }
+    e->q4e_scratch = g;
+    const uint64_t free_after = ds4_gpu_tier_free_vram(0);
+    fprintf(stderr, "ds4: qwen4exp shared prefill scratch: %u-row chunk, %.2f GB, "
+                    "borrowed by every execution context; %.2f GB per context "
+                    "for its own recurrent state\n",
+            T, free_before > free_after ? (double)(free_before - free_after) / 1e9 : 0.0,
+            (double)q4e_ctx_state_bytes(ctx_size, g->spec_k) / 1e9);
+    return 0;
+}
+
+/* Join an execution context to the shared scratch: take the whole prototype,
+ * then clear what a context owns for itself.  Written this way round on
+ * purpose -- a scratch buffer added above is shared without a second edit,
+ * and the list here is the short one a reviewer can check. */
+static void q4e_scratch_bind(ds4_q4e_graph *g, const ds4_q4e_graph *sc) {
+    *g = *sc;
+    /* Recurrent state and its speculative checkpoints. */
+    memset(g->gdn_conv, 0, sizeof(g->gdn_conv));
+    memset(g->gdn_state, 0, sizeof(g->gdn_state));
+    memset(g->gdn_conv_ckpt, 0, sizeof(g->gdn_conv_ckpt));
+    memset(g->gdn_state_ckpt, 0, sizeof(g->gdn_state_ckpt));
+    g->ple_conv = NULL;
+    g->ple_conv_ckpt = NULL;
+    /* The paged KV: borrowed from the cache, per-context table, own pages. */
+    memset(g->k_cache, 0, sizeof(g->k_cache));
+    memset(g->v_cache, 0, sizeof(g->v_cache));
+    memset(g->idx_k_cache, 0, sizeof(g->idx_k_cache));
+    memset(g->idx_pooled, 0, sizeof(g->idx_pooled));
+    g->mtp_k_cache = NULL;
+    g->mtp_v_cache = NULL;
+    g->mtp_ready = false;               /* set once the KV is borrowed */
+    g->kv_pages = NULL;
+    memset(&g->kv_table, 0, sizeof(g->kv_table));
+    g->cache = NULL;
+    g->pool_slots = 0;
+    g->node = NULL;
+    g->matched_end = 0;
+    memset(g->hint_pos, 0, sizeof(g->hint_pos));
+    g->n_hints = 0;
+    g->ctx_slot = -1;
+    /* Per-request and per-generation state, host scratch, counters. */
+    g->pos = 0;
+    g->ready = false;
+    g->qsa_sparse = false;
+    g->is_draft = false;
+    g->pend_res = NULL;
+    g->pend_valid = false;
+    g->pend_n = 0;
+    g->pend_pos0 = 0;
+    g->argmax_host = NULL;
+    g->ple_row_ids = NULL;
+    g->ple_row_data = NULL;
+    g->mtp_dump_fp = NULL;
+    g->spec_steps = 0;
+    g->spec_drafted = 0;
+    g->spec_accepted = 0;
+    g->spec_ngram_steps = 0;
+    g->spec_ngram_drafted = 0;
+    g->spec_ngram_accepted = 0;
+    g->spec_ngram_zero = 0;
+    g->spec_ngram_vetoed = 0;
+    g->ngram_gen_start = 0;
+    memset(&g->ngram_mem, 0, sizeof(g->ngram_mem));
+    g->spec_draft_ms = 0.0;
+    g->spec_verify_ms = 0.0;
+}
+
+static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
+    memset(g, 0, sizeof(*g));
+    /* The shared scratch comes first: it settles tok_cap, spec_k and
+     * logit_rows, and this context's own buffers are sized from them.  The
+     * free-memory reading brackets it so the cache below sees what a fully
+     * resident first context really left. */
+    if (q4e_scratch_ensure(e, ctx_size) != 0) return 1;
+    q4e_scratch_bind(g, e->q4e_scratch);
+    g->ctx_size = ctx_size;
+
+    const uint32_t T = g->tok_cap;
+    const uint64_t f = sizeof(float);
+    const bool mtp = e->q4e_scratch->mtp_ready;
+    bool ok = true;
+    const uint64_t gdn_conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t gdn_state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                     DS4_N_GDN_HEAD_DIM * f;
+
+    /* Everything below is this context's own.  One sequence cannot own more
+     * logical pages than its context. */
+    ok = q4e_alloc(&g->kv_pages, (uint64_t)q4e_pages_for(ctx_size) * sizeof(int32_t));
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (ds4_qwen4exp_layer_is_full_attn(il)) continue;   /* KV is borrowed */
+        ok = q4e_alloc(&g->gdn_conv[il], gdn_conv_bytes) &&
+             q4e_alloc(&g->gdn_state[il], gdn_state_bytes);
+        if (ok && g->spec_k) {
+            ok = q4e_alloc(&g->gdn_conv_ckpt[il], g->spec_k * gdn_conv_bytes) &&
+                 q4e_alloc(&g->gdn_state_ckpt[il], g->spec_k * gdn_state_bytes);
+        }
+    }
+    ok = ok && q4e_alloc(&g->ple_conv, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f);
+    if (ok && g->spec_k) {
+        ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
+    }
+    if (ok && mtp) {
+        /* The staged pending draft rows: at most the 1 + K rows one verify
+         * pass commits. */
+        ok = q4e_alloc(&g->pend_res, (uint64_t)(1u + g->spec_k) * Q4E_HC_DIM * f);
+    }
+    if (ok) {
+        g->argmax_host = xmalloc((size_t)(g->logit_rows + 1u) * sizeof(int32_t));
+        g->ple_row_ids = xmalloc((size_t)T * DS4_N_PLE_HEAD * sizeof(uint64_t));
+        g->ple_row_data = xmalloc((size_t)T * DS4_N_PLE_HEAD *
+                                  (size_t)((DS4_N_PLE_HEAD_DIM / 32u) * 18u));
+    }
     if (!ok) {
         q4e_graph_free(g);
         return 1;
@@ -67138,12 +67341,13 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
      * rows in every context that reads them) and keeps its own page table,
      * live GDN state and per-generation state.  The cache is opened by
      * whichever graph gets there first, and it sizes its budgets from the
-     * memory left now that this context's scratch is resident. */
+     * memory left now that the shared scratch and this context are resident.
+     * A later context costs only q4e_ctx_state_bytes, which the derivation
+     * holds back for every slot the cap allows. */
     {
         const uint64_t free_now = ds4_gpu_tier_free_vram(0);
-        const uint64_t scratch = free_before_scratch > free_now
-                               ? free_before_scratch - free_now : 0u;
-        q4e_cache *cache = q4e_cache_open(e, ctx_size, mtp, free_now, scratch);
+        q4e_cache *cache = q4e_cache_open(e, ctx_size, mtp, free_now,
+                                          q4e_ctx_state_bytes(ctx_size, g->spec_k));
         if (!cache) {
             q4e_graph_free(g);
             return 1;
@@ -67171,24 +67375,6 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
             g->mtp_ready = g->mtp_k_cache != NULL;
         }
     }
-
-    /* The PLE table is read straight from the shard that holds it, never
-     * through the joined mapping: the reader wants a file descriptor. */
-    uint64_t file_offset = 0;
-    const uint32_t shard = model_shard_of(&e->model, e->weights.ple_table->abs_offset,
-                                          &file_offset);
-    ds4_ple_params params;
-    qwen4exp_ple_params(&params);
-    char err[256] = {0};
-    if (ds4_ple_stream_open(&g->ple_stream, &params, e->model.shard_fd[shard], file_offset,
-                            e->weights.ple_table->dim[1], e->ple_cache_bytes,
-                            err, sizeof(err)) != 0) {
-        fprintf(stderr, "ds4: cannot open the qwen4exp PLE reader: %s\n", err);
-        q4e_graph_free(g);
-        return 1;
-    }
-    g->ple_row_ids = xmalloc((size_t)T * DS4_N_PLE_HEAD * sizeof(uint64_t));
-    g->ple_row_data = xmalloc((size_t)T * DS4_N_PLE_HEAD * row_bytes);
 
     /* Recurrent state starts at zero and the conv windows start empty. */
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -67650,14 +67836,20 @@ static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
     /* The launch sequence bakes the row count in, so a speculative verify at
      * 1 + K tokens and a one-token decode are different captures. */
     key.variant = n_tok + (g->qsa_sparse ? 64u : 0u);
-    /* Identity is the buffer set the island writes through; a session that
-     * reallocates its graph gets a different key and a fresh capture.  The
-     * MTP draft shares every scratch buffer but has its own residual, which
-     * is what keeps its captures apart from the target's. */
+    /* Identity is the buffer set the island writes through -- but with the
+     * shared prefill scratch those buffers are the same in every execution
+     * context, so one slot has to name something a context owns alone or
+     * context B would replay launches that write context A's recurrent state.
+     * kv_pages is that: the page table every KV store and every attention read
+     * goes through, allocated in the same block as the GDN state, and a
+     * captured launch bakes its address in like any other.  (`xn`, which it
+     * replaces, was shared and told the entries apart from nothing.)  The MTP
+     * draft shares every scratch buffer but has its own residual, which is
+     * what keeps its captures apart from the target's. */
     key.cur_hc = (void *)g->res;
     key.after_attn_hc = (void *)g->blk_out;
     key.after_ffn_hc = (void *)g->mixed;
-    key.attn_norm = (void *)g->xn;
+    key.attn_norm = (void *)g->kv_pages;
 
     for (;;) {
         const int state = ds4_gpu_decode_graph_begin(&key);
@@ -67984,53 +68176,76 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     return 0;
 }
 
-/* Write the draft KV for the pending target rows.  history supplies the
- * token after each row; `last_token` overrides it for the final row, which
- * is how the freshly sampled token gets in before it is part of history.
+/* Write the draft KV for `n` target residual rows starting at row `row0` of
+ * `src`, which stand at positions [pos0, pos0 + n).  history supplies the
+ * token after each row; `last_token` overrides it for the final row, which is
+ * how the freshly sampled token gets in before it is part of history.
  * Returns the draft's greedy pick for the row after the last one in
  * out_argmax when asked. */
-static int q4e_mtp_flush_pending(ds4_session *s, const int *history, int last_token,
-                                 int *out_argmax) {
-    ds4_q4e_graph *g = &s->q4e_graph;
-    if (!g->mtp_ready || !g->pend_valid) return 0;
-    const uint32_t n = g->pend_n;
+static int q4e_mtp_draft_rows(ds4_session *s, const ds4_gpu_tensor *src,
+                              uint32_t row0, uint32_t n, uint32_t pos0,
+                              const int *history, int last_token,
+                              int *out_argmax) {
     int32_t *tok = xmalloc((size_t)n * sizeof(int32_t));
     int32_t *pos = xmalloc((size_t)n * sizeof(int32_t));
     for (uint32_t i = 0; i < n; i++) {
-        pos[i] = (int32_t)(g->pend_pos0 + i);
-        tok[i] = (i + 1u < n || last_token < 0) ? history[g->pend_pos0 + i + 1u] : last_token;
+        pos[i] = (int32_t)(pos0 + i);
+        tok[i] = (i + 1u < n || last_token < 0) ? history[pos0 + i + 1u] : last_token;
     }
     ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
-            g->res, (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
+            src, (uint64_t)row0 * Q4E_HC_DIM * sizeof(float),
             (uint64_t)n * Q4E_HC_DIM * sizeof(float));
     int rc = 1;
     if (hidden) rc = q4e_mtp_draft(s, hidden, tok, pos, n, out_argmax);
     ds4_gpu_tensor_free(hidden);
     free(tok);
     free(pos);
+    return rc;
+}
+
+/* Stage `n` rows starting at row `row0` of `src` as this context's pending
+ * draft rows.  They are copied out of the shared scratch because the next
+ * thing to write `src` may be another execution context's chunk: the draft
+ * for the last committed row cannot be written until the next token arrives,
+ * and that arrives after the hand-off. */
+static int q4e_mtp_pend_set(ds4_q4e_graph *g, const ds4_gpu_tensor *src,
+                            uint32_t row0, uint32_t n, uint32_t pos0) {
+    g->pend_valid = false;
+    if (!g->mtp_ready || !g->pend_res || n == 0u || n > 1u + g->spec_k) return 1;
+    const uint64_t row = (uint64_t)Q4E_HC_DIM * sizeof(float);
+    if (!ds4_gpu_tensor_copy(g->pend_res, 0, src, (uint64_t)row0 * row, (uint64_t)n * row))
+        return 1;
+    g->pend_valid = true;
+    g->pend_n = n;
+    g->pend_pos0 = pos0;
+    return 0;
+}
+
+/* Write the draft KV for the staged pending rows. */
+static int q4e_mtp_flush_pending(ds4_session *s, const int *history, int last_token,
+                                 int *out_argmax) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (!g->mtp_ready || !g->pend_valid) return 0;
+    const int rc = q4e_mtp_draft_rows(s, g->pend_res, 0u, g->pend_n, g->pend_pos0,
+                                      history, last_token, out_argmax);
     g->pend_valid = false;
     return rc;
 }
 
 /* After a target chunk at [pos0, pos0 + n_tok) whose next tokens are known
- * from history, draft every row but the last and leave that one pending. */
+ * from history, draft every row but the last and stage that one. */
 static int q4e_mtp_after_prefill_chunk(ds4_session *s, const int *history,
                                        uint32_t pos0, uint32_t n_tok) {
     ds4_q4e_graph *g = &s->q4e_graph;
     if (!g->mtp_ready) return 0;
-    g->pend_valid = true;
-    g->pend_row0 = 0;
-    g->pend_n = n_tok;
-    g->pend_pos0 = pos0;
-    if (n_tok >= 2u) {
-        g->pend_n = n_tok - 1u;
-        if (q4e_mtp_flush_pending(s, history, -1, NULL) != 0) return 1;
-        g->pend_valid = true;
-        g->pend_row0 = n_tok - 1u;
-        g->pend_n = 1u;
-        g->pend_pos0 = pos0 + n_tok - 1u;
+    /* Every row but the last has the token after it in history already, so it
+     * is drafted straight out of the chunk's residual, however wide the chunk
+     * is.  Only the last row has to wait, and only it is staged. */
+    if (n_tok >= 2u &&
+        q4e_mtp_draft_rows(s, g->res, 0u, n_tok - 1u, pos0, history, -1, NULL) != 0) {
+        return 1;
     }
-    return 0;
+    return q4e_mtp_pend_set(g, g->res, n_tok - 1u, 1u, pos0 + n_tok - 1u);
 }
 
 /* Restore the recurrent state as it stood after row `keep` of the last
@@ -68248,13 +68463,13 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         return -1;
     }
 
-    /* The committed rows' residuals wait in g->res for the next step, whose
-     * sampled token completes the last one. */
-    if (g->mtp_ready) {
-        g->pend_valid = true;
-        g->pend_row0 = 0;
-        g->pend_n = 1u + a;
-        g->pend_pos0 = pos0;
+    /* The committed rows' residuals wait for the next step, whose sampled
+     * token completes the last one -- and the shared scratch they are in is
+     * the next context's to use, so they are staged aside now. */
+    if (g->mtp_ready && q4e_mtp_pend_set(g, g->res, 0u, 1u + a, pos0) != 0) {
+        if (errlen) snprintf(err, errlen, "qwen4exp draft row staging failed");
+        ds4_session_invalidate(s);
+        return -1;
     }
 
     accepted[0] = first_token;
