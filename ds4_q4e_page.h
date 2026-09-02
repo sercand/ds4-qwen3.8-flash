@@ -20,9 +20,12 @@
  * sequence's frontier has moved past them, so rows a kernel is reading never
  * move under it.
  *
- * This header is macros only: it is included both from C (ds4_gpu.h, and so
- * ds4.c) and from ds4_cuda.cu, which by project convention does not include
- * ds4_gpu.h.
+ * This header is macros only.  ds4.c includes it directly and outside its
+ * DS4_NO_GPU guard, because the page pool and the span tree are host-side
+ * bookkeeping that a CPU build compiles and ds4_test exercises;
+ * ds4_qwen4exp_gpu.cuh includes it for the kernels.  ds4_gpu.h deliberately
+ * does not, so the geometry does not reach the dozen translation units that
+ * only want the tensor API.
  */
 #ifndef DS4_Q4E_PAGE_H
 #define DS4_Q4E_PAGE_H

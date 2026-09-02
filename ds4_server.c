@@ -9730,14 +9730,22 @@ struct server {
     int cache_log_every;
 };
 
-/* Short, unscheduled engine calls: the prompt-prefix probes, the reuse
- * report, a rewind or a rewrite, the disk store, the sequence-end checkpoint
- * commit, the /cache report.  Each is microseconds of host work or one device
- * copy, so they get no turn in the executor's round -- but the executor has
- * to know one is waiting, because the prefilling context re-acquires
- * inference_mu the instant it releases it and would win that race every time.
- * It did: a short chat's reuse report waited 49 s behind a 21.7k prefill, and
- * the prefill quantum was doing exactly what it was told.
+/* Unscheduled engine calls: the prompt-prefix probes, the reuse report, a
+ * rewind or a rewrite, the disk store's staging and the disk load, the
+ * sequence-end checkpoint commit, the /cache report.  They get no turn in the
+ * executor's round -- but the executor has to know one is waiting, because the
+ * prefilling context re-acquires inference_mu the instant it releases it and
+ * would win that race every time.  It did: a short chat's reuse report waited
+ * 49 s behind a 21.7k prefill, and the prefill quantum was doing exactly what
+ * it was told.
+ *
+ * Most of them are microseconds of host work or one device copy.  Two are not:
+ * the qwen4exp disk store's staging holds inference_mu for about 0.3 s and its
+ * load for about 0.4 s at a 22k path, because both move ~768 MB between the
+ * shared KV buffers and host memory.  That is comparable to one contended
+ * prefill quantum, so a peer's decode waits about as long as it would for the
+ * prefiller's own turn -- but it is not microseconds, and making either of
+ * them yield mid-transfer is a task of its own.
  *
  * So the counter, not a turn: a prefill quantum will not start while it is
  * non-zero (server_model_enter_prefill).  A decode step does not check it --
@@ -10774,6 +10782,27 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+/* The position a *different* conversation sharing this prompt's scaffolding
+ * would branch from, which is where a cold disk checkpoint is worth most.
+ *
+ * ds4_kvstore_chat_boundary_pos is the general answer -- the last user marker
+ * before the first assistant marker -- but it needs the two markers to be
+ * distinct tokens.  A template whose every turn starts with the same one
+ * (qwen4exp: user_id == assistant_id == <|im_start|>) makes its assistant test
+ * match the very first marker, so it returns -1 for every prompt and no cold
+ * anchor has ever been reachable for that family.  For that shape the same
+ * position is the start of the last turn before the generation header, i.e.
+ * the second-to-last marker. */
+static int kv_cache_cold_anchor_pos(server *s, const ds4_tokens *prompt) {
+    const int user = ds4_token_user(s->engine);
+    const int assistant = ds4_token_assistant(s->engine);
+    if (user != assistant) {
+        return kv_cache_chat_anchor_pos(&s->kv, prompt, user, assistant);
+    }
+    const int pos = ds4_kvstore_prev_marker_pos(prompt, assistant);
+    return pos >= s->kv.opt.min_tokens ? pos : -1;
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                             const ds4_tokens *tokens,
                                             int store_len, const char *reason,
@@ -10800,8 +10829,17 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
      * there already, which for this family is the shutdown store of a path a
      * previous run wrote. */
     ds4_session_payload_file staged = {0};
+    bool wrote_file = false;
     const bool stage_first = ds4_engine_stages_session_payload(s->engine);
     if (stage_first) {
+        /* The store insists the live frontier is exactly the prefix being
+         * stored, and only the whole live path can be serialized anyway.  Ask
+         * first: a mismatch here is a skip, not a wasted 768 MB stage. */
+        const ds4_tokens *live = ds4_session_tokens(slot->session);
+        if (!s->kv.enabled || !tokens || !live || live->len != store_len ||
+            store_len < s->kv.opt.min_tokens) {
+            return false;
+        }
         const double stage_t0 = now_sec();
         server_inference_lock(s);
         const int rc = ds4_session_stage_payload(slot->session, &staged,
@@ -10833,15 +10871,16 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_ext,
                                                   cache_text_key,
                                                   stage_first ? &staged : NULL,
+                                                  &wrote_file,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
     if (!stage_first) server_inference_unlock(s);
-    const uint64_t staged_bytes = staged.bytes;
     ds4_session_payload_file_free(&staged);
-    /* Only the staging path can say a file was really written rather than
-     * found already compatible; the families that do not stage do not report
-     * a reuse tier either. */
-    if (ok && staged_bytes != 0) {
+    /* Only bytes that reached the disk.  A store that found a compatible file
+     * already there returns true without writing -- the shutdown store of a
+     * path a previous run wrote is exactly that -- and counting it would make
+     * `writes` a count of store *calls*. */
+    if (wrote_file) {
         pthread_mutex_lock(&s->mu);
         s->cache_disk_writes++;
         pthread_mutex_unlock(&s->mu);
@@ -13196,7 +13235,6 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
              * tree, so the sync that follows is a live extension. */
             reuse.source = DS4_REUSE_DISK;
             reuse.reused_tokens = disk_cached;
-            reuse.matched_tokens = disk_cached;
             pthread_mutex_lock(&s->mu);
             s->cache_disk_hits++;
             pthread_mutex_unlock(&s->mu);
@@ -13316,22 +13354,31 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
+        const int anchor = kv_cache_cold_anchor_pos(s, prompt_for_sync);
         cold_store_len = anchor >= s->kv.opt.min_tokens ?
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
-        if (ds4_engine_shares_prefix_cache(s->engine)) {
-            /* The trimmed, 2048-aligned anchor exists so a *different* next
-             * prompt still matches the stored prefix.  A family with a prefix
-             * cache does not need it: after a restart the position that
-             * matters is the prompt's own end, which makes an exact re-send
-             * prefill nothing -- and a follow-up turn's rendered prompt has
-             * this prompt's bytes as a prefix anyway, so it hits the same
-             * file.  It also halves the writes: the anchor and the prompt end
-             * would be two several-hundred-megabyte files for one request. */
-            cold_store_len = prompt_for_sync->len;
+        if (ds4_engine_shares_prefix_cache(s->engine) &&
+            anchor < s->kv.opt.min_tokens) {
+            /* Two positions are worth a file after a restart, and they are not
+             * the same one.  The chat anchor -- everything before the user turn
+             * that asks the task -- is what a *different* conversation sharing
+             * this system prompt matches, so it is kept exactly as it is for
+             * every other family.  The prompt's own end is what an exact
+             * re-send resumes at, and it is stored separately below.
+             *
+             * What a family with a prefix cache does not need is the fallback
+             * when there is no anchor: a guess at a stable position, the prompt
+             * trimmed by 32 and rounded down to 2048.  The prompt end covers
+             * everything that guess would have, and it costs one file instead
+             * of two several-hundred-megabyte ones. */
+            cold_store_len = 0;
         }
+        /* Where the two cold positions landed, once per cold request.  Which
+         * one a store used is otherwise only inferable from the tokens= in the
+         * store line, and an anchor below --kv-cache-min-tokens is invisible. */
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cache cold positions prompt=%d anchor=%d store=%d",
+                   prompt_for_sync->len, anchor, cold_store_len);
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -13435,6 +13482,26 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         } else {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
+        }
+    } else if (!multimodal && s->kv.enabled && cached == 0 &&
+               ds4_engine_shares_prefix_cache(s->engine) &&
+               prompt_for_sync->len >= s->kv.opt.min_tokens &&
+               s->kv.opt.cold_max_tokens > 0 &&
+               prompt_for_sync->len <= s->kv.opt.cold_max_tokens) {
+        /* The prompt's own end, beside whatever the anchor above stored.  This
+         * is the in-memory admission rule 1 on disk: it is the position an
+         * exact re-send resumes at (prefilling nothing), and any later prompt
+         * that extends this one still has its bytes as a prefix, so it is the
+         * deepest entry the byte-prefix lookup can return.  The anchor is the
+         * shallower one a *different* conversation matches; a cold request
+         * whose prompt has both pays two payloads. */
+        /* "cold", not a reason of its own: kv_cache_reason_is_anchor prices a
+         * cold entry as one a later prompt can branch from, which this is the
+         * best example of, and the log line's tokens= already says which of
+         * the two stores it was. */
+        if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
+                                       prompt_for_sync->len, "cold")) {
+            kv_cache_slot_note_store(slot, prompt_for_sync->len);
         }
     }
     const uint64_t response_seq = server_next_sequence(s);
@@ -19987,7 +20054,17 @@ static void test_request_reuse_label_names_engine_source(void) {
     request_reuse_label(label, sizeof(label), &live, "memory-token", 27);
     TEST_ASSERT(!strcmp(label, "live@27"));
 
-    /* A server-side matcher supplied the prefix: name the matcher. */
+    /* The disk tier: the server's own, but reported like a tier -- it names
+     * the position, not the matcher, and it does not use matched_tokens (only
+     * a tree hit's label does, and a disk load has no p_kv of its own). */
+    ds4_session_reuse disk = {
+        .source = DS4_REUSE_DISK, .reused_tokens = 22293, .prefilled_tokens = 0,
+    };
+    request_reuse_label(label, sizeof(label), &disk, "disk-text", 22293);
+    TEST_ASSERT(!strcmp(label, "disk@22293"));
+
+    /* A server-side matcher supplied the prefix without the engine reporting
+     * a tier: name the matcher. */
     ds4_session_reuse cold = {0};
     request_reuse_label(label, sizeof(label), &cold, "disk-text", 900);
     TEST_ASSERT(!strcmp(label, "disk-text"));
@@ -19996,6 +20073,43 @@ static void test_request_reuse_label_names_engine_source(void) {
     TEST_ASSERT(!strcmp(label, "cold"));
     request_reuse_label(label, sizeof(label), NULL, NULL, 0);
     TEST_ASSERT(!strcmp(label, "cold"));
+}
+
+/* A template whose turns all start with the same token has no role markers to
+ * tell apart: ds4_kvstore_chat_boundary_pos returns -1 for every prompt of it,
+ * because its assistant test matches the first marker.  The position a
+ * different conversation branches from is then the second-to-last marker --
+ * the start of the last turn before the generation header. */
+static void test_kv_cache_prev_marker_is_the_last_turn_start(void) {
+    enum { IM_START = 7, END = 8 };
+    /* <|im_start|> system ... <|im_start|> user shared ... <|im_start|> user
+     * task ... <|im_start|> assistant   -- four markers. */
+    int v[64];
+    int n = 0, marks[4], m = 0;
+    for (int turn = 0; turn < 4; turn++) {
+        marks[m++] = n;
+        v[n++] = IM_START;
+        for (int k = 0; k < 5; k++) v[n++] = 100 + turn * 10 + k;
+        v[n++] = END;
+    }
+    ds4_tokens prompt = {.v = v, .len = n, .cap = n};
+
+    /* The general boundary cannot see a role here: it breaks at marker 0. */
+    TEST_ASSERT(ds4_kvstore_chat_boundary_pos(&prompt, IM_START, IM_START) == -1);
+    /* The last turn's start, and the one before it. */
+    TEST_ASSERT(ds4_kvstore_last_marker_pos(&prompt, IM_START) == marks[3]);
+    TEST_ASSERT(ds4_kvstore_prev_marker_pos(&prompt, IM_START) == marks[2]);
+
+    /* Distinct markers still take the general path. */
+    TEST_ASSERT(ds4_kvstore_chat_boundary_pos(&prompt, IM_START, END) == marks[0]);
+
+    /* Degenerate inputs: fewer than two markers, and none at all. */
+    ds4_tokens one = {.v = v, .len = marks[1], .cap = marks[1]};
+    TEST_ASSERT(ds4_kvstore_prev_marker_pos(&one, IM_START) == -1);
+    int none[3] = {1, 2, 3};
+    ds4_tokens bare = {.v = none, .len = 3, .cap = 3};
+    TEST_ASSERT(ds4_kvstore_prev_marker_pos(&bare, IM_START) == -1);
+    TEST_ASSERT(ds4_kvstore_prev_marker_pos(NULL, IM_START) == -1);
 }
 
 static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
@@ -21177,6 +21291,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_request_reuse_label_names_engine_source();
+    test_kv_cache_prev_marker_is_the_last_turn_start();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
