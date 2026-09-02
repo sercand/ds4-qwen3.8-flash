@@ -151,15 +151,24 @@ int main(void) {
         CHECK(fmap != MAP_FAILED, "mmap arena plan model");
         CHECK(ds4_gpu_set_model_fd_for_map(fd, fmap), "set_model_fd_for_map");
 
-        const uint64_t offs[4]  = { 0, 1u << 20, 5u << 20, 7u << 20 };
-        const uint64_t sizes[4] = { 1u << 20, 3u << 20, 2u << 20, 700u * 1024u };
-        uint64_t want = 0;
-        for (int i = 0; i < 4; i++) want += (sizes[i] + 1024u + 255u) & ~(uint64_t)255u;
+        /* The last span's payload is deliberately not a multiple of 256, so
+         * the slot's round-up is exercised rather than being a no-op that
+         * would hide a mistake in the alignment arithmetic. */
+        const uint64_t offs[5]  = { 0, 1u << 20, 5u << 20, 7u << 20, 9u << 20 };
+        const uint64_t sizes[5] = { 1u << 20, 3u << 20, 2u << 20, 700u * 1024u,
+                                    (1u << 20) + 100u };
+        const uint32_t n_planned = 5;
+        uint64_t want = 0, unrounded = 0;
+        for (uint32_t i = 0; i < n_planned; i++) {
+            want += (sizes[i] + 1024u + 255u) & ~(uint64_t)255u;
+            unrounded += sizes[i] + 1024u;
+        }
+        CHECK(want > unrounded, "a span whose payload+pad needs rounding is in the set");
 
         const uint64_t before = ds4_gpu_model_weight_arena_bytes();
-        const uint64_t planned = ds4_gpu_plan_model_weight_arena(sizes, 4);
-        CHECK(planned == want, "plan covers exactly the span slots");
-        for (int i = 0; i < 4; i++) {
+        const uint64_t planned = ds4_gpu_plan_model_weight_arena(sizes, n_planned);
+        CHECK(planned == want, "plan covers exactly the span slots, rounding included");
+        for (uint32_t i = 0; i < n_planned; i++) {
             CHECK(ds4_gpu_cache_model_range(fmap, file_bytes, offs[i], sizes[i], "plan-span") == 1,
                   "cache planned span");
         }

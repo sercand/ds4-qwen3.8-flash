@@ -2510,24 +2510,40 @@ extern "C" uint64_t ds4_gpu_plan_model_weight_arena(const uint64_t *span_bytes,
 
     const uint64_t env_chunk = cuda_model_arena_chunk_env_bytes();
     const uint64_t max_chunk = env_chunk ? env_chunk : UINT64_MAX;
-    uint64_t span_total = 0;
-    uint64_t total = 0;
-    uint64_t chunk = 0;
+    uint64_t span_total = 0;   /* payload bytes the recorded chunks cover */
+    uint64_t total = 0;        /* arena bytes, the in-flight chunk included */
+    uint64_t chunk = 0;        /* the chunk being filled */
+    uint64_t chunk_spans = 0;  /* and its payload bytes */
     for (uint32_t i = 0; i < count; i++) {
         if (span_bytes[i] == 0) continue;
         const uint64_t slot = cuda_model_arena_slot_bytes(span_bytes[i]);
         if (budget != UINT64_MAX && slot > budget - total) break;
         if (chunk != 0 && slot > max_chunk - chunk) {
-            if (g_model_arena_plan_count == CUDA_MODEL_ARENA_PLAN_CAP) break;
+            /* The array is full (reachable only through a small
+             * DS4_CUDA_WEIGHT_ARENA_CHUNK_MB): the plan covers exactly the
+             * chunks it holds, so give back the one it cannot record and let
+             * the fixed-chunk rule take every span from here on. */
+            if (g_model_arena_plan_count == CUDA_MODEL_ARENA_PLAN_CAP) {
+                total -= chunk;
+                chunk = 0;
+                break;
+            }
             g_model_arena_plan[g_model_arena_plan_count++] = chunk;
+            span_total += chunk_spans;
             chunk = 0;
+            chunk_spans = 0;
         }
         chunk += slot;   /* a span larger than the cap gets a chunk of its own */
+        chunk_spans += span_bytes[i];
         total += slot;
-        span_total += span_bytes[i];
     }
-    if (chunk != 0 && g_model_arena_plan_count < CUDA_MODEL_ARENA_PLAN_CAP) {
-        g_model_arena_plan[g_model_arena_plan_count++] = chunk;
+    if (chunk != 0) {
+        if (g_model_arena_plan_count < CUDA_MODEL_ARENA_PLAN_CAP) {
+            g_model_arena_plan[g_model_arena_plan_count++] = chunk;
+            span_total += chunk_spans;
+        } else {
+            total -= chunk;   /* nowhere to record it; see above */
+        }
     }
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
         fprintf(stderr,
