@@ -2290,6 +2290,7 @@ enum {
     DS4_TENSOR_F32      = 0,
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
+    DS4_TENSOR_Q5_0     = 6,
     DS4_TENSOR_Q5_1     = 7,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
@@ -3273,6 +3274,36 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
     return NULL;
 }
 
+/* Qwen3.8-Flash-Next's MTP module ships in two layouts.
+ *
+ * Ours (arch `qwen4exp-mtp`, one block): the draft layer is blk.0.* and the
+ * head is mtp.{pre_fc_norm_embedding,pre_fc_norm_hidden,fc_embedding,
+ * fc_hidden,hc_norm,hc_down,hc_up}.
+ *
+ * unsloth's shared head (arch `qwen4exp`, nextn_predict_layers=1,
+ * block_count = target layers + 1): the module is described as the target's
+ * trailing block, so the draft layer is blk.<block_count-1>.* and the head is
+ * blk.<block_count-1>.nextn.{enorm,hnorm,eh_proj,hc_head_norm,hc_head_down,
+ * hc_head_up}.  "Shared" means it carries neither the embedding nor the
+ * vocabulary head, both of which ds4 already takes from the target.
+ *
+ * Returns the block index for the shared layout, or -1 when this file is not
+ * one.  The target's own GGUF also has arch qwen4exp and would otherwise
+ * match, which is why the nextn tensor itself is probed. */
+static int q4e_mtp_shared_layer(const ds4_model *m) {
+    uint32_t n_nextn = 0, n_block = 0;
+    if (!model_get_u32_compat(m, "qwen4exp.nextn_predict_layers", &n_nextn) ||
+        n_nextn == 0) {
+        return -1;
+    }
+    if (!model_get_u32_compat(m, "qwen4exp.block_count", &n_block) || n_block == 0) {
+        return -1;
+    }
+    char name[64];
+    snprintf(name, sizeof(name), "blk.%u.nextn.eh_proj.weight", n_block - 1u);
+    return model_find_tensor(m, name) ? (int)(n_block - 1u) : -1;
+}
+
 static const char *support_kind_name(ds4_support_kind kind) {
     switch (kind) {
     case DS4_SUPPORT_MTP_LEGACY:   return "legacy MTP";
@@ -3294,9 +3325,10 @@ static ds4_support_kind support_model_detect(
     /* Checked before the DSpark probe: the qwen4exp head shares no tensor
      * names with either of the older two, and its architecture key is
      * unambiguous. */
-    if (model_find_tensor(m, "mtp.fc_embedding.weight") &&
-        model_find_tensor(m, "mtp.fc_hidden.weight") &&
-        model_find_tensor(m, "blk.0.ffn_gate_exps.weight")) {
+    if ((model_find_tensor(m, "mtp.fc_embedding.weight") &&
+         model_find_tensor(m, "mtp.fc_hidden.weight") &&
+         model_find_tensor(m, "blk.0.ffn_gate_exps.weight")) ||
+        q4e_mtp_shared_layer(m) >= 0) {
         if (stages_out) *stages_out = 1u;
         return DS4_SUPPORT_QWEN4EXP_MTP;
     }
@@ -4789,6 +4821,15 @@ typedef struct {
     ds4_tensor *hc_down;
     ds4_tensor *hc_up;
     ds4_layer_weights block;
+    /* Where fc_embedding and fc_hidden are read from.  Normally the head
+     * file's own mapping; for the shared layout, whose two projections are
+     * fused into one tensor, it is `eh_split` below and the two tensors are
+     * `eh_split_tensor`. */
+    const void *fc_map;
+    uint64_t    fc_map_size;
+    void       *eh_split;        /* anonymous mapping, owned; NULL otherwise */
+    uint64_t    eh_split_bytes;
+    ds4_tensor  eh_split_tensor[2];
     bool        ready;
 } ds4_q4e_mtp_weights;
 
@@ -7275,66 +7316,174 @@ static void weights_bind_qwen4exp_layer(ds4_layer_weights *l, const ds4_model *m
     l->ffn_down_shexp     = required_tensorf(m, "blk.%u.ffn_down_shexp.weight", il);
 }
 
+/* unsloth fuses the two input projections along the contraction:
+ * nextn.eh_proj is one [5120, 2560] Q8_0 matrix over
+ * concat(enorm(embedding), hnorm(hidden)).  Checked elementwise against our
+ * own sidecar: contraction inputs 0..2559 are fc_embedding and 2560..5119 are
+ * fc_hidden, bit-identical to the halves we quantized separately.
+ *
+ * ds4 keeps them apart rather than running one GEMM because the two halves
+ * see different row counts: the embedding half runs once per token, the
+ * hidden half once per token and hyper-connection stream (see q4e_mtp_draft),
+ * so a fused GEMM would need a gathered n*4 x 5120 input and would redo the
+ * embedding half four times.  Instead the fused rows are de-interleaved once
+ * at load.  2560 inputs is exactly 80 whole Q8_0 blocks, so each half-row is
+ * a run of whole blocks: this is a byte copy at a block boundary, not a
+ * requantization, and the draft arithmetic is then identical for both
+ * layouts.  The buffer is mapped read-only afterwards because the CUDA
+ * resolver registers weight pages with cudaHostRegisterReadOnly.
+ *
+ * Any block type whose block divides n_embd splits this way -- unsloth's
+ * Q8_0 head stores eh_proj as Q8_0 (80 blocks a half-row) and its Q4_K_M head
+ * as Q4_K (10 blocks a half-row) -- so the row split is driven by the type's
+ * block geometry rather than hard-coded to one format. */
+static bool q4e_mtp_split_eh_proj(ds4_q4e_mtp_weights *w, const ds4_model *m,
+                                  const ds4_tensor *eh) {
+    const uint64_t in_dim  = eh->ndim >= 1 ? eh->dim[0] : 0;
+    const uint64_t out_dim = eh->ndim >= 2 ? eh->dim[1] : 0;
+    const uint64_t embd    = (uint64_t)DS4_N_EMBD;
+    const gguf_type_info *info = tensor_type(eh->type);
+    if (!info || info->block_elems == 0 || (embd % info->block_elems) != 0u ||
+        in_dim != 2u * embd || out_dim != embd ||
+        eh->abs_offset > m->size || eh->bytes > m->size - eh->abs_offset) {
+        fprintf(stderr,
+                "ds4: qwen4exp MTP nextn.eh_proj has an unexpected layout "
+                "(%s, %llu x %llu)\n",
+                tensor_type_name(eh->type),
+                (unsigned long long)in_dim, (unsigned long long)out_dim);
+        return false;
+    }
+
+    const uint64_t half_row = embd / info->block_elems * info->block_bytes;
+    const uint64_t half     = out_dim * half_row;
+    w->eh_split_bytes = 2u * half;
+    w->eh_split = mmap(NULL, (size_t)w->eh_split_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (w->eh_split == MAP_FAILED) {
+        w->eh_split = NULL;
+        w->eh_split_bytes = 0;
+        fprintf(stderr, "ds4: cannot allocate the qwen4exp MTP eh_proj split\n");
+        return false;
+    }
+
+    const uint8_t *src = (const uint8_t *)m->map + eh->abs_offset;
+    uint8_t *emb = (uint8_t *)w->eh_split;
+    uint8_t *hid = emb + half;
+    for (uint64_t r = 0; r < out_dim; r++) {
+        memcpy(emb + r * half_row, src + r * 2u * half_row, (size_t)half_row);
+        memcpy(hid + r * half_row, src + r * 2u * half_row + half_row, (size_t)half_row);
+    }
+    (void)mprotect(w->eh_split, (size_t)w->eh_split_bytes, PROT_READ);
+
+    for (int i = 0; i < 2; i++) {
+        ds4_tensor *t = &w->eh_split_tensor[i];
+        t->ndim = 2;
+        t->dim[0] = embd;
+        t->dim[1] = out_dim;
+        t->type = eh->type;
+        t->rel_offset = t->abs_offset = (uint64_t)i * half;
+        t->elements = embd * out_dim;
+        t->bytes = half;
+    }
+    w->fc_embedding = &w->eh_split_tensor[0];
+    w->fc_hidden    = &w->eh_split_tensor[1];
+    w->fc_map       = w->eh_split;
+    w->fc_map_size  = w->eh_split_bytes;
+    return true;
+}
+
 /* Binds the MTP head.  Deliberately not weights_bind_qwen4exp_layer: that one
  * decides attention type from the layer index, and index 0 is a Gated DeltaNet
  * layer in the target, whereas the MTP block is full attention.  It also
  * exit()s on a missing tensor, which is wrong for an optional sidecar -- a
- * malformed one should disable speculation, not kill the process. */
+ * malformed one should disable speculation, not kill the process.
+ *
+ * Both layouts described at q4e_mtp_shared_layer bind through this one table:
+ * the draft block's tensors differ only in their block index, and the head's
+ * differ only in name (plus eh_proj's fusion).  The type differences between
+ * the two files -- Q8_0 rather than Q4_K routed gate/up, F32 rather than Q8_0
+ * routers, BF16 rather than Q8_0 indexer projections -- need no work here:
+ * q4e_matmul and the MoE entries dispatch on the bound tensor's own type, and
+ * the draft never runs the indexer at all (q4e_qsa_layer skips it when
+ * is_draft). */
 static bool q4e_mtp_weights_bind(ds4_q4e_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
+    w->fc_map = m->map;
+    w->fc_map_size = m->size;
 
-    const char *missing = NULL;
-#define Q4E_MTP_BIND(dst, name)                                   \
-    do {                                                          \
-        (dst) = model_find_tensor(m, (name));                     \
-        if (!(dst) && !missing) missing = (name);                 \
+    const int shared = q4e_mtp_shared_layer(m);
+    const uint32_t blk = shared >= 0 ? (uint32_t)shared : 0u;
+    char head[48];
+    if (shared >= 0) snprintf(head, sizeof(head), "blk.%u.nextn.", blk);
+    else             snprintf(head, sizeof(head), "mtp.");
+
+    char missing[128];
+    missing[0] = '\0';
+#define Q4E_MTP_BIND(dst, ...)                                            \
+    do {                                                                  \
+        char nm_[128];                                                    \
+        snprintf(nm_, sizeof(nm_), __VA_ARGS__);                          \
+        (dst) = model_find_tensor(m, nm_);                                \
+        if (!(dst) && !missing[0]) memcpy(missing, nm_, sizeof(nm_));      \
     } while (0)
+    /* The head tensor this file calls `shared_`, or `ours_` for our sidecar. */
+#define Q4E_MTP_HEAD(shared_, ours_) "%s%s", head, (shared >= 0 ? (shared_) : (ours_))
 
-    Q4E_MTP_BIND(w->pre_fc_norm_embedding, "mtp.pre_fc_norm_embedding.weight");
-    Q4E_MTP_BIND(w->pre_fc_norm_hidden,    "mtp.pre_fc_norm_hidden.weight");
-    Q4E_MTP_BIND(w->fc_embedding,          "mtp.fc_embedding.weight");
-    Q4E_MTP_BIND(w->fc_hidden,             "mtp.fc_hidden.weight");
+    Q4E_MTP_BIND(w->pre_fc_norm_embedding,
+                 Q4E_MTP_HEAD("enorm.weight", "pre_fc_norm_embedding.weight"));
+    Q4E_MTP_BIND(w->pre_fc_norm_hidden,
+                 Q4E_MTP_HEAD("hnorm.weight", "pre_fc_norm_hidden.weight"));
     /* The collapsing mixer has no inject, exactly like the target's
      * output_mix; q4e_hc_mix takes NULL there. */
-    Q4E_MTP_BIND(w->hc_norm,               "mtp.hc_norm.weight");
-    Q4E_MTP_BIND(w->hc_down,               "mtp.hc_down.weight");
-    Q4E_MTP_BIND(w->hc_up,                 "mtp.hc_up.weight");
+    Q4E_MTP_BIND(w->hc_norm, Q4E_MTP_HEAD("hc_head_norm.weight", "hc_norm.weight"));
+    Q4E_MTP_BIND(w->hc_down, Q4E_MTP_HEAD("hc_head_down.weight", "hc_down.weight"));
+    Q4E_MTP_BIND(w->hc_up,   Q4E_MTP_HEAD("hc_head_up.weight",   "hc_up.weight"));
+
+    ds4_tensor *eh_proj = NULL;
+    if (shared >= 0) {
+        Q4E_MTP_BIND(eh_proj, "%seh_proj.weight", head);
+    } else {
+        Q4E_MTP_BIND(w->fc_embedding, "mtp.fc_embedding.weight");
+        Q4E_MTP_BIND(w->fc_hidden,    "mtp.fc_hidden.weight");
+    }
 
     ds4_layer_weights *l = &w->block;
-    Q4E_MTP_BIND(l->hc_attn_norm,   "blk.0.hc_attn_norm.weight");
-    Q4E_MTP_BIND(l->hc_attn_down,   "blk.0.hc_attn_down.weight");
-    Q4E_MTP_BIND(l->hc_attn_up,     "blk.0.hc_attn_up.weight");
-    Q4E_MTP_BIND(l->hc_attn_inject, "blk.0.hc_attn_inject.weight");
-    Q4E_MTP_BIND(l->hc_ffn_norm,    "blk.0.hc_ffn_norm.weight");
-    Q4E_MTP_BIND(l->hc_ffn_down,    "blk.0.hc_ffn_down.weight");
-    Q4E_MTP_BIND(l->hc_ffn_up,      "blk.0.hc_ffn_up.weight");
-    Q4E_MTP_BIND(l->hc_ffn_inject,  "blk.0.hc_ffn_inject.weight");
+    Q4E_MTP_BIND(l->hc_attn_norm,   "blk.%u.hc_attn_norm.weight", blk);
+    Q4E_MTP_BIND(l->hc_attn_down,   "blk.%u.hc_attn_down.weight", blk);
+    Q4E_MTP_BIND(l->hc_attn_up,     "blk.%u.hc_attn_up.weight", blk);
+    Q4E_MTP_BIND(l->hc_attn_inject, "blk.%u.hc_attn_inject.weight", blk);
+    Q4E_MTP_BIND(l->hc_ffn_norm,    "blk.%u.hc_ffn_norm.weight", blk);
+    Q4E_MTP_BIND(l->hc_ffn_down,    "blk.%u.hc_ffn_down.weight", blk);
+    Q4E_MTP_BIND(l->hc_ffn_up,      "blk.%u.hc_ffn_up.weight", blk);
+    Q4E_MTP_BIND(l->hc_ffn_inject,  "blk.%u.hc_ffn_inject.weight", blk);
 
-    Q4E_MTP_BIND(l->qsa_q,       "blk.0.attn_q.weight");
-    Q4E_MTP_BIND(l->qsa_k,       "blk.0.attn_k.weight");
-    Q4E_MTP_BIND(l->qsa_v,       "blk.0.attn_v.weight");
-    Q4E_MTP_BIND(l->qsa_q_norm,  "blk.0.attn_q_norm.weight");
-    Q4E_MTP_BIND(l->qsa_k_norm,  "blk.0.attn_k_norm.weight");
-    Q4E_MTP_BIND(l->attn_output, "blk.0.attn_output.weight");
-    Q4E_MTP_BIND(l->idx_q,       "blk.0.indexer.q_proj.weight");
-    Q4E_MTP_BIND(l->idx_k,       "blk.0.indexer.k_proj.weight");
-    Q4E_MTP_BIND(l->idx_q_norm,  "blk.0.indexer.q_norm.weight");
-    Q4E_MTP_BIND(l->idx_k_norm,  "blk.0.indexer.k_norm.weight");
+    Q4E_MTP_BIND(l->qsa_q,       "blk.%u.attn_q.weight", blk);
+    Q4E_MTP_BIND(l->qsa_k,       "blk.%u.attn_k.weight", blk);
+    Q4E_MTP_BIND(l->qsa_v,       "blk.%u.attn_v.weight", blk);
+    Q4E_MTP_BIND(l->qsa_q_norm,  "blk.%u.attn_q_norm.weight", blk);
+    Q4E_MTP_BIND(l->qsa_k_norm,  "blk.%u.attn_k_norm.weight", blk);
+    Q4E_MTP_BIND(l->attn_output, "blk.%u.attn_output.weight", blk);
+    Q4E_MTP_BIND(l->idx_q,       "blk.%u.indexer.q_proj.weight", blk);
+    Q4E_MTP_BIND(l->idx_k,       "blk.%u.indexer.k_proj.weight", blk);
+    Q4E_MTP_BIND(l->idx_q_norm,  "blk.%u.indexer.q_norm.weight", blk);
+    Q4E_MTP_BIND(l->idx_k_norm,  "blk.%u.indexer.k_norm.weight", blk);
 
-    Q4E_MTP_BIND(l->ffn_gate_inp,       "blk.0.ffn_gate_inp.weight");
-    Q4E_MTP_BIND(l->ffn_gate_inp_shexp, "blk.0.ffn_gate_inp_shexp.weight");
-    Q4E_MTP_BIND(l->ffn_gate_exps,      "blk.0.ffn_gate_exps.weight");
-    Q4E_MTP_BIND(l->ffn_up_exps,        "blk.0.ffn_up_exps.weight");
-    Q4E_MTP_BIND(l->ffn_down_exps,      "blk.0.ffn_down_exps.weight");
-    Q4E_MTP_BIND(l->ffn_gate_shexp,     "blk.0.ffn_gate_shexp.weight");
-    Q4E_MTP_BIND(l->ffn_up_shexp,       "blk.0.ffn_up_shexp.weight");
-    Q4E_MTP_BIND(l->ffn_down_shexp,     "blk.0.ffn_down_shexp.weight");
+    Q4E_MTP_BIND(l->ffn_gate_inp,       "blk.%u.ffn_gate_inp.weight", blk);
+    Q4E_MTP_BIND(l->ffn_gate_inp_shexp, "blk.%u.ffn_gate_inp_shexp.weight", blk);
+    Q4E_MTP_BIND(l->ffn_gate_exps,      "blk.%u.ffn_gate_exps.weight", blk);
+    Q4E_MTP_BIND(l->ffn_up_exps,        "blk.%u.ffn_up_exps.weight", blk);
+    Q4E_MTP_BIND(l->ffn_down_exps,      "blk.%u.ffn_down_exps.weight", blk);
+    Q4E_MTP_BIND(l->ffn_gate_shexp,     "blk.%u.ffn_gate_shexp.weight", blk);
+    Q4E_MTP_BIND(l->ffn_up_shexp,       "blk.%u.ffn_up_shexp.weight", blk);
+    Q4E_MTP_BIND(l->ffn_down_shexp,     "blk.%u.ffn_down_shexp.weight", blk);
+#undef Q4E_MTP_HEAD
 #undef Q4E_MTP_BIND
 
-    if (missing) {
+    if (missing[0]) {
         fprintf(stderr, "ds4: qwen4exp MTP head is missing %s\n", missing);
         return false;
     }
+    if (eh_proj && !q4e_mtp_split_eh_proj(w, m, eh_proj)) return false;
 
     /* Shape gates.  The draft shares every kernel with the target, so a
      * mismatched head would corrupt the graph rather than fail cleanly. */
@@ -63934,8 +64083,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 if (e->mtp_draft_tokens > (int)Q4E_SPEC_MAX_DRAFT) {
                     e->mtp_draft_tokens = (int)Q4E_SPEC_MAX_DRAFT;
                 }
-                fprintf(stderr, "ds4: qwen4exp MTP head loaded: %s (draft=%d)\n",
-                        opt->mtp_path, e->mtp_draft_tokens);
+                fprintf(stderr, "ds4: qwen4exp MTP head loaded: %s (%s layout, draft=%d)\n",
+                        opt->mtp_path,
+                        e->q4e_mtp_weights.eh_split ? "shared nextn" : "sidecar",
+                        e->mtp_draft_tokens);
             }
         } else if (e->support_kind == DS4_SUPPORT_DSPARK) {
             dspark_weights_bind_optional(&e->dspark_weights,
@@ -65049,6 +65200,10 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+    if (e->q4e_mtp_weights.eh_split) {
+        munmap(e->q4e_mtp_weights.eh_split, (size_t)e->q4e_mtp_weights.eh_split_bytes);
+        e->q4e_mtp_weights.eh_split = NULL;
+    }
     if (e->mtp_model.map) model_close(&e->mtp_model);
     if (e->vision_model.map) model_close(&e->vision_model);
     model_close(&e->model);
@@ -65805,8 +65960,11 @@ static int q4e_rows_matmul_disabled(void) {
     return cached;
 }
 
-static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
-                      const ds4_gpu_tensor *x, uint32_t n_tok) {
+/* Weights normally live in the model's own mapping; the MTP head's two input
+ * projections can instead live in the de-interleaved eh_proj buffer, which is
+ * why the map is a parameter rather than taken from a ds4_model. */
+static int q4e_matmul_at(ds4_gpu_tensor *out, const void *map, uint64_t map_size,
+                         const ds4_tensor *w, const ds4_gpu_tensor *x, uint32_t n_tok) {
     /* The shared expert's gate is stored rank 1: one output row, so dim[1] is
      * absent rather than 1. */
     const uint64_t out_dim = w->ndim >= 2 ? w->dim[1] : 1u;
@@ -65818,27 +65976,48 @@ static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor 
          * it does not improve. */
         if (n_tok == 1u) {
             const int rc = ds4_gpu_q4e_matvec_q8_0_narrow(
-                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x);
+                    out, map, map_size, w->abs_offset, w->dim[0], out_dim, x);
             if (rc != 0) return rc > 0;
         } else if (n_tok <= 16u && !q4e_rows_matmul_disabled()) {
             /* The speculative verify batch: a few rows through weights that
              * are read once for all of them, instead of the generic
              * multi-row dispatch. */
             const int rc = ds4_gpu_q4e_matmul_q8_0_rows(
-                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x, n_tok);
+                    out, map, map_size, w->abs_offset, w->dim[0], out_dim, x, n_tok);
             if (rc != 0) return rc > 0;
         }
         /* fall through */
     case DS4_TENSOR_Q4_K:
-        return ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type,
+        /* Q5_0 and Q6_K appear only in unsloth's Q4_K_M MTP head (the
+         * hyper-connection up projections, attn_v and hc_ffn_down); they have
+         * no narrow entry, so they go straight to the generic MMQ dense path.
+         *
+         * The three Q5_0 tensors are K = 320, which is not a multiple of
+         * MMQ_ITER_K (256): mmq's last K tile loads six 32-weight blocks past
+         * each row, so every row reads into the next row's weights and the
+         * LAST row reads past the tensor.  The activation lanes there are
+         * zero (quantize.cu fills past ne00 with 0.0f), so the products
+         * vanish -- but only while the bytes decode to a finite fp16 block
+         * scale, because 0 * inf is NaN.  These rows therefore depend on the
+         * zeroed tail the weight-span arena puts past every cached span, and
+         * on the span builder keeping a row-unaligned tensor last so that
+         * tail is what its final row reads (commit 0991e49).  Until that
+         * lands here the head is read through a host-registered file mapping
+         * rather than the arena, so the over-read hits the next tensor's real
+         * file bytes; measured finite, but it is the pad that makes it safe,
+         * not the layout.  A K-unaligned tensor placed last in a file would
+         * read past the mapping itself. */
+    case DS4_TENSOR_Q5_0:
+    case DS4_TENSOR_Q6_K:
+        return ds4_gpu_matmul_quant_tensor(out, map, map_size, w->abs_offset, w->type,
                                            w->dim[0], out_dim, x, n_tok);
     case DS4_TENSOR_BF16:
         if (n_tok >= 2u && n_tok <= 16u && !q4e_rows_matmul_disabled()) {
             const int rc = ds4_gpu_q4e_matmul_bf16_rows(
-                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x, n_tok);
+                    out, map, map_size, w->abs_offset, w->dim[0], out_dim, x, n_tok);
             if (rc != 0) return rc > 0;
         }
-        return ds4_gpu_glm53_matmul_bf16(out, m->map, m->size, w->abs_offset,
+        return ds4_gpu_glm53_matmul_bf16(out, map, map_size, w->abs_offset,
                                          (uint32_t)w->dim[0], (uint32_t)out_dim, x, n_tok);
     case DS4_TENSOR_F32:
         /* The injection logits are 10240 inputs into 4 outputs, which the
@@ -65848,15 +66027,20 @@ static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor 
          * restores the generic path. */
         if (n_tok == 1u && q4e_f32_splitk_enabled()) {
             const int rc = ds4_gpu_q4e_matvec_f32(
-                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x);
+                    out, map, map_size, w->abs_offset, w->dim[0], out_dim, x);
             if (rc != 0) return rc > 0;
         }
-        return ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset,
+        return ds4_gpu_matmul_f32_tensor(out, map, map_size, w->abs_offset,
                                          w->dim[0], out_dim, x, n_tok);
     default:
         fprintf(stderr, "ds4: qwen4exp dense matmul: unsupported type %u\n", w->type);
         return 0;
     }
+}
+
+static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
+                      const ds4_gpu_tensor *x, uint32_t n_tok) {
+    return q4e_matmul_at(out, m->map, m->size, w, x, n_tok);
 }
 
 /* The hyper-connection mix.  Produces the block input and, in `inject`, the
@@ -66515,7 +66699,8 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
                              mw->pre_fc_norm_embedding->abs_offset,
                              DS4_N_EMBD, 1u, n, DS4_RMS_EPS)) return 1;
     q4e_trace("mtp_embed_norm", -1, g->blk_out, (uint64_t)n * DS4_N_EMBD);
-    if (!q4e_matmul(g->mixed, mm, mw->fc_embedding, g->blk_out, n)) return 1;
+    if (!q4e_matmul_at(g->mixed, mw->fc_map, mw->fc_map_size,
+                       mw->fc_embedding, g->blk_out, n)) return 1;
     q4e_trace("mtp_fc_embedding", -1, g->mixed, (uint64_t)n * DS4_N_EMBD);
 
     /* h = fc_hidden(norm_10240(hidden)) per stream -> g->up [n, hc * n_embd].
@@ -66528,7 +66713,8 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
                              mw->pre_fc_norm_hidden->abs_offset,
                              Q4E_HC_DIM, 1u, n, DS4_RMS_EPS)) return 1;
     q4e_trace("mtp_hidden_norm", -1, g->xn, (uint64_t)n * Q4E_HC_DIM);
-    if (!q4e_matmul(g->up, mm, mw->fc_hidden, g->xn, n * DS4_N_HC)) return 1;
+    if (!q4e_matmul_at(g->up, mw->fc_map, mw->fc_map_size,
+                       mw->fc_hidden, g->xn, n * DS4_N_HC)) return 1;
     q4e_trace("mtp_fc_hidden", -1, g->up, (uint64_t)n * Q4E_HC_DIM);
     if (!ds4_gpu_q4e_hc_init_add(d.res, g->mixed, g->up, DS4_N_EMBD, DS4_N_HC, n)) return 1;
     q4e_trace("mtp_res_init", -1, d.res, (uint64_t)n * Q4E_HC_DIM);

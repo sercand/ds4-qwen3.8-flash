@@ -159,6 +159,24 @@ int ds4_mmq_q4_K_dense(
     int           K,
     cudaStream_t  stream);
 
+int ds4_mmq_q5_0_dense(
+    const void  * W_q5_0,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
+int ds4_mmq_q6_K_dense(
+    const void  * W_q6_K,
+    const float * X_f32,
+    float       * out_f32,
+    int           M,
+    int           N,
+    int           K,
+    cudaStream_t  stream);
+
 int ds4_mmq_mxfp4_dense(
     const void  * W_mxfp4,
     const float * X_f32,
