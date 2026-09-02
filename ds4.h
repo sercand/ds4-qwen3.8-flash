@@ -157,15 +157,19 @@ typedef struct {
      * is bounded by n-gram repetition, so a much larger cache buys nothing. */
     uint64_t ple_cache_bytes;
     /* qwen4exp only: the shared KV page pool, in token positions (rounded up
-     * to whole pages, never below the context size).  Zero derives the plan's
-     * budget from the context -- four resident conversations, capped at
-     * 600000 positions (18 GB). */
+     * to whole pages, never below the context size).  Zero derives it from the
+     * device memory free once the model and one context are resident, capped
+     * at four resident conversations and at 600000 positions (18 GB).  A value
+     * given here skips the pool's derivation only: ssm_checkpoints below is
+     * still derived, from what this pool leaves. */
     uint32_t kv_pool_tokens;
     /* qwen4exp only: GDN checkpoints the prefix cache may hold, 113 MB each.
      * A checkpoint is what lets a request resume in the middle of a token
      * sequence instead of prefilling it again.  Read only when
      * ssm_checkpoints_set, so 0 means "hold none" rather than "use the
-     * default"; unset derives a budget from the memory left after the model. */
+     * default"; unset derives a budget from the memory left once the model,
+     * one context and the KV pool's share are accounted for -- independently
+     * of whether kv_pool_tokens was given. */
     uint32_t ssm_checkpoints;
     /* qwen4exp only: execution contexts, each a live recurrent state and page
      * table over the shared pool.  0 allows DS4_EXEC_CONTEXTS_MAX, which is

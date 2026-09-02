@@ -55083,13 +55083,16 @@ static q4e_tree_node *q4e_tree_pick_victim(q4e_span_tree *t, double now,
 
 /* Unlink and free a leaf whose checkpoint (if any) the caller has released.
  * The `live` guard is defence in depth: pick_victim already skips nodes an
- * execution context stands on, and dropping one would be a use-after-free. */
-static void q4e_tree_drop(q4e_span_tree *t, q4e_tree_node *n) {
-    if (!n || n == t->root || n->child || n->ckpt >= 0 || n->live != 0u) return;
+ * execution context stands on, and dropping one would be a use-after-free.
+ * Returns whether the node went, so a caller freeing pages in a loop can stop
+ * instead of re-picking a victim it is never allowed to drop. */
+static bool q4e_tree_drop(q4e_span_tree *t, q4e_tree_node *n) {
+    if (!n || n == t->root || n->child || n->ckpt >= 0 || n->live != 0u) return false;
     q4e_tree_relink(n->parent, n, n->next);
     q4e_tree_node_destroy(t, n);
     t->nodes--;
     t->page_evictions++;
+    return true;
 }
 
 /* Add or drop one execution context along the path from `node` up to but not
@@ -55450,9 +55453,13 @@ typedef struct {
  * allocator mid-request.  So the defaults are derived from the memory
  * actually free once the model and this context's scratch are resident, less
  * a reserve for the remaining contexts and for whatever the process still
- * grows into; A0's split between the two budgets (18 of 22.5 GB) is kept.  An
- * explicit --kv-pool-tokens / --ssm-checkpoints (or their env vars) skips the
- * derivation: an operator who asks for more than fits owns that. */
+ * grows into; A0's split between the two budgets (18 of 22.5 GB) is kept.
+ *
+ * The two budgets are explicit-or-derived independently.  An explicit
+ * --kv-pool-tokens (or DS4_QWEN4EXP_KV_POOL_TOKENS) skips the *pool's*
+ * derivation and an operator who asks for more than fits owns that; the
+ * checkpoint budget is then still derived, from whatever the pool leaves.
+ * The same the other way round. */
 #define Q4E_MEM_RESERVE      (4ull << 30)
 #define Q4E_POOL_MEM_NUM     4u          /* A0's pool share: 18 of 22.5 GB */
 #define Q4E_POOL_MEM_DEN     5u
@@ -55709,9 +55716,20 @@ static int q4e_cache_free_pages(q4e_cache *c, uint32_t want, double now) {
         if (!v) return 1;
         if (v->ckpt >= 0) {
             q4e_ckpt_release(c, v->ckpt);
+            /* q4e_ckpt_release clears owner->ckpt only while the owner still
+             * names this slot; clear it here as well, so the drop below is
+             * never refused by a node pointing at a slot it no longer owns. */
+            v->ckpt = -1;
             c->ckpt_evictions++;
         }
-        q4e_tree_drop(&c->tree, v);
+        /* Insist on progress.  The victim scan is deterministic, so a node the
+         * drop refuses -- one a live execution context reached in between --
+         * would be picked again on every pass and the loop would never end.
+         * A successful drop is progress even when n_free does not grow: the
+         * only page it can fail to release is the one boundary page its parent
+         * also lists, and the tree is one node smaller either way, so the next
+         * pass picks a different victim. */
+        if (!q4e_tree_drop(&c->tree, v)) return 1;
     }
     return 0;
 }
@@ -55791,8 +55809,9 @@ static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
     c->idx_ready = q4e_indexer_enabled() != 0;
     c->ctx_cap = e->exec_contexts ? e->exec_contexts : Q4E_CTX_MAX;
     if (c->ctx_cap > Q4E_CTX_MAX) c->ctx_cap = Q4E_CTX_MAX;
-    c->page_bytes = q4e_page_bytes(c->idx_ready, mtp);
+    const uint64_t page_bytes = q4e_page_bytes(c->idx_ready, mtp);
     const uint64_t ckpt_bytes = q4e_ckpt_bytes();
+    c->page_bytes = page_bytes;
 
     /* What the caller asked for, and whether they asked at all. */
     bool pool_explicit = e->kv_pool_tokens != 0u;
@@ -55819,6 +55838,17 @@ static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
      * own scratch allocation cleanly rather than corrupting anything. */
     const uint64_t reserve = Q4E_MEM_RESERVE + ctx_scratch_bytes;
     const uint64_t avail = free_bytes > reserve ? free_bytes - reserve : 0u;
+    /* ds4_gpu_tier_free_vram reports 0 where it cannot measure -- the Metal
+     * stub, or a transient driver failure -- and deriving from 0 lands on the
+     * same budgets as "the context does not fit", which would blame --ctx for
+     * something it did not cause.  Say which of the two happened. */
+    const bool measured = free_bytes > 0u;
+    if (!measured && !(pool_explicit && ckpt_explicit)) {
+        fprintf(stderr, "ds4: could not measure free device memory, so the qwen4exp "
+                        "prefix cache takes the context-sized minimum: one context's "
+                        "pages and no checkpoint.  Size it explicitly with "
+                        "--kv-pool-tokens N and --ssm-checkpoints N.\n");
+    }
     if (!pool_explicit) {
         const uint64_t share = avail / Q4E_POOL_MEM_DEN * Q4E_POOL_MEM_NUM;
         const uint32_t fits = (uint32_t)(share / c->page_bytes);
@@ -55851,8 +55881,9 @@ static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
          * which knob buys one back: the pool's floor is one context's pages,
          * so at a large --ctx there is nothing left to derive from. */
         fprintf(stderr, "ds4: qwen4exp has no room for a recurrent checkpoint, so every "
-                        "request will prefill from zero; lower --ctx, or force a budget "
-                        "with --ssm-checkpoints N and accept the allocation risk\n");
+                        "request will prefill from zero; %s, or force a budget "
+                        "with --ssm-checkpoints N and accept the allocation risk\n",
+                measured ? "lower --ctx" : "size the cache explicitly");
     }
 
     if (c->ckpt_cap) {
@@ -55885,7 +55916,7 @@ static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
         q4e_cache_close(e);
         fprintf(stderr, "ds4: cannot allocate the qwen4exp KV page pool "
                         "(%u pages, %.1f GB); lower --kv-pool-tokens\n",
-                pool_pages, (double)pool_pages * 7.5 / 1024.0);
+                pool_pages, (double)pool_pages * (double)page_bytes / 1e9);
         return NULL;
     }
     e->q4e_cache = c;
