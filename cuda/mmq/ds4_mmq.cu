@@ -123,6 +123,51 @@ static void  *g_aligned_q81_scratch_ptr = nullptr;
 static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_aligned_q81_scratch_device = -1;
 
+/* The routed grids size their column tiles from the rows any one expert may
+ * hold.  The caller's bound (n_tok) is a worst case: with 10 of 512 experts
+ * per token the typical expert holds n_tok/51 rows, so 31 of 32 column tiles
+ * were empty and stream-k still visited each (a dependent expert_bounds load
+ * per skipped tile, ~0.7 us).  This reads the true maximum back from the
+ * device.  Prefill only (a chunk of >= 32 rows) and never under capture. */
+static __global__ void ds4_mmq_max_expert_rows_kernel(const int32_t * bounds, int n_experts, int * out) {
+    __shared__ int red[1024];
+    int m = 0;
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+        const int d = bounds[e + 1] - bounds[e];
+        m = d > m ? d : m;
+    }
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < (unsigned)s) red[threadIdx.x] = max(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) *out = red[0];
+}
+
+static int64_t ds4_mmq_true_max_rows(const int32_t * expert_bounds, int n_experts, int64_t fallback,
+                                     int64_t n_tokens, cudaStream_t stream) {
+    if (fallback <= 0 || n_tokens < 32 || !expert_bounds) return fallback;
+    if (getenv("DS4_MMQ_NO_TRUE_MAX_ROWS")) return fallback;
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        return fallback;
+    }
+    static int * d_max = nullptr;
+    static int * h_max = nullptr;
+    if (!d_max && cudaMalloc(&d_max, sizeof(int)) != cudaSuccess) { d_max = nullptr; (void)cudaGetLastError(); return fallback; }
+    if (!h_max && cudaMallocHost(&h_max, sizeof(int)) != cudaSuccess) { h_max = nullptr; (void)cudaGetLastError(); return fallback; }
+    ds4_mmq_max_expert_rows_kernel<<<1, 1024, 0, stream>>>(expert_bounds, n_experts, d_max);
+    if (cudaMemcpyAsync(h_max, d_max, sizeof(int), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return fallback;
+    }
+    const int64_t m = *h_max;
+    return (m > 0 && m < fallback) ? m : fallback;
+}
+
 // The gfx1151 IQ2 pair path is fed in tiles of at most 2048 tokens with six
 // routed experts per token. Keep its small routing maps out of the ROCm async
 // pool: repeated shape churn can recycle/remap those allocations while the
@@ -1175,7 +1220,8 @@ int ds4_mmq_moe_impl(
         /*use_stream_k=*/use_stream_k,
         /* Rows any one expert can hold, not the gathered total. */
         /*ncols_max=*/((max_rows_per_expert > 0 && max_rows_per_expert < ne_get_rows)
-                       ? max_rows_per_expert : ne_get_rows),
+                       ? ds4_mmq_true_max_rows(expert_bounds.get(), n_experts, max_rows_per_expert, n_tokens, stream)
+                       : ne_get_rows),
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
     };
@@ -1504,7 +1550,8 @@ int ds4_mmq_moe_pair_impl(
         ? (int64_t)n_tokens
         : ne_get_rows;
     if (max_rows_per_expert > 0 && max_rows_per_expert < routed_ncols_max) {
-        routed_ncols_max = max_rows_per_expert;
+        routed_ncols_max = ds4_mmq_true_max_rows(expert_bounds, n_experts, max_rows_per_expert,
+                                                 (int64_t)n_tokens, stream);
     }
 
     /* The materialized path stream-frees gate/up Q8_1 before allocating the
