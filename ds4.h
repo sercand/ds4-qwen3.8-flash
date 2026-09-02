@@ -437,6 +437,19 @@ void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn
  * safe boundaries where the live checkpoint is either unchanged or represents a
  * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
+/* A hand-off point inside a long prefill.  The engine calls this before every
+ * prefill chunk, with the frontier it is about to advance from and the prompt
+ * length it is working toward; return 0 to go on, non-zero to stop the sync
+ * with DS4_SESSION_SYNC_INTERRUPTED.
+ *
+ * The callback may block.  At the moment it runs the session's state is
+ * consistent and nothing of it is left in the buffers other execution
+ * contexts share, so another context may hold the model while it waits --
+ * which is what ds4-server's executor uses it for.  The width of one chunk,
+ * and so of one hand-off quantum, is --prefill-chunk.  Only the families that
+ * chunk a prefill inside the engine call this; today that is qwen4exp. */
+typedef int (*ds4_prefill_yield_fn)(void *ud, int pos, int len);
+void ds4_session_set_prefill_yield(ds4_session *s, ds4_prefill_yield_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */

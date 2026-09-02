@@ -9634,8 +9634,14 @@ struct server_slot {
 
     job *assigned;
     job *running;
+    /* The job this context is queued for or executing, from dispatch until
+     * the worker clears `busy`.  Guarded by srv->mu, so the scheduler can
+     * read a busy context's prompt without racing the session its worker is
+     * mutating (job_busy_owner_locked). */
+    job *work;
     bool busy;
     bool prefill_waiting;
+    bool decode_waiting;
 
     bool decode_pending;
     bool decode_in_flight;
@@ -9654,6 +9660,10 @@ struct server {
     int slot_count;
     int ctx_size;
     bool batched_mode;
+    /* qwen4exp: --exec-contexts execution contexts over one shared prefix
+     * cache, time-sliced by the executor.  Mutually exclusive with
+     * batched_mode, which is refused for a family that shares its cache. */
+    bool multi_ctx_mode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -9669,9 +9679,15 @@ struct server {
     bool model_busy;
     bool model_stopping;
     int decode_pending;
+    /* Executor bookkeeping, guarded by model_mu: contexts queued for a decode
+     * step, contexts inside their decode loop, and how many steps have been
+     * granted since the last prefill quantum. */
+    int decode_waiting;
     int active_generations;
+    int decodes_since_prefill;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    int last_decode_slot;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -11769,6 +11785,49 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
 
+/* =========================================================================
+ * The model executor.
+ * =========================================================================
+ *
+ * There is one model lock and inference_mu is it: every engine call takes it,
+ * so exactly one context is ever inside the backend.  model_mu adds nothing
+ * but fairness on top -- it decides who acquires inference_mu next.  The lock
+ * order is model_mu then inference_mu and never the reverse; every hand-off
+ * releases inference_mu before it touches model_mu.
+ *
+ * Two schedulers share that machinery.  --batched-session (DeepSeek, GLM)
+ * coalesces decode into one ds4_sessions_eval_batch through the decode
+ * coordinator, and turns MTP speculation off to do it.  --exec-contexts
+ * (qwen4exp) does not: a speculative step there is self-contained per context
+ * -- its own draft KV, its own rollback checkpoints -- so each context keeps
+ * its own MTP step (D4) and the executor time-slices the steps against the
+ * prefilling context (D3):
+ *
+ *     one speculative step for each generating context,
+ *     then one prefill quantum for the context that is prefilling, repeat.
+ *
+ * server_prefill_before_decode_locked is that policy: a queued decode step
+ * goes before a queued prefill quantum until every generating context has had
+ * its step since the last quantum, and then the prefiller takes one -- or a
+ * long prompt would never finish while anyone is decoding.  Round-robin
+ * inside each class.  A prefill quantum is one engine prefill chunk
+ * (--prefill-chunk; 512 rows for qwen4exp once there is more than one
+ * context), so a decoding stream waits at most one chunk for the model.  The
+ * quantum is the chunk width rather than a cap on top of it because chunk
+ * width perturbs the router logits of a 512-expert MoE: an answer must not
+ * depend on whether the request happened to share the model.
+ *
+ * D5, true batched decode, would replace the per-context steps with one
+ * forward carrying rows from both contexts.  Nothing here assumes a step is
+ * one row -- the policy counts steps, not tokens -- and the per-row position
+ * and context indexing the kernels already take is what it would need. */
+
+/* Whether the executor arbitrates engine calls at all.  With one resident
+ * session and one worker there is nothing to arbitrate. */
+static bool server_time_sliced(const server *s) {
+    return s && (s->batched_mode || s->multi_ctx_mode);
+}
+
 static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
     for (int n = 1; n <= s->slot_count; n++) {
@@ -11778,9 +11837,29 @@ static int server_next_prefill_slot_locked(const server *s) {
     return -1;
 }
 
-static bool server_prefill_enter(server *s, server_slot *slot) {
+/* model_mu held: the next context whose decode step is due, round-robin. */
+static int server_next_decode_slot_locked(const server *s) {
+    if (!s || s->slot_count <= 0) return -1;
+    for (int n = 1; n <= s->slot_count; n++) {
+        int id = (s->last_decode_slot + n) % s->slot_count;
+        if (s->slots[id].decode_waiting) return id;
+    }
+    return -1;
+}
+
+/* model_mu held: may a prefill quantum go before the decode steps that are
+ * queued?  Only when none is queued -- which is also what keeps the GPU busy
+ * while a generator does its host-side work, and what stops a generator that
+ * never comes back from wedging the prefill -- or when every generating
+ * context has already had its step since the last quantum. */
+static bool server_prefill_before_decode_locked(const server *s) {
+    return s->decode_waiting == 0 ||
+           s->decodes_since_prefill >= s->active_generations;
+}
+
+static bool server_model_enter_prefill(server *s, server_slot *slot) {
     if (!s || !slot || slot_job_cancelled(slot)) return false;
-    if (!s->batched_mode) {
+    if (!server_time_sliced(s)) {
         pthread_mutex_lock(&s->inference_mu);
         if (slot_job_cancelled(slot)) {
             pthread_mutex_unlock(&s->inference_mu);
@@ -11794,6 +11873,7 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
            (s->model_busy || s->decode_pending > 0 ||
+            !server_prefill_before_decode_locked(s) ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
     }
@@ -11805,16 +11885,52 @@ static bool server_prefill_enter(server *s, server_slot *slot) {
     }
     slot->prefill_waiting = false;
     s->last_prefill_slot = slot->id;
+    s->decodes_since_prefill = 0;      /* this quantum closes the round */
     s->model_busy = true;
     pthread_mutex_unlock(&s->model_mu);
     pthread_mutex_lock(&s->inference_mu);
     return true;
 }
 
-static void server_prefill_leave(server *s) {
+/* One grant of the model for one decode step of this context: a whole
+ * speculative step, draft and verify together, or one plain token. */
+static bool server_model_enter_decode(server *s, server_slot *slot) {
+    if (!s || !slot || slot_job_cancelled(slot) || g_stop_requested) return false;
+    if (!s->multi_ctx_mode) {
+        pthread_mutex_lock(&s->inference_mu);
+        return true;
+    }
+
+    pthread_mutex_lock(&s->model_mu);
+    slot->decode_waiting = true;
+    s->decode_waiting++;
+    pthread_cond_broadcast(&s->model_cv);
+    while (!g_stop_requested && !slot_job_cancelled(slot) &&
+           (s->model_busy ||
+            (server_next_prefill_slot_locked(s) >= 0 &&
+             server_prefill_before_decode_locked(s)) ||
+            server_next_decode_slot_locked(s) != slot->id)) {
+        pthread_cond_wait(&s->model_cv, &s->model_mu);
+    }
+    slot->decode_waiting = false;
+    s->decode_waiting--;
+    if (g_stop_requested || slot_job_cancelled(slot)) {
+        pthread_cond_broadcast(&s->model_cv);
+        pthread_mutex_unlock(&s->model_mu);
+        return false;
+    }
+    s->last_decode_slot = slot->id;
+    s->decodes_since_prefill++;
+    s->model_busy = true;
+    pthread_mutex_unlock(&s->model_mu);
+    pthread_mutex_lock(&s->inference_mu);
+    return true;
+}
+
+static void server_model_leave(server *s) {
     if (!s) return;
     pthread_mutex_unlock(&s->inference_mu);
-    if (!s->batched_mode) return;
+    if (!server_time_sliced(s)) return;
     pthread_mutex_lock(&s->model_mu);
     s->model_busy = false;
     pthread_cond_broadcast(&s->model_cv);
@@ -11838,6 +11954,30 @@ static int server_prefill_quantum(server *s) {
     return server_prefill_quantum_for(s, generation_active);
 }
 
+/* One prefill turn per engine chunk (multi-context mode).  `first` is the
+ * chunk the caller already holds the model for. */
+typedef struct {
+    server      *srv;
+    server_slot *slot;
+    bool         first;
+    bool         held;
+} server_prefill_turn;
+
+static int server_prefill_yield_cb(void *ud, int pos, int len) {
+    server_prefill_turn *t = ud;
+    (void)pos;
+    (void)len;
+    if (t->first) {
+        t->first = false;
+        return 0;
+    }
+    server_model_leave(t->srv);
+    t->held = false;
+    if (!server_model_enter_prefill(t->srv, t->slot)) return 1;
+    t->held = true;
+    return 0;
+}
+
 /* Synchronize one resident slot without monopolizing the model executor.  A
  * non-matching prompt is first rebuilt to one quantum; a matching checkpoint
  * advances from its current frontier. Absolute positions remain session-local,
@@ -11846,10 +11986,29 @@ static int server_session_sync(server *s, server_slot *slot,
                                const ds4_tokens *prompt,
                                char *err, size_t errlen) {
     if (!s || !slot || !prompt) return 1;
+    if (s->multi_ctx_mode) {
+        /* The engine chunks this prompt itself, and it stops at the positions
+         * its prefix cache wants a checkpoint at, so the server only has to
+         * take a turn at each chunk boundary.  Truncating the prompt instead
+         * -- what batched mode does below -- would make every quantum look
+         * like a prompt end to that cache and spend a checkpoint slot, and an
+         * eviction, on each one. */
+        server_prefill_turn turn = { .srv = s, .slot = slot,
+                                     .first = true, .held = false };
+        ds4_session_set_prefill_yield(slot->session, server_prefill_yield_cb, &turn);
+        int rc = DS4_SESSION_SYNC_INTERRUPTED;
+        if (server_model_enter_prefill(s, slot)) {
+            turn.held = true;
+            rc = ds4_session_sync(slot->session, prompt, err, errlen);
+        }
+        if (turn.held) server_model_leave(s);
+        ds4_session_set_prefill_yield(slot->session, NULL, NULL);
+        return rc;
+    }
     if (!s->batched_mode) {
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_model_enter_prefill(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, prompt, err, errlen);
-        server_prefill_leave(s);
+        server_model_leave(s);
         return rc;
     }
 
@@ -11870,10 +12029,10 @@ static int server_session_sync(server *s, server_slot *slot,
 
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_model_enter_prefill(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync(slot->session, &prefix, err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
-        server_prefill_leave(s);
+        server_model_leave(s);
         called = true;
         if (rc != 0) return rc;
         if (done >= prompt->len) return 0;
@@ -11894,12 +12053,15 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
     if (!image_count)
         return server_session_sync(s, slot, prompt, err, errlen);
     if (!s || !slot || !prompt || !images) return 1;
+    /* No multimodal family shares a prefix cache, so multi-context mode never
+     * gets here with images; if one ever does it takes a single long turn
+     * rather than silently interleaving image spans. */
     if (!s->batched_mode) {
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_model_enter_prefill(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, prompt,
                                              images, image_count,
                                              err, errlen);
-        server_prefill_leave(s);
+        server_model_leave(s);
         return rc;
     }
 
@@ -11928,12 +12090,12 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         }
         ds4_tokens prefix = *prompt;
         prefix.len = target;
-        if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+        if (!server_model_enter_prefill(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
         int rc = ds4_session_sync_multimodal(slot->session, &prefix,
                                              images, prefix_images,
                                              err, errlen);
         if (rc == 0) done = ds4_session_pos(slot->session);
-        server_prefill_leave(s);
+        server_model_leave(s);
         called = true;
         if (rc != 0) return rc;
         if (done >= prompt->len) return 0;
@@ -12425,7 +12587,7 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
 }
 
 static void server_generation_enter(server *s) {
-    if (!s || !s->batched_mode) return;
+    if (!server_time_sliced(s)) return;
     pthread_mutex_lock(&s->model_mu);
     s->active_generations++;
     pthread_cond_broadcast(&s->model_cv);
@@ -12433,7 +12595,7 @@ static void server_generation_enter(server *s) {
 }
 
 static void server_generation_leave(server *s) {
-    if (!s || !s->batched_mode) return;
+    if (!server_time_sliced(s)) return;
     pthread_mutex_lock(&s->model_mu);
     if (s->active_generations > 0) s->active_generations--;
     pthread_cond_broadcast(&s->model_cv);
@@ -12457,6 +12619,19 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
     if (!s || !slot) return 1;
+    if (s->multi_ctx_mode) {
+        /* One grant of the model for one token.  No coalescing: contexts here
+         * keep their own state and their own speculative step (D4). */
+        if (!server_model_enter_decode(s, slot)) {
+            if (err && errlen) snprintf(err, errlen, "%s",
+                                        g_stop_requested ? "shutdown requested" :
+                                                           "client disconnected");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        int rc = ds4_session_eval(slot->session, token, err, errlen);
+        server_model_leave(s);
+        return rc;
+    }
     if (!s->batched_mode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
             if (err && errlen) snprintf(err, errlen, "%s",
@@ -13179,10 +13354,23 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
+        /* D4: speculation stays on with several execution contexts.  A
+         * qwen4exp step is self-contained per context -- its own draft KV, its
+         * own rollback checkpoints, its own n-gram memory -- so only
+         * --batched-session, which coalesces decode into one batched forward
+         * over shared rows, has to turn it off.  Draft and verify are one
+         * grant of the model. */
         if (!s->batched_mode &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
+            if (!server_model_enter_decode(s, slot)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "%s",
+                         g_stop_requested ? "shutdown requested" :
+                                            "client disconnected");
+                break;
+            }
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
                     slot->session, token, max_tokens - completion,
@@ -13196,6 +13384,7 @@ decode_again:
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
             }
+            server_model_leave(s);
             if (ntok < 0) {
                 finish = "error";
                 break;
@@ -13923,6 +14112,46 @@ static int job_required_slot_locked(server *s, const job *j) {
     return -1;
 }
 
+/* Longest common token prefix of two prompts. */
+static int prompt_common_prefix(const ds4_tokens *a, const ds4_tokens *b) {
+    if (!a || !b) return 0;
+    const int n = a->len < b->len ? a->len : b->len;
+    int i = 0;
+    while (i < n && a->v[i] == b->v[i]) i++;
+    return i;
+}
+
+/* A shared prompt prefix this long means "the same conversation".  It is the
+ * page size of the qwen4exp KV pool, which is also the granularity two paths
+ * can share pages at, and it is far above any chat scaffolding two unrelated
+ * requests have in common. */
+#define DS4_JOB_SAME_CONVERSATION_MIN 256
+
+/* D2: a request that extends a conversation a context is generating right now
+ * belongs to that context and waits for it.  It is going to extend the same
+ * path, and the frontier it wants is not in the shared tree until that
+ * generation ends and checkpoints it -- so handing it to the other context
+ * would resume from an older checkpoint and prefill the difference twice, and
+ * copy a page to do it.  Returns that context, or -1.
+ *
+ * The comparison is against the running job's prompt, not the context's live
+ * session: the session's token vector is being appended to by its own worker,
+ * while the job is stable for as long as the slot names it. */
+static int job_busy_owner_locked(server *s, const job *j) {
+    int owner = -1;
+    int best = DS4_JOB_SAME_CONVERSATION_MIN - 1;
+    for (int i = 0; i < s->slot_count; i++) {
+        const job *work = s->slots[i].work;
+        if (!work || work == j) continue;
+        const int common = prompt_common_prefix(&work->req.prompt, &j->req.prompt);
+        if (common > best) {
+            best = common;
+            owner = i;
+        }
+    }
+    return owner;
+}
+
 static int job_slot_score(server *s, server_slot *slot, const job *j,
                           int required_slot) {
     if (!s || !slot || !j || slot->busy || slot->assigned) return INT_MIN;
@@ -13933,7 +14162,7 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
 }
 
 static void dispatch_jobs_locked(server *s) {
-    if (!s || !s->batched_mode) return;
+    if (!server_time_sliced(s)) return;
     for (;;) {
         job *chosen = NULL;
         job *chosen_prev = NULL;
@@ -13944,6 +14173,7 @@ static void dispatch_jobs_locked(server *s) {
         job *prev = NULL;
         for (job *j = s->head; j; prev = j, j = j->next) {
             int required = job_required_slot_locked(s, j);
+            if (required < 0) required = job_busy_owner_locked(s, j);
             server_slot *best = NULL;
             int best_score = INT_MIN;
             for (int i = 0; i < s->slot_count; i++) {
@@ -13970,6 +14200,7 @@ static void dispatch_jobs_locked(server *s) {
         if (s->tail == chosen) s->tail = chosen_prev;
         chosen->next = NULL;
         chosen_slot->assigned = chosen;
+        chosen_slot->work = chosen;
         chosen_slot->busy = true;
         pthread_cond_broadcast(&s->cv);
     }
@@ -13983,7 +14214,7 @@ static bool enqueue(server *s, job *j) {
     }
     if (s->tail) s->tail->next = j; else s->head = j;
     s->tail = j;
-    if (s->batched_mode) {
+    if (server_time_sliced(s)) {
         dispatch_jobs_locked(s);
         pthread_cond_broadcast(&s->cv);
     } else {
@@ -14036,12 +14267,17 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_unlock(&s->mu);
 
         generate_job(s, slot, j);
-        job_complete(j);
 
+        /* Release the slot -- and its claim on this job -- before the client
+         * thread is allowed to return: `work` outlives `assigned` so the
+         * scheduler can see what a busy context is working on, and the job
+         * itself lives on that thread's stack. */
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
+        slot->work = NULL;
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
+        job_complete(j);
     }
     return NULL;
 }
@@ -14301,11 +14537,12 @@ static void server_cancel_job(server *s, job *j) {
         detached = true;
         break;
     }
-    if (!detached && s->batched_mode) {
+    if (!detached && server_time_sliced(s)) {
         for (int i = 0; i < s->slot_count; i++) {
             server_slot *slot = &s->slots[i];
             if (slot->assigned != j) continue;
             slot->assigned = NULL;
+            slot->work = NULL;
             slot->busy = false;
             detached = true;
             dispatch_jobs_locked(s);
@@ -14889,8 +15126,11 @@ static void server_request_worker_stop(server *s) {
     pthread_mutex_unlock(&s->mu);
 }
 
+/* Wake everything parked on the executor.  In batched mode that also stops
+ * the decode coordinator; in multi-context mode the waiters exit on
+ * g_stop_requested and only need the broadcast. */
 static void server_request_decode_stop(server *s) {
-    if (!s->batched_mode) return;
+    if (!server_time_sliced(s)) return;
     pthread_mutex_lock(&s->model_mu);
     s->model_stopping = true;
     pthread_cond_broadcast(&s->model_cv);
@@ -14960,7 +15200,9 @@ int main(int argc, char **argv) {
 
     /* A family with one prefix cache shared by every session has no use for
      * independent slots: they would draw from the same page pool and the same
-     * checkpoint store, and batched mode also turns MTP speculation off. */
+     * checkpoint store, and batched mode also turns MTP speculation off.  Its
+     * concurrency is --exec-contexts instead: sessions over one pool, one
+     * tree and one prefill scratch, time-sliced by the executor. */
     if (cfg.batched_sessions > 0 && ds4_engine_shares_prefix_cache(engine)) {
         server_log(DS4_LOG_DEFAULT,
                    "ds4-server: --batched-session %d ignored: this model shares one "
@@ -14968,7 +15210,11 @@ int main(int argc, char **argv) {
                    cfg.batched_sessions);
         cfg.batched_sessions = 0;
     }
-    const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
+    const bool multi_ctx_mode = cfg.batched_sessions <= 0 &&
+                                ds4_engine_shares_prefix_cache(engine) &&
+                                cfg.engine.exec_contexts > 1;
+    const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions :
+                           multi_ctx_mode ? (int)cfg.engine.exec_contexts : 1;
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
                        ds4_engine_prefill_chunk(engine),
@@ -14980,8 +15226,10 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.multi_ctx_mode = multi_ctx_mode;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
+    s.last_decode_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
@@ -14989,7 +15237,7 @@ int main(int argc, char **argv) {
     s.enable_cors = cfg.enable_cors;
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
-    if (s.batched_mode) {
+    if (server_time_sliced(&s)) {
         s.slot_threads = xmalloc((size_t)slot_count * sizeof(*s.slot_threads));
         memset(s.slot_threads, 0, (size_t)slot_count * sizeof(*s.slot_threads));
     }
@@ -15048,6 +15296,14 @@ int main(int argc, char **argv) {
                        "ds4-server: MTP speculative decoding is disabled while native session batching is active");
         }
     }
+    if (s.multi_ctx_mode) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: %d execution contexts over one prefix cache, "
+                   "time-sliced: one speculative step per generating context, "
+                   "then one %d-row prefill quantum%s",
+                   s.slot_count, ds4_session_prefill_cap(s.slots[0].session),
+                   ds4_engine_has_mtp(engine) ? " (MTP stays on)" : "");
+    }
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {
@@ -15063,13 +15319,18 @@ int main(int argc, char **argv) {
     pthread_t worker = (pthread_t){0};
     int slot_threads_started = 0;
     bool decode_thread_started = false;
-    if (s.batched_mode) {
-        if (pthread_create(&s.decode_thread, NULL, decode_worker_main, &s) != 0) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: failed to start decode coordinator");
-            server_close_resources(&s);
-            return 1;
+    if (server_time_sliced(&s)) {
+        /* Only batched mode coalesces decode into one backend call, so only
+         * it needs the coordinator; multi-context decode is one grant of the
+         * model per context, taken by the context's own worker. */
+        if (s.batched_mode) {
+            if (pthread_create(&s.decode_thread, NULL, decode_worker_main, &s) != 0) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: failed to start decode coordinator");
+                server_close_resources(&s);
+                return 1;
+            }
+            decode_thread_started = true;
         }
-        decode_thread_started = true;
         for (int i = 0; i < s.slot_count; i++) {
             if (pthread_create(&s.slot_threads[i], NULL, slot_worker_main,
                                &s.slots[i]) != 0) {
@@ -15077,11 +15338,11 @@ int main(int argc, char **argv) {
                            "ds4-server: failed to start session worker %d/%d",
                            i + 1, s.slot_count);
                 server_request_worker_stop(&s);
+                server_request_decode_stop(&s);
                 for (int j = 0; j < slot_threads_started; j++) {
                     pthread_join(s.slot_threads[j], NULL);
                 }
-                server_request_decode_stop(&s);
-                pthread_join(s.decode_thread, NULL);
+                if (decode_thread_started) pthread_join(s.decode_thread, NULL);
                 server_close_resources(&s);
                 return 1;
             }
@@ -15097,7 +15358,8 @@ int main(int argc, char **argv) {
     if (lfd < 0) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: failed to listen on %s:%d: %s", cfg.host, cfg.port, strerror(errno));
         server_request_worker_stop(&s);
-        if (s.batched_mode) {
+        if (server_time_sliced(&s)) {
+            if (s.multi_ctx_mode) server_request_decode_stop(&s);
             for (int i = 0; i < slot_threads_started; i++) {
                 pthread_join(s.slot_threads[i], NULL);
             }
@@ -15151,7 +15413,12 @@ int main(int argc, char **argv) {
 
     server_log(DS4_LOG_DEFAULT, "ds4-server: shutdown requested, draining requests");
     server_request_worker_stop(&s);
-    if (s.batched_mode) {
+    if (server_time_sliced(&s)) {
+        /* Multi-context workers park on model_cv waiting their turn and leave
+         * on g_stop_requested, but only a broadcast makes them look; the
+         * batched decode coordinator must instead outlive its slot workers,
+         * so it is told to stop after the joins. */
+        if (s.multi_ctx_mode) server_request_decode_stop(&s);
         for (int i = 0; i < slot_threads_started; i++) {
             pthread_join(s.slot_threads[i], NULL);
         }
@@ -15215,6 +15482,97 @@ static void test_batched_prefill_round_robin(void) {
     slots[0].prefill_waiting = false;
     slots[2].prefill_waiting = false;
     TEST_ASSERT(server_next_prefill_slot_locked(&s) == -1);
+}
+
+/* The executor's round-robin over the contexts whose decode step is due. */
+static void test_multi_ctx_decode_round_robin(void) {
+    server s = {0};
+    server_slot slots[3] = {0};
+    s.slots = slots;
+    s.slot_count = 3;
+
+    s.last_decode_slot = 0;
+    TEST_ASSERT(server_next_decode_slot_locked(&s) == -1);
+    slots[0].decode_waiting = true;
+    slots[2].decode_waiting = true;
+    TEST_ASSERT(server_next_decode_slot_locked(&s) == 2);
+    s.last_decode_slot = 2;
+    TEST_ASSERT(server_next_decode_slot_locked(&s) == 0);
+    slots[0].decode_waiting = false;
+    TEST_ASSERT(server_next_decode_slot_locked(&s) == 2);
+}
+
+/* D3's loop, as the grant policy expresses it: every generating context's
+ * step goes before the prefill quantum, and then the quantum goes even though
+ * a decoder is queued again. */
+static void test_multi_ctx_executor_alternation(void) {
+    server s = {0};
+
+    /* Nobody decoding: the prefiller runs whenever it is ready. */
+    TEST_ASSERT(server_prefill_before_decode_locked(&s));
+
+    /* One generating context, its step not yet taken this round. */
+    s.active_generations = 1;
+    s.decode_waiting = 1;
+    s.decodes_since_prefill = 0;
+    TEST_ASSERT(!server_prefill_before_decode_locked(&s));
+    /* Step taken: the quantum is next even though the decoder wants more. */
+    s.decodes_since_prefill = 1;
+    TEST_ASSERT(server_prefill_before_decode_locked(&s));
+
+    /* Two generating contexts: both steps first, then the quantum. */
+    s.active_generations = 2;
+    s.decode_waiting = 2;
+    s.decodes_since_prefill = 1;
+    TEST_ASSERT(!server_prefill_before_decode_locked(&s));
+    s.decodes_since_prefill = 2;
+    TEST_ASSERT(server_prefill_before_decode_locked(&s));
+
+    /* A generation that stops asking for steps cannot wedge the prefill. */
+    s.decode_waiting = 0;
+    s.decodes_since_prefill = 0;
+    TEST_ASSERT(server_prefill_before_decode_locked(&s));
+}
+
+/* D2: a request that extends a conversation a context is generating is bound
+ * to that context; one that only shares chat scaffolding is not. */
+static void test_multi_ctx_same_conversation_affinity(void) {
+    server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
+
+    enum { N = DS4_JOB_SAME_CONVERSATION_MIN + 8 };
+    int *live = xmalloc(N * sizeof(int));
+    int *follow = xmalloc(N * sizeof(int));
+    int *other = xmalloc(N * sizeof(int));
+    for (int i = 0; i < N; i++) {
+        live[i] = i;
+        follow[i] = i;
+        other[i] = i < DS4_JOB_SAME_CONVERSATION_MIN - 1 ? i : 100000 + i;
+    }
+    follow[N - 1] = 999;      /* the follow-up turn diverges at the very end */
+
+    job running = {0};
+    job followup = {0};
+    job unrelated = {0};
+    running.req.prompt = (ds4_tokens){.v = live, .len = N, .cap = N};
+    followup.req.prompt = (ds4_tokens){.v = follow, .len = N, .cap = N};
+    unrelated.req.prompt = (ds4_tokens){.v = other, .len = N, .cap = N};
+
+    TEST_ASSERT(prompt_common_prefix(&running.req.prompt, &followup.req.prompt) == N - 1);
+    TEST_ASSERT(job_busy_owner_locked(&s, &followup) == -1);   /* no context is busy */
+
+    slots[1].work = &running;
+    slots[1].busy = true;
+    TEST_ASSERT(job_busy_owner_locked(&s, &followup) == 1);
+    TEST_ASSERT(job_busy_owner_locked(&s, &unrelated) == -1);
+    /* The job a context is already running is not its own owner. */
+    TEST_ASSERT(job_busy_owner_locked(&s, &running) == -1);
+
+    free(live);
+    free(follow);
+    free(other);
 }
 
 static void test_mixed_prefill_quantum_option(void) {
@@ -20309,6 +20667,9 @@ static void test_responses_inline_image_content(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_batched_prefill_round_robin();
+    test_multi_ctx_decode_round_robin();
+    test_multi_ctx_executor_alternation();
+    test_multi_ctx_same_conversation_affinity();
     test_mixed_prefill_quantum_option();
     test_batched_live_continuation_slot_binding();
     test_request_defaults_use_min_p_filtering();

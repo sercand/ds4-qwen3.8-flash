@@ -55489,6 +55489,13 @@ struct ds4_q4e_graph {
  * DS4_EXEC_CONTEXTS_DEFAULT. */
 #define Q4E_CTX_MAX      ((uint32_t)DS4_EXEC_CONTEXTS_MAX)
 
+/* The prefill chunk once more than one execution context is asked for: it is
+ * the executor's hand-off quantum, and 512 rows is roughly a second of
+ * prefill on a GB10, so a decoding stream never waits much longer than that
+ * for the model.  Wider chunks prefill faster (see q4e_scratch_ensure), which
+ * is the trade --prefill-chunk exists to make. */
+#define Q4E_MULTI_CTX_CHUNK 512u
+
 typedef struct {
     bool     used;
     bool     ready;              /* tensors allocated (they outlive eviction) */
@@ -56080,6 +56087,8 @@ struct ds4_session {
     void *display_progress_ud;
     ds4_session_cancel_fn cancel;
     void *cancel_ud;
+    ds4_prefill_yield_fn prefill_yield;
+    void *prefill_yield_ud;
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
@@ -67066,10 +67075,18 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
      * memory -- the routed intermediates are tok_cap * n_used wide, and at
      * 2048 they come to roughly 700 MiB.
      *
-     * ds4-server lowers it (--prefill-chunk) when it runs more than one
-     * execution context: the chunk is also the executor's hand-off quantum,
-     * so a decoding stream waits at most one chunk for the model. */
-    g->tok_cap = e->prefill_chunk ? e->prefill_chunk : 2048u;
+     * With more than one execution context the chunk is also the executor's
+     * hand-off quantum -- a decoding stream waits at most one chunk for the
+     * model -- so it drops to Q4E_MULTI_CTX_CHUNK, about a second of prefill.
+     * That is the width for every request, not only for one that happens to
+     * share the model, because chunk width perturbs the router logits (see
+     * below) and an answer must not depend on who else was running.
+     * --prefill-chunk overrides it, --exec-contexts 1 takes the wide chunk
+     * back. */
+    g->tok_cap = e->prefill_chunk;
+    if (g->tok_cap == 0u) {
+        g->tok_cap = e->exec_contexts > 1u ? Q4E_MULTI_CTX_CHUNK : 2048u;
+    }
     {
         /* The routed GEMMs are the reason to tune this: a chunk spreads
          * tok_cap * 10 rows over 512 experts, so 1024 tokens leaves each expert
@@ -68987,6 +69004,12 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud) 
     s->cancel_ud = ud;
 }
 
+void ds4_session_set_prefill_yield(ds4_session *s, ds4_prefill_yield_fn fn, void *ud) {
+    if (!s) return;
+    s->prefill_yield = fn;
+    s->prefill_yield_ud = ud;
+}
+
 static bool ds4_session_cancelled(ds4_session *s) {
     return s && s->cancel && s->cancel(s->cancel_ud);
 }
@@ -70402,6 +70425,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const uint32_t take = g->tok_cap < left ? g->tok_cap : left;
             const bool last = (pos + take) == len;
             if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            /* The executor's hand-off point (see ds4_session_set_prefill_yield).
+             * Everything of this context is committed here -- g->pos, the
+             * session checkpoint, the page table, the staged draft rows -- and
+             * the shared scratch holds nothing of it, so another execution
+             * context may run a chunk or a speculative step before this loop
+             * gets the model back. */
+            if (s->prefill_yield &&
+                s->prefill_yield(s->prefill_yield_ud, (int)pos, (int)len) != 0) {
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
