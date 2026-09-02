@@ -445,6 +445,10 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+/* Leading prompt tokens the session can reuse without recomputation: the live
+ * checkpoint when the prompt extends it, or (qwen4exp) the state snapshot
+ * taken at the end of the previous prompt.  A chunked prefill starts here. */
+int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,

@@ -54590,6 +54590,7 @@ static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
 #define Q4E_GDN_V    ((uint32_t)(DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM))
 #define Q4E_GDN_IN   (2u * Q4E_GDN_K + Q4E_GDN_V)
 #define Q4E_PLE_HIST ((DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM)
+#define Q4E_SNAP_MAX 8u
 
 /* Scratch and persistent state for one session.  Scratch is sized for the
  * prefill chunk; decode uses the same buffers with n_tok = 1. */
@@ -54680,6 +54681,32 @@ typedef struct {
     ds4_gpu_tensor *gdn_conv_ckpt[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state_ckpt[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv_ckpt;
+
+    /* Snapshots of the recurrent state at prefill chunk boundaries (a ring
+     * of the most recent Q4E_SNAP_MAX), in the spirit of Marconi: the GDN
+     * state cannot be rewound, so a follow-up prompt that shares a prefix
+     * resumes from the longest snapshot that is a prefix of it and prefills
+     * only the rest.  Clients re-render the assistant turn, so the shared
+     * prefix ends just before the previous prompt's generation header; the
+     * last chunk boundary below that point is what gets reused.  The KV
+     * caches need no copy: positions below a snapshot are only rewritten
+     * after every longer snapshot has been dropped.  ~113 MB each. */
+    struct q4e_snapshot {
+        bool            valid;
+        uint32_t        pos;
+        uint64_t        serial;      /* insertion order, for eviction */
+        ds4_tokens      tokens;
+        ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
+        ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
+        ds4_gpu_tensor *ple_conv;
+        ds4_gpu_tensor *pend_row;    /* the draft's pending residual row */
+        bool            pend_valid;
+        uint32_t        pend_pos0;
+        float          *logits;      /* host: the last row's logits */
+        bool            logits_valid; /* only a prompt-final chunk has them */
+    } snap[Q4E_SNAP_MAX];
+    uint32_t        snap_count;      /* allocated entries */
+    uint64_t        snap_serial;
     ds4_gpu_tensor *argmax_dev;      /* int32 per logits row */
     int32_t        *argmax_host;     /* the verify rows' greedy picks */
 
@@ -65294,6 +65321,17 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         g->argmax_dev,
     };
     for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
+    for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) {
+        struct q4e_snapshot *sn = &g->snap[k];
+        for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+            ds4_gpu_tensor_free(sn->gdn_conv[il]);
+            ds4_gpu_tensor_free(sn->gdn_state[il]);
+        }
+        ds4_gpu_tensor_free(sn->ple_conv);
+        ds4_gpu_tensor_free(sn->pend_row);
+        ds4_tokens_free(&sn->tokens);
+        free(sn->logits);
+    }
     ds4_ple_stream_close(g->ple_stream);
     free(g->ple_row_ids);
     free(g->ple_row_data);
@@ -65318,6 +65356,120 @@ static void q4e_graph_reset(ds4_q4e_graph *g) {
     }
     g->pos = 0;
     g->pend_valid = false;
+    /* The prefill that follows rewrites the KV from position 0. */
+    for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) g->snap[k].valid = false;
+}
+
+/* Copy the recurrent state between the live buffers and snapshot `sn`. */
+static int q4e_snapshot_copy(ds4_q4e_graph *g, struct q4e_snapshot *sn, bool to_snapshot) {
+    const uint64_t f = sizeof(float);
+    const uint64_t conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                 DS4_N_GDN_HEAD_DIM * f;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->gdn_conv[il] || !sn->gdn_conv[il]) continue;
+        ds4_gpu_tensor *c_live = g->gdn_conv[il], *c_snap = sn->gdn_conv[il];
+        ds4_gpu_tensor *s_live = g->gdn_state[il], *s_snap = sn->gdn_state[il];
+        if (!ds4_gpu_tensor_copy(to_snapshot ? c_snap : c_live, 0,
+                                 to_snapshot ? c_live : c_snap, 0, conv_bytes) ||
+            !ds4_gpu_tensor_copy(to_snapshot ? s_snap : s_live, 0,
+                                 to_snapshot ? s_live : s_snap, 0, state_bytes)) return 1;
+    }
+    if (g->ple_conv && sn->ple_conv) {
+        const uint64_t ple_bytes = (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f;
+        if (!ds4_gpu_tensor_copy(to_snapshot ? sn->ple_conv : g->ple_conv, 0,
+                                 to_snapshot ? g->ple_conv : sn->ple_conv, 0, ple_bytes)) return 1;
+    }
+    return 0;
+}
+
+/* Snapshot the live state at g->pos, which must equal s->checkpoint.len.
+ * Reuses the entry already at this position, else a free one, else the
+ * oldest. */
+static int q4e_snapshot_take(ds4_session *s, bool logits_valid) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (g->snap_count == 0 || (uint32_t)s->checkpoint.len != g->pos) return 0;
+    struct q4e_snapshot *sn = NULL;
+    for (uint32_t k = 0; k < g->snap_count; k++) {
+        if (g->snap[k].valid && g->snap[k].pos == g->pos) { sn = &g->snap[k]; break; }
+    }
+    if (!sn) for (uint32_t k = 0; k < g->snap_count; k++) {
+        if (!g->snap[k].valid) { sn = &g->snap[k]; break; }
+    }
+    if (!sn) {
+        sn = &g->snap[0];
+        for (uint32_t k = 1; k < g->snap_count; k++) {
+            if (g->snap[k].serial < sn->serial) sn = &g->snap[k];
+        }
+    }
+    sn->valid = false;
+    if (q4e_snapshot_copy(g, sn, true) != 0) return 1;
+    sn->pend_valid = false;
+    if (g->mtp_ready && g->pend_valid && g->pend_n == 1u) {
+        if (!ds4_gpu_tensor_copy(sn->pend_row, 0, g->res,
+                                 (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
+                                 (uint64_t)Q4E_HC_DIM * sizeof(float))) return 1;
+        sn->pend_valid = true;
+        sn->pend_pos0 = g->pend_pos0;
+    }
+    sn->tokens.len = 0;
+    for (int i = 0; i < s->checkpoint.len; i++) ds4_tokens_push(&sn->tokens, s->checkpoint.v[i]);
+    sn->logits_valid = logits_valid && sn->logits != NULL;
+    if (sn->logits_valid) memcpy(sn->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    sn->pos = g->pos;
+    sn->serial = ++g->snap_serial;
+    sn->valid = true;
+    return 0;
+}
+
+/* The longest valid snapshot whose tokens are a prefix of `prompt`. */
+static struct q4e_snapshot *q4e_snapshot_find(ds4_q4e_graph *g, const ds4_tokens *prompt) {
+    struct q4e_snapshot *best = NULL;
+    for (uint32_t k = 0; k < g->snap_count; k++) {
+        struct q4e_snapshot *sn = &g->snap[k];
+        if (!sn->valid || (uint32_t)sn->tokens.len != sn->pos) continue;
+        if ((uint32_t)prompt->len < sn->pos) continue;
+        /* An exact match needs the logits of that position. */
+        if ((uint32_t)prompt->len == sn->pos && !sn->logits_valid) continue;
+        if (best && sn->pos <= best->pos) continue;
+        if (ds4_tokens_starts_with(prompt, &sn->tokens)) best = sn;
+    }
+    return best;
+}
+
+/* Rewind the live state to snapshot `sn`.  Snapshots above it describe KV
+ * positions the next prefill rewrites, so they are dropped. */
+static int q4e_snapshot_restore(ds4_session *s, struct q4e_snapshot *sn) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (q4e_snapshot_copy(g, sn, false) != 0) return 1;
+    g->pos = sn->pos;
+    s->checkpoint.len = 0;
+    for (int i = 0; i < sn->tokens.len; i++) token_vec_push(&s->checkpoint, sn->tokens.v[i]);
+    if (sn->logits_valid) memcpy(s->logits, sn->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    g->pend_valid = false;
+    if (g->mtp_ready && sn->pend_valid) {
+        if (!ds4_gpu_tensor_copy(g->res, 0, sn->pend_row, 0,
+                                 (uint64_t)Q4E_HC_DIM * sizeof(float))) return 1;
+        g->pend_valid = true;
+        g->pend_row0 = 0;
+        g->pend_n = 1u;
+        g->pend_pos0 = sn->pend_pos0;
+    }
+    for (uint32_t k = 0; k < g->snap_count; k++) {
+        if (g->snap[k].valid && g->snap[k].pos > sn->pos) g->snap[k].valid = false;
+    }
+    return 0;
+}
+
+/* How many leading prompt tokens the session can take as already computed:
+ * the live checkpoint when the prompt extends it, else the longest snapshot
+ * the prompt extends. */
+static uint32_t q4e_reusable_prefix(ds4_session *s, const ds4_tokens *prompt) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (s->checkpoint_valid && (uint32_t)s->checkpoint.len == g->pos &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) return g->pos;
+    const struct q4e_snapshot *sn = q4e_snapshot_find(g, prompt);
+    return sn ? sn->pos : 0;
 }
 
 static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
@@ -65444,6 +65596,29 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
 
     if (ok && g->spec_k) {
         ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
+    }
+    if (ok) {
+        /* DS4_QWEN4EXP_SNAPSHOTS (default 8, 0 disables) chunk-boundary
+         * snapshots, ~113 MB each. */
+        const char *env = getenv("DS4_QWEN4EXP_SNAPSHOTS");
+        long want = (env && env[0]) ? strtol(env, NULL, 10) : (long)Q4E_SNAP_MAX;
+        if (want < 0) want = 0;
+        if (want > (long)Q4E_SNAP_MAX) want = (long)Q4E_SNAP_MAX;
+        g->snap_count = 0;
+        for (long k = 0; k < want && ok; k++) {
+            struct q4e_snapshot *sn = &g->snap[k];
+            for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+                if (!g->gdn_conv[il]) continue;
+                ok = q4e_alloc(&sn->gdn_conv[il], gdn_conv_bytes) &&
+                     q4e_alloc(&sn->gdn_state[il], gdn_state_bytes);
+            }
+            if (ok) ok = q4e_alloc(&sn->ple_conv, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f) &&
+                        q4e_alloc(&sn->pend_row, (uint64_t)Q4E_HC_DIM * f);
+            if (ok) {
+                sn->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+                g->snap_count = (uint32_t)k + 1u;
+            }
+        }
     }
     if (ok) {
         ok = q4e_alloc(&g->argmax_dev, (uint64_t)(g->logit_rows + 1u) * sizeof(int32_t));
@@ -68246,6 +68421,27 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         if (s->checkpoint_valid && ds4_tokens_starts_with(prompt, &s->checkpoint) &&
             (uint32_t)s->checkpoint.len == g->pos) {
             start = g->pos;
+        } else if (q4e_snapshot_find(g, prompt) != NULL) {
+            /* The agent case: a new prompt sharing a prefix with the previous
+             * one (up to the re-rendered assistant turn).  Rewind to the last
+             * chunk boundary inside the shared prefix. */
+            struct q4e_snapshot *sn = q4e_snapshot_find(g, prompt);
+            if (q4e_snapshot_restore(s, sn) != 0) {
+                snprintf(err, errlen, "qwen4exp snapshot restore failed");
+                ds4_session_invalidate(s);
+                return 1;
+            }
+            start = g->pos;
+            if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+                fprintf(stderr, "q4e sync: restored snapshot at %u, prefilling %u new tokens\n",
+                        start, (uint32_t)prompt->len - start);
+            }
+            if (start == (uint32_t)prompt->len) {
+                /* The identical prefix again: its logits were snapshotted. */
+                s->checkpoint_valid = true;
+                s->mtp_draft_valid = false;
+                return 0;
+            }
         } else {
             q4e_graph_reset(g);
             s->checkpoint.len = 0;
@@ -68285,6 +68481,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
             pos += take;
+            /* The checkpoint tracks the prefilled prefix so a snapshot can be
+             * taken at this chunk boundary (only the last chunk has logits
+             * worth keeping; earlier ones are restored for prefix reuse). */
+            s->checkpoint.len = 0;
+            for (uint32_t i = 0; i < pos; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
+            (void)q4e_snapshot_take(s, last);
             ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
         }
         s->checkpoint.len = 0;
@@ -69293,6 +69495,16 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 
     snprintf(err, errlen, "unexpected canonical rewrite state");
     return DS4_SESSION_REWRITE_ERROR;
+}
+
+int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt) {
+    if (!s || !prompt) return 0;
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) return (int)q4e_reusable_prefix(s, prompt);
+#endif
+    if (!s->checkpoint_valid) return 0;
+    const int common = ds4_session_common_prefix(s, prompt);
+    return (common == s->checkpoint.len && prompt->len >= s->checkpoint.len) ? s->checkpoint.len : 0;
 }
 
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {

@@ -11734,10 +11734,11 @@ static int server_session_sync(server *s, server_slot *slot,
     }
 
     pthread_mutex_lock(&s->inference_mu);
-    int live = ds4_session_pos(slot->session);
-    int common = ds4_session_common_prefix(slot->session, prompt);
+    /* The live checkpoint when the prompt extends it, or a state snapshot the
+     * backend kept at the end of the previous prompt; the chunks start there
+     * so a chunk shorter than the snapshot does not discard it. */
+    int done = ds4_session_reusable_prefix(slot->session, prompt);
     pthread_mutex_unlock(&s->inference_mu);
-    int done = common == live && prompt->len >= live ? live : 0;
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
