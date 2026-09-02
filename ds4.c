@@ -54533,9 +54533,17 @@ typedef struct {
  * 29.2 -> 27.6 tok/s.  It has to win on both to be on by default, so it ships
  * off and DS4_QWEN4EXP_NGRAM_K=8 turns it on for echo-shaped work.
  *
- * DS4_QWEN4EXP_NGRAM_MIN is the shortest match accepted.  The minimum is 5:
- * a 3-token key matches template scaffolding all over an agent context, and
- * every firing measured at 3 was such a false positive. */
+ * The knob is not output-neutral: it sizes g->spec_k, and so the verify batch
+ * width and the recurrent checkpoint buffers.  Committed tokens are always
+ * the target's argmax, but a different verify width reassociates the target's
+ * GEMMs, so which of two near-tied tokens wins can differ between K values --
+ * the same effect the prefill chunk width has on the router.
+ *
+ * DS4_QWEN4EXP_NGRAM_MIN is the shortest match accepted, 5 by default and
+ * clamped to the scan's longest key so it cannot silently disable the lookup.
+ * 5 rather than 3 because a 3-token key matches template scaffolding all over
+ * an agent context, and every firing measured at 3 was such a false
+ * positive. */
 static uint32_t q4e_ngram_k(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -54548,13 +54556,17 @@ static uint32_t q4e_ngram_k(void) {
     return (uint32_t)cached;
 }
 
+/* Longest key the scan tries.  Beyond a handful of tokens a match is already
+ * certain enough that a longer key only costs another pass over the history. */
+#define Q4E_NGRAM_MAX_MATCH 6u
+
 static uint32_t q4e_ngram_min_match(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_QWEN4EXP_NGRAM_MIN");
         long v = (env && env[0]) ? strtol(env, NULL, 10) : 5;
         if (v < 1) v = 1;
-        if (v > 8) v = 8;
+        if (v > (long)Q4E_NGRAM_MAX_MATCH) v = Q4E_NGRAM_MAX_MATCH;
         cached = (int)v;
     }
     return (uint32_t)cached;
@@ -54600,8 +54612,8 @@ static bool q4e_ngram_rejected(const q4e_ngram_memory *m, const q4e_ngram_src *s
 }
 
 /* Propose up to max_k tokens after seq = hist[0, len) ++ [first].  Tries the
- * longest key first (up to 6 tokens, down to the configured minimum) and takes
- * the most recent earlier occurrence that passes the filters below.  Returns
+ * longest key first (Q4E_NGRAM_MAX_MATCH down to the configured minimum) and
+ * takes the most recent earlier occurrence that passes the filters.  Returns
  * the number proposed and, when that is non-zero, the match's source in *src.
  * gen_start is where this generation's own tokens begin. */
 static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
@@ -54611,7 +54623,7 @@ static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
     const uint32_t min_n = q4e_ngram_min_match();
     if (max_k == 0 || L < min_n + 1u) return 0;
 #define Q4E_SEQ(j) ((j) < len ? hist[(j)] : first)
-    for (uint32_t n = 6u; n >= min_n; n--) {
+    for (uint32_t n = Q4E_NGRAM_MAX_MATCH; n >= min_n; n--) {
         if (n + 1u > L) continue;
         /* key = seq[L - n, L).  It has to lie inside the generated text: the
          * prompt ends with the assistant-turn header, and a key reaching back
@@ -54829,6 +54841,7 @@ typedef struct {
     uint64_t spec_ngram_drafted;
     uint64_t spec_ngram_accepted;
     uint64_t spec_ngram_zero;        /* n-gram steps the target rejected outright */
+    uint64_t spec_ngram_vetoed;      /* proposals the first-token gate refused */
     /* Per-generation n-gram state: where the generated text starts and which
      * matches the target already rejected.  Both live here, not in a global,
      * because concurrent requests each have their own graph. */
@@ -65400,7 +65413,8 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         fprintf(stderr,
                 "ds4: qwen4exp spec stats: steps=%llu drafted=%llu accepted=%llu "
                 "(%.2f accepted/step, %.1f%% of drafts) draft=%.1fms verify=%.1fms "
-                "per step; ngram steps=%llu drafted=%llu accepted=%llu zero=%llu\n",
+                "per step; ngram steps=%llu drafted=%llu accepted=%llu zero=%llu "
+                "vetoed=%llu\n",
                 (unsigned long long)g->spec_steps,
                 (unsigned long long)g->spec_drafted,
                 (unsigned long long)g->spec_accepted,
@@ -65411,7 +65425,8 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
                 (unsigned long long)g->spec_ngram_steps,
                 (unsigned long long)g->spec_ngram_drafted,
                 (unsigned long long)g->spec_ngram_accepted,
-                (unsigned long long)g->spec_ngram_zero);
+                (unsigned long long)g->spec_ngram_zero,
+                (unsigned long long)g->spec_ngram_vetoed);
     }
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->gdn_conv[il]);
@@ -66677,6 +66692,23 @@ static int q4e_spec_rollback(ds4_q4e_graph *g, uint32_t keep) {
     return 0;
 }
 
+/* Diagnostic (DS4_QWEN4EXP_SPEC_LOG=2): the top two logits of the
+ * distribution first_token was taken from, and the gap between them.  K sizes
+ * the verify batch, which reassociates the target's GEMMs, so a stream that
+ * flips between two K values should flip only where that gap is down at the
+ * level of the reassociation itself -- a flip at a wide gap would mean a
+ * defect in the verify or rollback path, not arithmetic. */
+static void q4e_log_logit_margin(const float *logits, uint32_t pos) {
+    const uint32_t n = (uint32_t)DS4_N_VOCAB;
+    uint32_t t1 = 0;
+    for (uint32_t i = 1; i < n; i++) if (logits[i] > logits[t1]) t1 = i;
+    uint32_t t2 = t1 == 0u ? 1u : 0u;
+    for (uint32_t i = 0; i < n; i++) if (i != t1 && logits[i] > logits[t2]) t2 = i;
+    fprintf(stderr, "q4e spec margin pos=%u top1=%u %.5f top2=%u %.5f gap=%.5f\n",
+            pos, t1, (double)logits[t1], t2, (double)logits[t2],
+            (double)(logits[t1] - logits[t2]));
+}
+
 /* One decode step: commit `first_token`, draft up to K tokens after it,
  * verify them all in one target pass and keep the accepted prefix.  Returns
  * the number of committed tokens (first_token plus accepted drafts) written
@@ -66710,10 +66742,14 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         const char *env = getenv("DS4_QWEN4EXP_SPEC_LOG");
         spec_log = (env && env[0]) ? atoi(env) : 0;
     }
+    if (spec_log >= 2) q4e_log_logit_margin(s->logits, pos0);
     double t_ngram = t_draft, t_flush = t_draft;
 
+    /* The head can draft only while its pending rows are waiting for this
+     * token; without that there is no draft and no gate for the lookup. */
+    const bool draft_ready = g->mtp_ready && g->pend_valid;
     uint32_t mtp_k = 0;
-    if (g->mtp_ready && g->pend_valid) {
+    if (draft_ready) {
         mtp_k = s->engine->mtp_draft_tokens > 0 ? (uint32_t)s->engine->mtp_draft_tokens : 0;
         if (mtp_k > K) mtp_k = K;
     }
@@ -66735,7 +66771,7 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
     t_ngram = now_sec();
 
     K = mtp_k;
-    if (g->mtp_ready && g->pend_valid) {
+    if (draft_ready) {
         /* The draft KV follows every committed token whether or not the head
          * proposes this step. */
         const uint32_t flushed_n = g->pend_n;
@@ -66763,6 +66799,10 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
                 n_draft = n_ngram;
                 K = n_ngram;
                 from_ngram = true;
+            } else if (n_ngram) {
+                /* Counted so the n-gram acceptance figures are read against
+                 * the proposals made, not only the ones the gate let past. */
+                g->spec_ngram_vetoed++;
             }
             while (n_draft < K && drafts[n_draft - 1u] != eos_token) {
                 ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
@@ -66813,8 +66853,12 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
     if (from_ngram) {
         g->spec_ngram_accepted += a;
         if (a == 0) g->spec_ngram_zero++;
-        /* The target disagreed somewhere in this continuation; do not read it
-         * from the same place again for the rest of the generation. */
+        /* The target disagreed somewhere in this continuation, so do not read
+         * it from the same place again for the rest of the generation.  A
+         * partial acceptance counts: the tokens after the divergence are the
+         * wrong ones, and this draft from this position would be wrong the
+         * same way.  A shorter draft from the same place hashes differently
+         * and is still allowed. */
         if (a < K) q4e_ngram_remember(&g->ngram_mem, &ngram_src);
     }
     if (K && getenv("DS4_QWEN4EXP_SPEC_LOG")) {
@@ -76385,9 +76429,10 @@ static int ds4_session_eval_speculative_argmax_impl(
 #ifndef DS4_NO_GPU
     if (ds4_session_is_qwen4exp(s) && !ds4_session_is_cpu(s) &&
         s->q4e_graph.spec_k > 0 && accepted) {
-        /* MTP or n-gram drafts verified against the target's argmax.  Under
-         * ignore_eos the caller steers around stop tokens itself, one token
-         * at a time, so speculation stays off there. */
+        /* MTP drafts -- extended by the prompt-lookup n-gram when it agrees
+         * with the head's first token -- verified against the target's argmax.
+         * Under ignore_eos the caller steers around stop tokens itself, one
+         * token at a time, so speculation stays off there. */
         uint32_t K = s->q4e_graph.spec_k;
         if (ignore_eos || first_token == eos_token) K = 0;
         if (max_tokens > 0 && K > (uint32_t)max_tokens - 1u) K = (uint32_t)max_tokens - 1u;
