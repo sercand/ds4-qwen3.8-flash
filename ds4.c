@@ -54521,9 +54521,12 @@ typedef struct {
 /* N-gram (prompt-lookup) speculation: when the last few tokens already
  * occurred earlier in the context, propose what followed them.  No weights,
  * one host-side scan per step, and strongest exactly where an agent echoes
- * tool output back.  DS4_QWEN4EXP_NGRAM_K caps the proposal (0 disables,
- * default 8); DS4_QWEN4EXP_NGRAM_MIN is the shortest match accepted
- * (default 3 tokens). */
+ * tool output back.  It never replaces the MTP draft, only extends it (see
+ * q4e_spec_step), so a bad lookup costs nothing on the GPU.
+ * DS4_QWEN4EXP_NGRAM_K caps the proposal (0 disables, default 8);
+ * DS4_QWEN4EXP_NGRAM_MIN is the shortest match accepted.  The minimum is 5:
+ * a 3-token key matches template scaffolding all over an agent context, and
+ * every firing measured at 3 was such a false positive. */
 static uint32_t q4e_ngram_k(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -54540,7 +54543,7 @@ static uint32_t q4e_ngram_min_match(void) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_QWEN4EXP_NGRAM_MIN");
-        long v = (env && env[0]) ? strtol(env, NULL, 10) : 3;
+        long v = (env && env[0]) ? strtol(env, NULL, 10) : 5;
         if (v < 1) v = 1;
         if (v > 8) v = 8;
         cached = (int)v;
@@ -54548,33 +54551,86 @@ static uint32_t q4e_ngram_min_match(void) {
     return (uint32_t)cached;
 }
 
+/* The chat template's markers sit at the top of the vocabulary, from
+ * <|endoftext|> (the id the PLE hash treats as EOS) upward.  A proposal that
+ * walks into that range came from a turn boundary, not from an echo. */
+#define Q4E_SPECIAL_TOKEN_MIN ((int)DS4_PLE_EOS_TOKEN)
+
+/* One proposal, identified by the position it was read from and the hash of
+ * the tokens read there.  The hash covers the proposal, not the key window
+ * that found it: the same continuation is reachable through keys of several
+ * lengths, and drafting it twice is what the failure memory below exists to
+ * prevent.  Its length still matters -- a longer draft from the same place is
+ * a different bet -- so the pair, not the position alone, is the identity. */
+typedef struct {
+    uint64_t draft;
+    uint32_t pos;
+} q4e_ngram_src;
+
+/* Proposals this generation's target already rejected, so the same match is
+ * not tried twice.  A ring: the oldest entry is the least interesting one to
+ * keep, and forgetting a failure only costs one more rejected draft. */
+#define Q4E_NGRAM_FAIL_MAX 256u
+typedef struct {
+    q4e_ngram_src e[Q4E_NGRAM_FAIL_MAX];
+    uint32_t n;      /* entries in use, capped at the ring size */
+    uint32_t next;   /* write cursor */
+} q4e_ngram_memory;
+
+static void q4e_ngram_remember(q4e_ngram_memory *m, const q4e_ngram_src *src) {
+    m->e[m->next] = *src;
+    m->next = (m->next + 1u) % Q4E_NGRAM_FAIL_MAX;
+    if (m->n < Q4E_NGRAM_FAIL_MAX) m->n++;
+}
+
+static bool q4e_ngram_rejected(const q4e_ngram_memory *m, const q4e_ngram_src *src) {
+    for (uint32_t i = 0; i < m->n; i++) {
+        if (m->e[i].pos == src->pos && m->e[i].draft == src->draft) return true;
+    }
+    return false;
+}
+
 /* Propose up to max_k tokens after seq = hist[0, len) ++ [first].  Tries the
  * longest key first (up to 6 tokens, down to the configured minimum) and takes
- * the most recent earlier occurrence.  Returns the number proposed. */
+ * the most recent earlier occurrence that passes the filters below.  Returns
+ * the number proposed and, when that is non-zero, the match's source in *src.
+ * gen_start is where this generation's own tokens begin. */
 static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
-                                  int *out, uint32_t max_k) {
+                                  uint32_t gen_start, const q4e_ngram_memory *mem,
+                                  int *out, uint32_t max_k, q4e_ngram_src *src) {
     const uint32_t L = len + 1u;
     const uint32_t min_n = q4e_ngram_min_match();
     if (max_k == 0 || L < min_n + 1u) return 0;
 #define Q4E_SEQ(j) ((j) < len ? hist[(j)] : first)
     for (uint32_t n = 6u; n >= min_n; n--) {
         if (n + 1u > L) continue;
-        /* key = seq[L - n, L); look for it ending at i, i <= L - 2. */
-        for (uint32_t i = L - 2u; i + 1u >= n; i--) {
+        /* key = seq[L - n, L).  It has to lie inside the generated text: the
+         * prompt ends with the assistant-turn header, and a key reaching back
+         * into that header matches every earlier turn boundary in the context,
+         * which is where the false positives came from.  The cost is that the
+         * lookup stays quiet for the first min_n tokens of a generation. */
+        if (L < n + gen_start) continue;
+        /* Look for the key ending at i, most recent first (i <= L - 2). */
+        for (uint32_t i = L - 2u; ; i--) {
             uint32_t m = 0;
             while (m < n && Q4E_SEQ(i - m) == Q4E_SEQ(L - 1u - m)) m++;
             if (m == n) {
+                q4e_ngram_src cand = {1469598103934665603ull, i};   /* FNV-1a */
                 uint32_t k = 0;
+                bool special = false;
                 while (k < max_k && i + 1u + k < L) {
-                    out[k] = Q4E_SEQ(i + 1u + k);
-                    k++;
+                    const int t = Q4E_SEQ(i + 1u + k);
+                    if (t >= Q4E_SPECIAL_TOKEN_MIN) { special = true; break; }
+                    cand.draft = (cand.draft ^ (uint64_t)(uint32_t)t) * 1099511628211ull;
+                    out[k++] = t;
                 }
-                if (k) return k;
-                break;
+                if (!special && k && !q4e_ngram_rejected(mem, &cand)) {
+                    *src = cand;
+                    return k;
+                }
             }
-            if (i == 0) break;
+            if (i + 1u <= n) break;   /* i == n - 1 is the oldest window */
         }
-        if (n == 0) break;
     }
 #undef Q4E_SEQ
     return 0;
@@ -54763,6 +54819,12 @@ typedef struct {
     uint64_t spec_ngram_steps;
     uint64_t spec_ngram_drafted;
     uint64_t spec_ngram_accepted;
+    uint64_t spec_ngram_zero;        /* n-gram steps the target rejected outright */
+    /* Per-generation n-gram state: where the generated text starts and which
+     * matches the target already rejected.  Both live here, not in a global,
+     * because concurrent requests each have their own graph. */
+    uint32_t ngram_gen_start;
+    q4e_ngram_memory ngram_mem;
     double   spec_draft_ms;
     double   spec_verify_ms;
 } ds4_q4e_graph;
@@ -65329,7 +65391,7 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         fprintf(stderr,
                 "ds4: qwen4exp spec stats: steps=%llu drafted=%llu accepted=%llu "
                 "(%.2f accepted/step, %.1f%% of drafts) draft=%.1fms verify=%.1fms "
-                "per step; ngram steps=%llu drafted=%llu accepted=%llu\n",
+                "per step; ngram steps=%llu drafted=%llu accepted=%llu zero=%llu\n",
                 (unsigned long long)g->spec_steps,
                 (unsigned long long)g->spec_drafted,
                 (unsigned long long)g->spec_accepted,
@@ -65339,7 +65401,8 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
                 g->spec_verify_ms / (double)g->spec_steps,
                 (unsigned long long)g->spec_ngram_steps,
                 (unsigned long long)g->spec_ngram_drafted,
-                (unsigned long long)g->spec_ngram_accepted);
+                (unsigned long long)g->spec_ngram_accepted,
+                (unsigned long long)g->spec_ngram_zero);
     }
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->gdn_conv[il]);
@@ -66626,7 +66689,10 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
     if ((int)K > accepted_cap - 1) K = (uint32_t)(accepted_cap - 1);
 
     int drafts[Q4E_SPEC_MAX_DRAFT];
+    int ngram_drafts[Q4E_SPEC_MAX_DRAFT];
+    q4e_ngram_src ngram_src = {0, 0};
     uint32_t n_draft = 0;
+    uint32_t n_ngram = 0;
     bool from_ngram = false;
     const double t_draft = now_sec();
     /* DS4_QWEN4EXP_SPEC_LOG=2 adds a host-side phase breakdown per step. */
@@ -66637,24 +66703,28 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
     }
     double t_ngram = t_draft, t_flush = t_draft;
 
-    /* Prompt lookup first: when the recent tokens repeat something earlier
-     * in the context, the continuation there is a better and longer guess
-     * than the head's, and it costs nothing on the GPU. */
-    {
+    uint32_t mtp_k = 0;
+    if (g->mtp_ready && g->pend_valid) {
+        mtp_k = s->engine->mtp_draft_tokens > 0 ? (uint32_t)s->engine->mtp_draft_tokens : 0;
+        if (mtp_k > K) mtp_k = K;
+    }
+
+    /* Prompt lookup, host-side and free: when the recent tokens repeat
+     * something earlier in the context, the continuation there is a longer
+     * guess than the head's.  It is only believed when MTP's first draft
+     * token agrees with it (below), so there is nothing to look up without
+     * the head. */
+    if (mtp_k) {
         uint32_t ng_k = q4e_ngram_k();
         if (ng_k > K) ng_k = K;
-        if (ng_k) {
-            n_draft = q4e_ngram_propose(s->checkpoint.v, pos0, first_token, drafts, ng_k);
-            from_ngram = n_draft != 0;
+        if (ng_k > mtp_k) {
+            n_ngram = q4e_ngram_propose(s->checkpoint.v, pos0, first_token,
+                                        g->ngram_gen_start, &g->ngram_mem,
+                                        ngram_drafts, ng_k, &ngram_src);
         }
     }
     t_ngram = now_sec();
 
-    uint32_t mtp_k = 0;
-    if (g->mtp_ready && g->pend_valid && !from_ngram) {
-        mtp_k = s->engine->mtp_draft_tokens > 0 ? (uint32_t)s->engine->mtp_draft_tokens : 0;
-        if (mtp_k > K) mtp_k = K;
-    }
     K = mtp_k;
     if (g->mtp_ready && g->pend_valid) {
         /* The draft KV follows every committed token whether or not the head
@@ -66673,6 +66743,18 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
              * for that row is the last of the rows just written. */
             uint32_t last_row = flushed_n - 1u;
             drafts[n_draft++] = pick;
+            /* MTP gates the lookup: two independent drafters agreeing on the
+             * next token is the evidence that the earlier occurrence is the
+             * text being echoed, and the lookup then extends the draft past
+             * MTP's K.  Disagreement costs nothing -- the head's own chain
+             * below is exactly what an MTP-only step would have drafted.  A
+             * proposal no longer than that chain is not worth the swap. */
+            if (n_ngram > K && ngram_drafts[0] == pick) {
+                for (uint32_t i = 1; i < n_ngram; i++) drafts[i] = ngram_drafts[i];
+                n_draft = n_ngram;
+                K = n_ngram;
+                from_ngram = true;
+            }
             while (n_draft < K && drafts[n_draft - 1u] != eos_token) {
                 ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
                         g->mtp_res, (uint64_t)last_row * Q4E_HC_DIM * sizeof(float),
@@ -66719,7 +66801,13 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         a++;
         if (drafts[a - 1u] == eos_token) break;
     }
-    if (from_ngram) g->spec_ngram_accepted += a;
+    if (from_ngram) {
+        g->spec_ngram_accepted += a;
+        if (a == 0) g->spec_ngram_zero++;
+        /* The target disagreed somewhere in this continuation; do not read it
+         * from the same place again for the rest of the generation. */
+        if (a < K) q4e_ngram_remember(&g->ngram_mem, &ngram_src);
+    }
     if (K && getenv("DS4_QWEN4EXP_SPEC_LOG")) {
         fprintf(stderr, "q4e spec pos=%u first=%d %s drafts=", pos0, first_token,
                 from_ngram ? "ngram" : "mtp");
@@ -68603,6 +68691,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * that is not an extension of the live checkpoint rebuilds from zero.
          * Prefix reuse still covers the common agent case of appending turns. */
         ds4_q4e_graph *g = &s->q4e_graph;
+        /* A new prompt is a new generation: the n-gram lookup keys off the
+         * text generated after this prompt, and last generation's rejected
+         * matches say nothing about this one. */
+        g->ngram_gen_start = (uint32_t)prompt->len;
+        g->ngram_mem.n = 0;
+        g->ngram_mem.next = 0;
         uint32_t start = 0;
         if (s->checkpoint_valid && ds4_tokens_starts_with(prompt, &s->checkpoint) &&
             (uint32_t)s->checkpoint.len == g->pos) {
