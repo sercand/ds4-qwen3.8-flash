@@ -102,6 +102,11 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
     }
 }
 
+/* ds4: -DDS4_CUDA_MMQ_Y=64 selects 64-row tiles with 4 warps per block (two
+ * blocks per SM under GB10's 99 KB shared-memory limit).  Tested 2026-09-02
+ * on the 26k prefill: no change (moe gate+up 1017 vs ~1000 ms per chunk,
+ * down 821 vs ~815), so occupancy is not what limits mmq here; default 128. */
+
 struct tile_x_sizes {
     int qs;
     int dm;
@@ -165,6 +170,11 @@ static int get_mmq_y_host(const int cc) {
 #if defined(GGML_USE_HIP) && defined(DS4_HIP_MMQ_Y)
     GGML_UNUSED(cc);
     return DS4_HIP_MMQ_Y;
+#elif !defined(GGML_USE_HIP) && defined(DS4_CUDA_MMQ_Y)
+    /* ds4: 64-row tiles halve the shared footprint (57.9 -> ~38 KB at
+     * mmq_x = 128) so two blocks fit an SM with a 99 KB opt-in limit. */
+    GGML_UNUSED(cc);
+    return DS4_CUDA_MMQ_Y;
 #else
     return GGML_CUDA_CC_IS_AMD(cc) ? (GGML_CUDA_CC_IS_RDNA1(cc) ? 64 : 128) :
         ((GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ? 128 : 64);
@@ -192,7 +202,9 @@ static constexpr __device__ int get_mmq_y_device() {
 #endif // defined RDNA1
 #endif // defined(DS4_HIP_MMQ_Y)
 #else
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+#if defined(DS4_CUDA_MMQ_Y)
+    return DS4_CUDA_MMQ_Y;
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     return 128;
 #else
     return 64;
@@ -335,7 +347,12 @@ static int mmq_get_nwarps_host(const int cc, const int warp_size) {
 }
 #else
 static int mmq_get_nwarps_host(const int /*cc*/, const int warp_size) {
+#if defined(DS4_CUDA_MMQ_Y)
+    GGML_UNUSED(warp_size);
+    return DS4_CUDA_MMQ_Y/16;   /* the MMA write-back needs nwarps*16 == mmq_y */
+#else
     return 256/warp_size;
+#endif
 }
 #endif // (GGML_USE_HIP)
 
@@ -347,7 +364,11 @@ static constexpr __device__ int mmq_get_nwarps_device() {
     return 8;
 #endif
 #else
+#if defined(DS4_CUDA_MMQ_Y)
+    return DS4_CUDA_MMQ_Y/16;
+#else
     return 256/ggml_cuda_get_physical_warp_size();
+#endif
 #endif // AMD_MFMA_AVAILABLE
 }
 
@@ -4340,6 +4361,18 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
         }
     }
 
+    /* ds4: DS4_MMQ_DEBUG_X=1 prints the tile choice per launch. */
+    {
+        static int dbg = -1;
+        if (dbg < 0) dbg = getenv("DS4_MMQ_DEBUG_X") != nullptr ? 1 : 0;
+        if (dbg) {
+            fprintf(stderr, "mmq tile: type=%d mmq_x=%d ntiles_x=%d ncols_max=%lld mmq_y=%d nrows_x=%lld ncols_dst=%lld ne00=%lld smpbo=%lld nbytes(x=128)=%zu nbytes(x=64)=%zu\n",
+                    (int)type, mmq_x_best, ntiles_x_best, (long long)args.ncols_max, mmq_y,
+                    (long long)args.nrows_x, (long long)args.ncols_dst, (long long)args.ncols_x, (long long)smpbo,
+                    mmq_get_nbytes_shared<type>(128, mmq_y, cc, warp_size, nwarps),
+                    mmq_get_nbytes_shared<type>(64, mmq_y, cc, warp_size, nwarps));
+        }
+    }
     switch (mmq_x_best) {
         case   8:
             launch_mul_mat_q<type,   8>(ctx, args, stream);
