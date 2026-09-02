@@ -54591,6 +54591,8 @@ static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
 #define Q4E_GDN_IN   (2u * Q4E_GDN_K + Q4E_GDN_V)
 #define Q4E_PLE_HIST ((DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM)
 #define Q4E_SNAP_MAX 8u
+#define Q4E_IDX_QB   512u    /* indexer/sparse-attention rows per pass */
+#define Q4E_IDX_WIDTH (2048u + 3u)
 
 /* Scratch and persistent state for one session.  Scratch is sized for the
  * prefill chunk; decode uses the same buffers with n_tok = 1. */
@@ -54691,6 +54693,25 @@ typedef struct {
      * last chunk boundary below that point is what gets reused.  The KV
      * caches need no copy: positions below a snapshot are only rewritten
      * after every longer snapshot has been dropped.  ~113 MB each. */
+    /* QSA indexer state and scratch (see ds4_gpu_q4e_idx_*): raw f16 indexer
+     * keys and pooled/normed/rotated block keys per attention layer; the
+     * per-forward scratch is sized for Q4E_IDX_QB rows at a time. */
+    ds4_gpu_tensor *idx_k_cache[DS4_MAX_LAYER];   /* [ctx][128] f16 */
+    ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];    /* [ctx/4 + 1][128] f16 */
+    ds4_gpu_tensor *idx_k;        /* [tok_cap][128] f32 */
+    ds4_gpu_tensor *idx_q;        /* [tok_cap][4*128] f32 */
+    ds4_gpu_tensor *idx_qn;       /* [tok_cap][4*128] f16 */
+    ds4_gpu_tensor *idx_score;    /* [QB][max_blocks] f32 */
+    ds4_gpu_tensor *idx_sel;      /* [QB][512] i32 */
+    ds4_gpu_tensor *idx_cnt;      /* [QB] i32 */
+    ds4_gpu_tensor *idx_tokens;   /* [QB][2048 + 3] i32 */
+    ds4_gpu_tensor *idx_nsel;     /* [QB] i32 */
+    ds4_gpu_tensor *idx_part;     /* [QB][n_head][8][264] f32 */
+    uint32_t        idx_max_blocks;
+    bool            idx_ready;    /* indexer caches allocated for the attention layers */
+    bool            qsa_sparse;   /* this forward selects blocks (context past the budget) */
+    bool            is_draft;     /* the MTP head's shallow copy: dense attention, own KV */
+
     struct q4e_snapshot {
         bool            valid;
         uint32_t        pos;
@@ -65321,6 +65342,15 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         g->argmax_dev,
     };
     for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(g->idx_k_cache[il]);
+        ds4_gpu_tensor_free(g->idx_pooled[il]);
+    }
+    {
+        ds4_gpu_tensor *idx_flat[] = { g->idx_k, g->idx_q, g->idx_qn, g->idx_score, g->idx_sel,
+                                       g->idx_cnt, g->idx_tokens, g->idx_nsel, g->idx_part };
+        for (size_t i = 0; i < sizeof(idx_flat) / sizeof(idx_flat[0]); i++) ds4_gpu_tensor_free(idx_flat[i]);
+    }
     for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) {
         struct q4e_snapshot *sn = &g->snap[k];
         for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
@@ -65341,6 +65371,8 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
 
 /* Drop every recurrent trace of the current sequence.  There is no partial
  * rewind: the DeltaNet state and the two conv windows only move forward. */
+static int q4e_indexer_enabled(void);
+
 static void q4e_graph_reset(ds4_q4e_graph *g) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (g->gdn_conv[il]) {
@@ -65505,7 +65537,14 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
             if (v > 0) g->tok_cap = (uint32_t)v;
         }
     }
-    if (g->tok_cap > 2048u) g->tok_cap = 2048u;
+    /* 2048 by default; an explicit override may go to 4096 (about 2.8 GB of
+     * routed intermediates), which an oracle comparison above 2048 tokens
+     * needs so the trace is one pass like llama.cpp's. */
+    {
+        const char *env = getenv("DS4_QWEN4EXP_PREFILL_CHUNK");
+        const uint32_t cap = (env && env[0] && strtol(env, NULL, 10) > 2048) ? 4096u : 2048u;
+        if (g->tok_cap > cap) g->tok_cap = cap;
+    }
     if (g->tok_cap > ctx_size) g->tok_cap = ctx_size;
 
     const uint32_t T = g->tok_cap;
@@ -65620,6 +65659,28 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
             }
         }
     }
+    if (ok && q4e_indexer_enabled()) {
+        const uint32_t max_blocks = ctx_size / 4u + 1u;
+        g->idx_max_blocks = max_blocks;
+        const uint32_t qb = T < Q4E_IDX_QB ? T : Q4E_IDX_QB;
+        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+            if (!ds4_qwen4exp_layer_is_full_attn(il)) continue;
+            ok = q4e_alloc(&g->idx_k_cache[il], (uint64_t)ctx_size * 128u * sizeof(uint16_t)) &&
+                 q4e_alloc(&g->idx_pooled[il], (uint64_t)max_blocks * 128u * sizeof(uint16_t));
+        }
+        if (ok) {
+            ok = q4e_alloc(&g->idx_k, (uint64_t)T * 128u * f) &&
+                 q4e_alloc(&g->idx_q, (uint64_t)T * DS4_N_INDEXER_HEAD * 128u * f) &&
+                 q4e_alloc(&g->idx_qn, (uint64_t)T * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t)) &&
+                 q4e_alloc(&g->idx_score, (uint64_t)qb * max_blocks * f) &&
+                 q4e_alloc(&g->idx_sel, (uint64_t)qb * (DS4_N_INDEXER_TOP_K / 4u) * sizeof(int32_t)) &&
+                 q4e_alloc(&g->idx_cnt, (uint64_t)qb * sizeof(int32_t)) &&
+                 q4e_alloc(&g->idx_tokens, (uint64_t)qb * Q4E_IDX_WIDTH * sizeof(int32_t)) &&
+                 q4e_alloc(&g->idx_nsel, (uint64_t)qb * sizeof(int32_t)) &&
+                 q4e_alloc(&g->idx_part, (uint64_t)qb * DS4_N_HEAD * 8u * 264u * f);
+        }
+        g->idx_ready = ok;
+    }
     if (ok) {
         ok = q4e_alloc(&g->argmax_dev, (uint64_t)(g->logit_rows + 1u) * sizeof(int32_t));
         if (ok) g->argmax_host = xmalloc((size_t)(g->logit_rows + 1u) * sizeof(int32_t));
@@ -65697,6 +65758,17 @@ static int q4e_verify_graphs_enabled(void) {
     return cached;
 }
 
+/* QSA indexer (sparse attention past 512 complete key blocks); default on.
+ * DS4_QWEN4EXP_QSA_INDEXER=0 keeps dense attention at every context. */
+static int q4e_indexer_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_QSA_INDEXER");
+        cached = (env && env[0] == '0') ? 0 : 1;
+    }
+    return cached;
+}
+
 static int q4e_rows_matmul_disabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -65734,6 +65806,11 @@ static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor 
         return ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type,
                                            w->dim[0], out_dim, x, n_tok);
     case DS4_TENSOR_BF16:
+        if (n_tok >= 2u && n_tok <= 16u && !q4e_rows_matmul_disabled()) {
+            const int rc = ds4_gpu_q4e_matmul_bf16_rows(
+                    out, m->map, m->size, w->abs_offset, w->dim[0], out_dim, x, n_tok);
+            if (rc != 0) return rc > 0;
+        }
         return ds4_gpu_glm53_matmul_bf16(out, m->map, m->size, w->abs_offset,
                                          (uint32_t)w->dim[0], (uint32_t)out_dim, x, n_tok);
     case DS4_TENSOR_F32:
@@ -65875,9 +65952,67 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
                                   g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD_KV,
                                   DS4_N_ROT, DS4_ROPE_FREQ_BASE, g->ctx_size,
                                   n_tok, DS4_RMS_EPS)) return 0;
-    if (!ds4_gpu_q4e_qsa_attention(g->qsa_out, g->k_cache[il], g->v_cache[il], g->qsa_q,
-                                   g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD,
-                                   DS4_N_HEAD_KV, n_tok)) return 0;
+    /* QSA indexer: keep the raw and pooled indexer keys current for every
+     * forward; select blocks only once the context holds more complete
+     * blocks than the budget (below that the selection is every visible
+     * token and the dense kernel is exact and faster). */
+    const bool idx_on = !g->is_draft && g->idx_k_cache[il] && l->idx_q && l->idx_k &&
+                        l->idx_q_norm && l->idx_k_norm;
+    if (idx_on) {
+        const uint32_t pos0 = g->pos;
+        if (!q4e_matmul(g->idx_k, m, l->idx_k, g->mixed, n_tok)) return 0;
+        if (!ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], g->idx_k, g->positions, n_tok)) return 0;
+        (void)pos0;
+        if (!ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
+                                  l->idx_k_norm->abs_offset, g->positions, n_tok, DS4_N_ROT,
+                                  DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
+    }
+    if (idx_on && g->qsa_sparse) {
+        /* Block counts come from the positions on the device (see the
+         * kernels), so the launch sequence is the same at every context and
+         * a captured graph tracks the growing context; only the buffer
+         * stride (idx_max_blocks) is fixed. */
+        const uint32_t kb = DS4_N_INDEXER_TOP_K / 4u;
+        ds4_gpu_tensor *pos_last = ds4_gpu_tensor_view(g->positions, (uint64_t)(n_tok - 1u) * sizeof(int32_t),
+                                                       sizeof(int32_t));
+        if (!pos_last) return 0;
+        if (!q4e_matmul(g->idx_q, m, l->idx_q, g->mixed, n_tok)) return 0;
+        if (!ds4_gpu_q4e_idx_q(g->idx_qn, g->idx_q, m->map, m->size, l->idx_q_norm->abs_offset,
+                               g->positions, DS4_N_INDEXER_HEAD, n_tok, DS4_N_ROT,
+                               DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
+        for (uint32_t r0 = 0; r0 < n_tok; r0 += Q4E_IDX_QB) {
+            const uint32_t nb = (n_tok - r0 < Q4E_IDX_QB) ? (n_tok - r0) : Q4E_IDX_QB;
+            ds4_gpu_tensor *qn_v = ds4_gpu_tensor_view(g->idx_qn,
+                    (uint64_t)r0 * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t),
+                    (uint64_t)nb * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t));
+            ds4_gpu_tensor *pos_v = ds4_gpu_tensor_view(g->positions, (uint64_t)r0 * sizeof(int32_t),
+                                                        (uint64_t)nb * sizeof(int32_t));
+            ds4_gpu_tensor *q_v = ds4_gpu_tensor_view(g->qsa_q, (uint64_t)r0 * Q4E_Q_DIM * sizeof(float),
+                                                      (uint64_t)nb * Q4E_Q_DIM * sizeof(float));
+            ds4_gpu_tensor *out_v = ds4_gpu_tensor_view(g->qsa_out, (uint64_t)r0 * Q4E_Q_DIM * sizeof(float),
+                                                        (uint64_t)nb * Q4E_Q_DIM * sizeof(float));
+            int ok = qn_v && pos_v && q_v && out_v &&
+                     ds4_gpu_q4e_idx_score(g->idx_score, qn_v, g->idx_pooled[il], pos_v, pos_last,
+                                           DS4_N_INDEXER_HEAD, nb, g->idx_max_blocks) &&
+                     ds4_gpu_q4e_idx_topk(g->idx_sel, g->idx_cnt, g->idx_score, pos_last, nb,
+                                          g->idx_max_blocks, kb) &&
+                     ds4_gpu_q4e_idx_expand(g->idx_tokens, g->idx_nsel, g->idx_sel, g->idx_cnt, pos_v,
+                                            nb, kb, Q4E_IDX_WIDTH) &&
+                     ds4_gpu_q4e_qsa_attention_sparse(out_v, g->idx_part, g->k_cache[il], g->v_cache[il],
+                                                      q_v, g->idx_tokens, g->idx_nsel, Q4E_IDX_WIDTH,
+                                                      DS4_N_HEAD_DIM, DS4_N_HEAD, DS4_N_HEAD_KV, nb);
+            ds4_gpu_tensor_free(qn_v);
+            ds4_gpu_tensor_free(pos_v);
+            ds4_gpu_tensor_free(q_v);
+            ds4_gpu_tensor_free(out_v);
+            if (!ok) { ds4_gpu_tensor_free(pos_last); return 0; }
+        }
+        ds4_gpu_tensor_free(pos_last);
+    } else if (!ds4_gpu_q4e_qsa_attention(g->qsa_out, g->k_cache[il], g->v_cache[il], g->qsa_q,
+                                          g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                          DS4_N_HEAD_KV, n_tok)) {
+        return 0;
+    }
     if (!ds4_gpu_q4e_qsa_gate(g->qsa_out, g->qsa_gate,
                               (uint64_t)n_tok * Q4E_Q_DIM)) return 0;
     q4e_trace("attn_gated", (int)il, g->qsa_out, (uint64_t)n_tok * Q4E_Q_DIM);
@@ -66034,7 +66169,7 @@ static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
     key.island = island;
     /* The launch sequence bakes the row count in, so a speculative verify at
      * 1 + K tokens and a one-token decode are different captures. */
-    key.variant = n_tok;
+    key.variant = n_tok + (g->qsa_sparse ? 64u : 0u);
     /* Identity is the buffer set the island writes through; a session that
      * reallocates its graph gets a different key and a fresh capture.  The
      * MTP draft shares every scratch buffer but has its own residual, which
@@ -66133,6 +66268,9 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
      * abort this used to hit was the dense mmq tier launching on the legacy
      * stream at >= 9 rows (fixed); it stays opt-in until it has run long
      * enough to trust. */
+    /* Sparse attention engages once the context holds more complete key
+     * blocks than the indexer budget; the graph key carries the mode. */
+    g->qsa_sparse = g->idx_ready && (pos0 + n_tok) / 4u > DS4_N_INDEXER_TOP_K / 4u;
     const bool graphs_ok = (n_tok == 1u ||
                             (g->spec_k && n_tok <= 1u + g->spec_k && q4e_verify_graphs_enabled())) &&
                            !q4e_trace_enabled() &&
@@ -66235,8 +66373,11 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     d.logits = g->mtp_logits;
     d.k_cache[Q4E_MTP_SLOT] = g->mtp_k_cache;
     d.v_cache[Q4E_MTP_SLOT] = g->mtp_v_cache;
-    /* The draft layer has no recurrent state to checkpoint. */
+    /* The draft layer has no recurrent state to checkpoint, and its attention
+     * stays dense over its own KV (the indexer caches belong to the target). */
     d.spec_k = 0;
+    d.is_draft = true;
+    d.qsa_sparse = false;
 
     if (!ds4_gpu_tensor_write(d.tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) ||
         !ds4_gpu_tensor_write(d.positions, 0, positions, (uint64_t)n * sizeof(int32_t))) {

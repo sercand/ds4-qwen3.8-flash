@@ -897,7 +897,7 @@ static inline cublasHandle_t cuda_cublas_for_tier(int logical_tier) {
  * DS4_CUDA_DECODE_GRAPHS=0 (or off/no/false) disables everything. */
 #define CUDA_DECODE_GRAPH_LAYERS   64u
 #define CUDA_DECODE_GRAPH_ISLANDS   2u
-#define CUDA_DECODE_GRAPH_VARIANTS 16u   /* 1-token decode, verify at 2..9 rows, draft flushes */
+#define CUDA_DECODE_GRAPH_VARIANTS 32u   /* n_tok 1..16, plus 64 for the sparse-attention mode */
 
 /* Mirrors the public `struct ds4_decode_graph_key` decl in ds4_gpu.h
  * byte-for-byte (ds4_cuda.cu does not include that header; it carries
