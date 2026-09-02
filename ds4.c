@@ -3496,6 +3496,13 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             tty ? ": 0.00 GiB" : "\n");
     fflush(stderr);
 
+    /* Merge first, cache second.  Merging is a pure function of the sorted
+     * tensor list, so a first pass can emit the whole span list -- which is
+     * what lets the device weight arena size its allocations to the exact
+     * total instead of first-fitting spans into fixed chunks and stranding
+     * every chunk tail (ds4_gpu_plan_model_weight_arena).  Each merged span
+     * is written back over an entry the merge has already consumed
+     * (merged <= i always), so this needs no second array. */
     for (uint64_t i = 0; i < nspan;) {
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
@@ -3514,19 +3521,36 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             seal = spans[i].seal;
             i++;
         }
+        /* The merged span keeps the seal of the tensor that closed it, so a
+         * reader sees why the merge stopped where it did. */
+        spans[merged++] = (accelerator_tensor_span){ .off = off, .end = end, .seal = seal };
+    }
+    nspan = merged;
+
+#ifndef DS4_ROCM_BUILD
+    {
+        uint64_t *span_bytes = xmalloc((size_t)nspan * sizeof(span_bytes[0]));
+        for (uint64_t s = 0; s < nspan; s++) span_bytes[s] = spans[s].end - spans[s].off;
+        (void)ds4_gpu_plan_model_weight_arena(span_bytes, (uint32_t)nspan);
+        free(span_bytes);
+    }
+#endif
+
+    for (uint64_t s = 0; s < nspan; s++) {
+        const uint64_t off = spans[s].off;
+        const uint64_t end = spans[s].end;
         char label[96];
-        snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+        snprintf(label, sizeof(label), "tensor-span:%" PRIu64, s);
         if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
                     "ds4: accelerator failed to prepare model tensor span %" PRIu64
                     " at offset %" PRIu64 "\n",
-                    merged, off);
+                    s, off);
             free(spans);
             return false;
         }
         prepared += end - off;
-        merged++;
 
         const double now = now_sec();
         if (prepared >= next_progress || now - last_progress >= (tty ? 2.0 : 10.0)) {
@@ -3610,9 +3634,19 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 #else
     const char *accelerator_name = "CUDA";
 #endif
+    /* Arena bytes next to span bytes: the two used to differ by 17.6 GiB of
+     * stranded chunk tails, which is invisible unless it is printed. */
+#ifdef DS4_ROCM_BUILD
     fprintf(stderr,
             "ds4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
+#else
+    fprintf(stderr,
+            "ds4: %s startup model preparation covered %.2f GiB of tensor spans "
+            "in %.3fs (weight arenas %.2f GiB)\n",
+            accelerator_name, (double)prepared / 1073741824.0, t1 - t0,
+            (double)ds4_gpu_model_weight_arena_bytes() / 1073741824.0);
+#endif
     return true;
 }
 #else

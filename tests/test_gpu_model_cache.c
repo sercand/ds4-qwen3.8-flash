@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #define CHECK(cond, msg)                                                \
     do {                                                                \
@@ -125,6 +127,56 @@ int main(void) {
         CHECK(dd == 1, "lookup resolves to dev 1");
         CHECK(pp != NULL, "lookup ptr non-null");
         (void)cudaSetDevice(0);
+    }
+
+    /* Weight-arena packing plan: a planned arena must hold the spans it was
+     * planned for and nothing more.  This is the regression guard for the
+     * 17.6 GiB of stranded chunk tails that fixed-size chunks used to cost
+     * on qwen4exp (203 spans, 78.66 GiB of weights, 96.25 GiB of arenas). */
+    {
+        /* Cap one chunk so the unplanned-span check below cannot ask for a
+         * default 1792 MiB chunk on a busy GPU. */
+        setenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB", "256", 1);
+
+        char path[] = "/tmp/ds4_arena_planXXXXXX";
+        const int fd = mkstemp(path);
+        CHECK(fd >= 0, "mkstemp arena plan model");
+        (void)unlink(path);
+        const size_t file_bytes = 16u * 1024u * 1024u;
+        void *filler = calloc(1, file_bytes);
+        CHECK(filler != NULL, "calloc filler");
+        CHECK(write(fd, filler, file_bytes) == (ssize_t)file_bytes, "write arena plan model");
+        free(filler);
+        void *fmap = mmap(NULL, file_bytes, PROT_READ, MAP_PRIVATE, fd, 0);
+        CHECK(fmap != MAP_FAILED, "mmap arena plan model");
+        CHECK(ds4_gpu_set_model_fd_for_map(fd, fmap), "set_model_fd_for_map");
+
+        const uint64_t offs[4]  = { 0, 1u << 20, 5u << 20, 7u << 20 };
+        const uint64_t sizes[4] = { 1u << 20, 3u << 20, 2u << 20, 700u * 1024u };
+        uint64_t want = 0;
+        for (int i = 0; i < 4; i++) want += (sizes[i] + 1024u + 255u) & ~(uint64_t)255u;
+
+        const uint64_t before = ds4_gpu_model_weight_arena_bytes();
+        const uint64_t planned = ds4_gpu_plan_model_weight_arena(sizes, 4);
+        CHECK(planned == want, "plan covers exactly the span slots");
+        for (int i = 0; i < 4; i++) {
+            CHECK(ds4_gpu_cache_model_range(fmap, file_bytes, offs[i], sizes[i], "plan-span") == 1,
+                  "cache planned span");
+        }
+        CHECK(ds4_gpu_model_weight_arena_bytes() - before == planned,
+              "planned arena bytes equal the span slots (no stranded tail)");
+
+        /* A span the plan never saw still caches, on the fixed-chunk rule. */
+        CHECK(ds4_gpu_cache_model_range(fmap, file_bytes, 8u << 20, 512u * 1024u,
+                                        "unplanned-span") == 1,
+              "cache unplanned span");
+        CHECK(ds4_gpu_model_weight_arena_bytes() - before > planned,
+              "unplanned span opens a chunk of its own");
+
+        (void)ds4_gpu_set_model_fd_for_map(-1, NULL);
+        (void)munmap(fmap, file_bytes);
+        (void)close(fd);
+        unsetenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
     }
 
     ds4_gpu_cleanup();

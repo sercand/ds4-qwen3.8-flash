@@ -2440,17 +2440,131 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     return gb * 1073741824ull;
 }
 
-static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
-    uint64_t mb = 1792;
+/* Arena bytes one cached span occupies: its payload, its zeroed tail pad
+ * (CUDA_WEIGHT_SPAN_TAIL_PAD, which mmq's last-row over-read reads), rounded
+ * up so the next span starts 256-byte aligned.  The plan below and the
+ * allocator must agree on this to the byte, so both go through here. */
+static uint64_t cuda_model_arena_slot_bytes(uint64_t bytes) {
+    const uint64_t align = 256u;
+    return (bytes + CUDA_WEIGHT_SPAN_TAIL_PAD + align - 1u) & ~(align - 1u);
+}
+
+/* Weight-arena packing plan.
+ *
+ * A span never straddles two chunks, so first-fitting spans into chunks of a
+ * fixed size strands whatever is left at the end of every chunk: qwen4exp's
+ * 203 spans (78.66 GiB, 54 of them between 768 and 954 MiB) needed 55 chunks
+ * of 1792 MiB = 96.25 GiB resident, 17.6 GiB of it empty chunk tails.  A
+ * bigger fixed chunk only moves the waste around (4096 MiB -> 84.0 GiB).
+ *
+ * The span builder (accelerator_prepare_model_tensor_spans in ds4.c) knows
+ * every span before the first one is cached, so it hands the list over here
+ * first and the chunks are sized to hold an exact whole number of spans:
+ * chunk bytes == sum of the slot bytes of the spans that will land in it, so
+ * nothing is left over to strand.  Spans are cached in plan order and a full
+ * chunk has no room for the next span, so first-fit places each span in the
+ * chunk the plan picked for it.
+ *
+ * The plan is advisory: if a span is served by some other path, or a model
+ * caches spans the plan never saw, the entries simply stop matching and the
+ * fixed-chunk rule below takes over for the rest -- correctness never depends
+ * on it, only residency.  Sealing and the tail pad are untouched: the plan
+ * only decides how many bytes each cudaMalloc gets, not what a span contains.
+ */
+#define CUDA_MODEL_ARENA_PLAN_CAP 512u
+static uint64_t g_model_arena_plan[CUDA_MODEL_ARENA_PLAN_CAP];
+static uint32_t g_model_arena_plan_count;
+static uint32_t g_model_arena_plan_next;
+
+/* DS4_CUDA_WEIGHT_ARENA_CHUNK_MB in bytes, 0 when unset.  It used to be the
+ * fixed chunk size; it is now the cap on one cudaMalloc, and still the fixed
+ * size where no plan applies.  Unset, a plan is one allocation per model. */
+static uint64_t cuda_model_arena_chunk_env_bytes(void) {
+    uint64_t mb = 0;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
     if (env && env[0]) {
         char *end = NULL;
         unsigned long long v = strtoull(env, &end, 10);
         if (end != env && v > 0) mb = (uint64_t)v;
     }
+    if (mb == 0) return 0;
     if (mb < 256) mb = 256;
     if (mb > 8192) mb = 8192;
-    uint64_t bytes = mb * 1048576ull;
+    return mb * 1048576ull;
+}
+
+/* Plan the arena for the spans about to be cached, in the order they will be
+ * cached.  Returns the arena bytes the plan covers. */
+extern "C" uint64_t ds4_gpu_plan_model_weight_arena(const uint64_t *span_bytes,
+                                                    uint32_t count) {
+    g_model_arena_plan_count = 0;
+    g_model_arena_plan_next = 0;
+    if (!span_bytes || count == 0) return 0;
+
+    /* Never plan past the weight-cache budget: the spans beyond it are meant
+     * to fall back to the mapping, not to be allocated up front. */
+    const uint64_t limit = cuda_model_cache_limit_bytes();
+    const uint64_t budget = (limit == UINT64_MAX || limit < g_model_range_bytes)
+                                ? UINT64_MAX
+                                : limit - g_model_range_bytes;
+
+    const uint64_t env_chunk = cuda_model_arena_chunk_env_bytes();
+    const uint64_t max_chunk = env_chunk ? env_chunk : UINT64_MAX;
+    uint64_t span_total = 0;
+    uint64_t total = 0;
+    uint64_t chunk = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (span_bytes[i] == 0) continue;
+        const uint64_t slot = cuda_model_arena_slot_bytes(span_bytes[i]);
+        if (budget != UINT64_MAX && slot > budget - total) break;
+        if (chunk != 0 && slot > max_chunk - chunk) {
+            if (g_model_arena_plan_count == CUDA_MODEL_ARENA_PLAN_CAP) break;
+            g_model_arena_plan[g_model_arena_plan_count++] = chunk;
+            chunk = 0;
+        }
+        chunk += slot;   /* a span larger than the cap gets a chunk of its own */
+        total += slot;
+        span_total += span_bytes[i];
+    }
+    if (chunk != 0 && g_model_arena_plan_count < CUDA_MODEL_ARENA_PLAN_CAP) {
+        g_model_arena_plan[g_model_arena_plan_count++] = chunk;
+    }
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
+        fprintf(stderr,
+                "ds4: CUDA weight arena plan: %u chunks, %.2f GiB for %.2f GiB "
+                "of spans (%u spans)\n",
+                g_model_arena_plan_count,
+                (double)total / 1073741824.0,
+                (double)span_total / 1073741824.0,
+                count);
+    }
+    return total;
+}
+
+extern "C" uint64_t ds4_gpu_model_weight_arena_bytes(void) {
+    uint64_t arena_bytes = 0;
+    for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
+    return arena_bytes;
+}
+
+/* Bytes for the chunk that will hold a span needing `need` bytes.  Consumes
+ * the plan when it has an entry big enough; `*from_plan` says whether it did,
+ * so the caller can bill what it actually allocated against that entry. */
+static uint64_t cuda_model_arena_chunk_bytes(uint64_t need, int *from_plan) {
+    *from_plan = 0;
+    while (g_model_arena_plan_next < g_model_arena_plan_count) {
+        const uint64_t planned = g_model_arena_plan[g_model_arena_plan_next];
+        if (planned >= need) {
+            *from_plan = 1;
+            return planned;
+        }
+        /* Out of sync with the plan (a span the plan expected went elsewhere):
+         * an entry too small for the span in hand is dead, drop it. */
+        g_model_arena_plan_next++;
+    }
+
+    const uint64_t env_chunk = cuda_model_arena_chunk_env_bytes();
+    uint64_t bytes = env_chunk ? env_chunk : 1792ull * 1048576ull;
     if (bytes < need) {
         const uint64_t align = 256ull * 1048576ull;
         bytes = (need + align - 1u) & ~(align - 1u);
@@ -2462,8 +2576,7 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
-    const uint64_t aligned =
-        (bytes + CUDA_WEIGHT_SPAN_TAIL_PAD + align - 1u) & ~(align - 1u);
+    const uint64_t aligned = cuda_model_arena_slot_bytes(bytes);
 
     for (cuda_model_arena &a : g_model_arenas) {
         const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
@@ -2486,9 +2599,23 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     const uint64_t limit = cuda_model_cache_limit_bytes();
     if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
 
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    int from_plan = 0;
+    uint64_t chunk = cuda_model_arena_chunk_bytes(aligned, &from_plan);
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
+    /* A planned chunk is as large as the whole remaining weight set, so a
+     * transient shortfall must not take the entire cache down with it: halve
+     * the request until the span itself fits.  Whatever is not allocated here
+     * stays on the plan entry and becomes the next chunk, so shrinking costs
+     * an extra allocation, not arena bytes. */
+    while (err != cudaSuccess && chunk > aligned) {
+        (void)cudaGetLastError();
+        uint64_t half = (chunk / 2u) & ~(uint64_t)255u;
+        if (half < aligned) half = aligned;
+        if (half >= chunk) break;
+        chunk = half;
+        err = cudaMalloc(&dev, (size_t)chunk);
+    }
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA model arena alloc failed for %s (%.2f MiB chunk): %s\n",
                 what ? what : "weights",
@@ -2498,13 +2625,19 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         g_model_cache_full = 1;
         return NULL;
     }
+    if (from_plan) {
+        uint64_t *planned = &g_model_arena_plan[g_model_arena_plan_next];
+        if (chunk >= *planned) g_model_arena_plan_next++;
+        else *planned -= chunk;
+    }
     g_model_arenas.push_back({(char *)dev, chunk, aligned});
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        uint64_t arena_bytes = 0;
-        for (const cuda_model_arena &a : g_model_arenas) arena_bytes += a.bytes;
-        fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
+        fprintf(stderr,
+                "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB, "
+                "spans %.2f GiB)\n",
                 (double)chunk / 1048576.0,
-                (double)arena_bytes / 1073741824.0);
+                (double)ds4_gpu_model_weight_arena_bytes() / 1073741824.0,
+                (double)(g_model_range_bytes + bytes) / 1073741824.0);
     }
     if (!cuda_ok(cudaMemset((char *)dev + bytes, 0, (size_t)(aligned - bytes)),
                  "zero weight span tail pad")) {
@@ -2735,6 +2868,9 @@ static void cuda_model_range_release_all(void) {
     g_model_ranges.clear();
     g_model_range_by_offset.clear();
     g_model_range_bytes = 0;
+    /* The plan describes arenas that no longer exist. */
+    g_model_arena_plan_count = 0;
+    g_model_arena_plan_next = 0;
     cuda_model_load_progress_reset();
 }
 

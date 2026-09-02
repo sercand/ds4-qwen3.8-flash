@@ -137,6 +137,14 @@ int ds4_gpu_set_aux_model_map_range(const void *model_map,
                                     uint64_t map_size);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
+#ifndef DS4_ROCM_BUILD
+/* Size the weight arena to the spans about to be cached, in the order
+ * ds4_gpu_cache_model_range() will see them, instead of first-fitting them
+ * into fixed chunks and stranding every chunk tail.  Advisory: caching works
+ * unplanned, it just costs residency.  Returns the planned arena bytes. */
+uint64_t ds4_gpu_plan_model_weight_arena(const uint64_t *span_bytes, uint32_t count);
+uint64_t ds4_gpu_model_weight_arena_bytes(void);
+#endif
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
