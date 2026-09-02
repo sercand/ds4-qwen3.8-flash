@@ -196,6 +196,51 @@ int ds4_mmq_mxfp4_dense(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
+// Routed expert map: the permutation that sorts the (token, slot) routing
+// assignments by expert, plus where each expert's run starts in that order.
+// mm_ids_helper derives it from the router's ids and from nothing else, so a
+// MoE block that runs several GEMMs over one routing table can build it once
+// and hand the same map to each.
+//
+// qwen4exp's block is the gate/up pair (n_tokens x top-k assignments, one
+// activation row per token) followed by down (the same assignments, flattened
+// to one expert per row).  Down's src1 row and its dst column are both the
+// assignment row index, which is exactly what the pair GEMM's ids_dst holds,
+// and its expert runs are the same counts in the same order -- see
+// ds4_mmq_moe_map_flatten.  Without sharing, down rebuilt the map by scanning
+// the whole ids array once per expert (512 blocks x 20480 rows a layer) for a
+// result the pair GEMM had already computed.
+//
+// The pointers borrow an mmq-owned per-device scratch and stay valid until the
+// next ds4_mmq_moe_map_build; the GEMMs that consume them must run on the
+// stream the map was built on, in order.
+struct ds4_mmq_moe_map {
+    const int32_t * ids_src1;       // compact assignment -> src1 (activation) row
+    const int32_t * ids_dst;        // compact assignment -> dst column
+    const int32_t * expert_bounds;  // n_expert + 1 run starts
+    int             n_rows;         // n_tokens * n_expert_used it was built for
+    int             n_expert;
+};
+
+// Build the map for (ids, n_tokens, n_expert, n_expert_used).  Returns 0 on
+// success; non-zero leaves *map zeroed, which every consumer treats as "build
+// your own", so a failure costs speed and never correctness.  Refuses under
+// stream capture (the scratch is allocated on first use).
+int ds4_mmq_moe_map_build(
+    struct ds4_mmq_moe_map * map,
+    const int32_t          * ids,
+    int                      n_tokens,
+    int                      n_expert,
+    int                      n_expert_used,
+    cudaStream_t             stream);
+
+// The same assignments as `pair`, seen the way a GEMM that flattens (token,
+// slot) into one expert per row sees them: source row = dst column = the
+// assignment index.
+void ds4_mmq_moe_map_flatten(
+    struct ds4_mmq_moe_map       * out,
+    const struct ds4_mmq_moe_map * pair);
+
 int ds4_mmq_q8_0_moe(
     const void    * W,
     const float   * X_f32,
@@ -207,7 +252,9 @@ int ds4_mmq_q8_0_moe(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream,
-    int             max_rows_per_expert);
+    int             max_rows_per_expert,
+    /* Routed map to reuse, or NULL to build one; see ds4_mmq_moe_map. */
+    const struct ds4_mmq_moe_map * map);
 
 int ds4_mmq_q2_K_moe(
     const void    * W,
@@ -273,7 +320,9 @@ int ds4_mmq_q5_1_moe(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream,
-    int             max_rows_per_expert);
+    int             max_rows_per_expert,
+    /* Routed map to reuse, or NULL to build one; see ds4_mmq_moe_map. */
+    const struct ds4_mmq_moe_map * map);
 
 /* max_rows_per_expert: an upper bound on the rows any one expert can receive,
  * or 0 for the gathered-row total.  mmq launches ceil(ncols_max / tile) tiles
@@ -293,7 +342,9 @@ int ds4_mmq_q5_K_moe(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream,
-    int             max_rows_per_expert);
+    int             max_rows_per_expert,
+    /* Routed map to reuse, or NULL to build one; see ds4_mmq_moe_map. */
+    const struct ds4_mmq_moe_map * map);
 
 int ds4_mmq_mxfp4_moe(
     const void    * W,
@@ -434,7 +485,9 @@ int ds4_mmq_q4_K_moe_pair(
     int             n_experts,
     int             n_expert_used,
     cudaStream_t    stream,
-    int             max_rows_per_expert);
+    int             max_rows_per_expert,
+    /* Routed map to reuse, or NULL to build one; see ds4_mmq_moe_map. */
+    const struct ds4_mmq_moe_map * map);
 
 int ds4_mmq_mxfp4_moe_pair(
     const void    * W_a,

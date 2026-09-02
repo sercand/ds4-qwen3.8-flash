@@ -991,7 +991,27 @@ extern "C" int ds4_mmq_mxfp4_dense(
 //   2. quantize_mmq_q8_1_cuda with ids_src1 - gathers and quantizes the
 //      activation into the expert-major flat layout.
 //   3. mul_mat_q_case<type> with ids_dst + expert_bounds - the matmul.
+//
+// Steps 1 and 2 do not depend on the weights, so a caller with several GEMMs
+// over one routing table passes a prebuilt map (ds4_mmq_moe_map) and step 1
+// is skipped.
 // ----------------------------------------------------------------------------
+
+/* A map the caller offered is usable only if it was built for this GEMM's
+ * shape; anything else is a caller bug, so say so instead of silently
+ * computing the wrong routing. */
+static const ds4_mmq_moe_map *ds4_mmq_moe_map_checked(
+        const char * tag, const ds4_mmq_moe_map * map,
+        int64_t n_rows, int n_expert) {
+    if (!map || !map->ids_src1) return nullptr;
+    if (map->n_rows != (int)n_rows || map->n_expert != n_expert ||
+        !map->ids_dst || !map->expert_bounds) {
+        fprintf(stderr, "%s: routed map is for %d rows / %d experts, not %lld / %d\n",
+                tag, map->n_rows, map->n_expert, (long long)n_rows, n_expert);
+        return nullptr;
+    }
+    return map;
+}
 
 namespace {
 
@@ -1021,7 +1041,10 @@ int ds4_mmq_moe_impl(
          * (token, slot) pairs into n_tokens with n_expert_used = 1 must pass
          * the *original* token count, not the flattened row count.
          * The bound must hold: rows past it would never be computed. */
-        int64_t         max_rows_per_expert = 0) {
+        int64_t         max_rows_per_expert = 0,
+        /* ds4 (S5 C4): a routed map built once for this block, or NULL to
+         * build one here; see ds4_mmq_moe_map. */
+        const ds4_mmq_moe_map * shared_map = NULL) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -1069,53 +1092,68 @@ int ds4_mmq_moe_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;   // per-expert weight stride in blocks
 
-    // 1. Build the expert-major work map.
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+    // 1. Build the expert-major work map, unless the caller shares one.
+    const ds4_mmq_moe_map * const reuse =
+        ds4_mmq_moe_map_checked(tag, shared_map, ne_get_rows, n_experts);
+    ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
+    ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
+    const int32_t * ids_src1_p = reuse ? reuse->ids_src1 : nullptr;
+    const int32_t * ids_dst_p = reuse ? reuse->ids_dst : nullptr;
+    const int32_t * expert_bounds_p = reuse ? reuse->expert_bounds : nullptr;
+    if (!reuse) {
+        int32_t * const ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
+        int32_t * const ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
+        int32_t * const expert_bounds =
+            expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+        ids_src1_p = ids_src1;
+        ids_dst_p = ids_dst;
+        expert_bounds_p = expert_bounds;
 
-    // Task #22 root-cause fix: mm_ids_helper COMPACTS - it only writes ids_src1
-    // entries for in-range router ids and drops invalid ones (the router's NaN
-    // path emits -1 by design), so with any dropped id the tail of ids_src1
-    // stays unwritten pool memory.  quantize_mmq_q8_1's grid covers all
-    // ne_get_rows rows and gathers x rows via ids_src1[i1] unconditionally
-    // (quantize.cu:304), so a stale/garbage tail entry becomes a wild OOB read
-    // (the intermittent batched-draft illegal access; B200 memcheck-convicted).
-    // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
-    // those lanes' output is never consumed (the mmq write-back loop is
-    // expert_bounds-bounded), the cost is a few KB of memset on-stream.
-    (void)cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
-    (void)cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
+        // Task #22 root-cause fix: mm_ids_helper COMPACTS - it only writes ids_src1
+        // entries for in-range router ids and drops invalid ones (the router's NaN
+        // path emits -1 by design), so with any dropped id the tail of ids_src1
+        // stays unwritten pool memory.  quantize_mmq_q8_1's grid covers all
+        // ne_get_rows rows and gathers x rows via ids_src1[i1] unconditionally
+        // (quantize.cu:304), so a stale/garbage tail entry becomes a wild OOB read
+        // (the intermittent batched-draft illegal access; B200 memcheck-convicted).
+        // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
+        // those lanes' output is never consumed (the mmq write-back loop is
+        // expert_bounds-bounded), the cost is a few KB of memset on-stream.
+        (void)cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
+        (void)cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
 
-    // si1 = stride between tokens in the ids tensor, in elements. Our ids is
-    // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
-    // sis1 = stride between src1 channels in row-units. With ne11=1, sis1=1
-    //        means each "channel" of src1 is one row of K floats.
-    const int si1  = n_expert_used;
-    const int sis1 = 1;
+        // si1 = stride between tokens in the ids tensor, in elements. Our ids is
+        // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
+        // sis1 = stride between src1 channels in row-units. With ne11=1, sis1=1
+        //        means each "channel" of src1 is one row of K floats.
+        const int si1  = n_expert_used;
+        const int sis1 = 1;
 
-    // The smem mm_ids_helper uses n_tokens * 4 bytes of dynamic shared memory;
-    // the down matmul reaches here with n_tokens = assignments (6x the forward
-    // width), so 8192-row prefill chunks pass 48384 "tokens" > cap.  P5: past
-    // the cap the launcher dispatches the bit-identical two-pass global
-    // variant instead (mmid.cu mm_ids_helper_global) — refusing here used to
-    // throw the WHOLE MoE block (including gate/up mmq work) onto the legacy
-    // expert-tile fallback, the W8192 prefill cliff.  DS4_MMID_LARGE=0
-    // restores the refusal.
-    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo && !ds4_mmid_large_enabled()) {
-        fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
-                tag, n_tokens);
-        return -1;
-    }
+        // The smem mm_ids_helper uses n_tokens * 4 bytes of dynamic shared memory;
+        // the down matmul reaches here with n_tokens = assignments (6x the forward
+        // width), so 8192-row prefill chunks pass 48384 "tokens" > cap.  P5: past
+        // the cap the launcher dispatches the bit-identical two-pass global
+        // variant instead (mmid.cu mm_ids_helper_global) — refusing here used to
+        // throw the WHOLE MoE block (including gate/up mmq work) onto the legacy
+        // expert-tile fallback, the W8192 prefill cliff.  DS4_MMID_LARGE=0
+        // restores the refusal.
+        if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo &&
+            !ds4_mmid_large_enabled()) {
+            fprintf(stderr, "%s: n_tokens=%d exceeds mm_ids_helper shared-mem cap; falling back\n",
+                    tag, n_tokens);
+            return -1;
+        }
 
-    ggml_cuda_launch_mm_ids_helper(
-        ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-        n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
+        ggml_cuda_launch_mm_ids_helper(
+            ids, ids_src1, ids_dst, expert_bounds,
+            n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mm_ids_helper failed: %s\n", tag, cudaGetErrorString(err));
-        return -2;
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: mm_ids_helper failed: %s\n", tag, cudaGetErrorString(err));
+            return -2;
+        }
     }
 
     // 2. Gather + quantize activations. Native Blackwell MXFP4 consumes FP4;
@@ -1148,19 +1186,19 @@ int ds4_mmq_moe_impl(
 
     if (use_native_fp4) {
         quantize_mmq_fp4_cuda(
-            X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
+            X_f32, ids_src1_p, (void *)src1_q8_1.get(),
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
     } else {
         quantize_mmq_q8_1_cuda(
-            X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
+            X_f32, ids_src1_p, (void *)src1_q8_1.get(),
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
     }
 
-    err = cudaGetLastError();
+    cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: MMQ activation quantize failed: %s\n",
                 tag, cudaGetErrorString(err));
@@ -1206,7 +1244,7 @@ int ds4_mmq_moe_impl(
             if (d2r_work_bytes != 0) {
                 ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
                 const int d2r_rc = ds4_mmq_q2_K_moe_d2r_launch(
-                    x_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+                    x_soa, soa_blocks, src1_q8_1.get(), ids_dst_p, expert_bounds_p,
                     out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), d2r_work_bytes,
                     stream);
                 if (d2r_rc == 0) {
@@ -1220,8 +1258,8 @@ int ds4_mmq_moe_impl(
         /*x=*/(const char *)W,
         /*type_x=*/type,
         /*y=*/(const int *)src1_q8_1.get(),
-        /*ids_dst=*/ids_dst.get(),
-        /*expert_bounds=*/expert_bounds.get(),
+        /*ids_dst=*/ids_dst_p,
+        /*expert_bounds=*/expert_bounds_p,
         /*dst=*/out_f32,
         /*ncols_x=*/ne00,
         /*nrows_x=*/(int64_t)M,
@@ -1242,7 +1280,7 @@ int ds4_mmq_moe_impl(
         /*use_stream_k=*/use_stream_k,
         /* Rows any one expert can hold, not the gathered total. */
         /*ncols_max=*/((max_rows_per_expert > 0 && max_rows_per_expert < ne_get_rows)
-                       ? ds4_mmq_true_max_rows(expert_bounds.get(), n_experts, max_rows_per_expert, n_tokens, stream)
+                       ? ds4_mmq_true_max_rows(expert_bounds_p, n_experts, max_rows_per_expert, n_tokens, stream)
                        : ne_get_rows),
         /*x_soa=*/x_soa,
         /*soa_blocks=*/soa_blocks,
@@ -1363,7 +1401,8 @@ int ds4_mmq_moe_pair_impl(
         int64_t         soa_blocks = 0,
         const ds4_mmq_fused_down *fused_down = nullptr,
         /* ds4: see ds4_mmq_moe_impl. */
-        int64_t         max_rows_per_expert = 0) {
+        int64_t         max_rows_per_expert = 0,
+        const ds4_mmq_moe_map * shared_map = NULL) {
 
     const bool direct_gateup_q8 =
         fused_down != nullptr && fused_down->direct_gateup_q8;
@@ -1437,6 +1476,10 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
+    /* A map the caller built for this block (S5 C4); the fused direct path
+     * keeps its own scratch, so it takes precedence over sharing. */
+    const ds4_mmq_moe_map * const reuse =
+        ds4_mmq_moe_map_checked(tag, shared_map, ne_get_rows, n_experts);
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
     ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
@@ -1514,6 +1557,11 @@ int ds4_mmq_moe_pair_impl(
         ids_src1 = maps.ids_src1;
         ids_dst = maps.ids_dst;
         expert_bounds = maps.expert_bounds;
+    } else if (reuse) {
+        /* Built once for this MoE block; nothing to allocate or launch. */
+        ids_src1 = (int32_t *)reuse->ids_src1;
+        ids_dst = (int32_t *)reuse->ids_dst;
+        expert_bounds = (int32_t *)reuse->expert_bounds;
     } else {
         ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
         ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
@@ -1533,7 +1581,7 @@ int ds4_mmq_moe_pair_impl(
     }
 
     cudaError_t err = cudaSuccess;
-    {
+    if (!reuse) {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/expert_map",
                 ds4_mmq_nvtx_payload((uint32_t)n_tokens, (uint32_t)n_experts),
@@ -1992,14 +2040,106 @@ int ds4_mmq_moe_pair_impl(
 
 } // anonymous namespace
 
+/* Scratch for the shared routed map (ds4_mmq_moe_map).  One live map per
+ * device: a MoE block builds it and its GEMMs consume it before the next
+ * block starts, all on one stream.  Plain cudaMalloc rather than the pool
+ * because the map has to outlive the pool scopes of the GEMMs between the
+ * build and the last consumer, and grown rather than sized once because the
+ * prefill chunk width is a runtime knob. */
+static int32_t *g_mmq_moe_map_base[GGML_CUDA_MAX_DEVICES] = {};
+static size_t   g_mmq_moe_map_ints[GGML_CUDA_MAX_DEVICES] = {};
+
+extern "C" int ds4_mmq_moe_map_build(
+        ds4_mmq_moe_map * map, const int32_t * ids,
+        int n_tokens, int n_expert, int n_expert_used, cudaStream_t stream) {
+    if (!map) return -1;
+    memset(map, 0, sizeof(*map));
+    if (!ids || n_tokens <= 0 || n_expert <= 0 || n_expert_used <= 0) return -1;
+    if (n_expert_used > n_expert) return -1;
+
+    const int dev = ggml_cuda_get_device();
+    if (dev < 0 || dev >= GGML_CUDA_MAX_DEVICES) return -1;
+
+    /* The scratch is allocated here on first use, which capture forbids; a
+     * captured graph is decode-shaped anyway and never takes this path. */
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess ||
+        cap != cudaStreamCaptureStatusNone) {
+        (void)cudaGetLastError();
+        return -1;
+    }
+
+    const int64_t rows = (int64_t)n_tokens * n_expert_used;
+    const size_t need = 2u * (size_t)rows + (size_t)n_expert + 1u;
+    if (g_mmq_moe_map_ints[dev] < need) {
+        int32_t *base = nullptr;
+        if (cudaMalloc((void **)&base, need * sizeof(int32_t)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return -1;
+        }
+        if (g_mmq_moe_map_base[dev]) (void)cudaFree(g_mmq_moe_map_base[dev]);
+        g_mmq_moe_map_base[dev] = base;
+        g_mmq_moe_map_ints[dev] = need;
+    }
+
+    /* Same shared-memory cap guard as the GEMMs: past it the launcher takes
+     * the two-pass global variant unless that is switched off. */
+    if ((size_t)n_tokens * 4u > ggml_cuda_info().devices[dev].smpbo &&
+        !ds4_mmid_large_enabled()) {
+        return -1;
+    }
+
+    int32_t *ids_src1 = g_mmq_moe_map_base[dev];
+    int32_t *ids_dst = ids_src1 + rows;
+    int32_t *expert_bounds = ids_dst + rows;
+
+    /* Task #22 root-cause fix, as in the GEMMs: mm_ids_helper compacts and
+     * drops out-of-range router ids, so the unwritten tail must gather row 0
+     * instead of stale scratch. */
+    (void)cudaMemsetAsync(ids_src1, 0, (size_t)rows * sizeof(int32_t), stream);
+    (void)cudaMemsetAsync(ids_dst, 0, (size_t)rows * sizeof(int32_t), stream);
+    ggml_cuda_launch_mm_ids_helper(
+        ids, ids_src1, ids_dst, expert_bounds, n_expert, n_tokens, n_expert_used,
+        /*nchannels_y=*/1, /*si1=*/n_expert_used, /*sis1=*/1, stream);
+    const cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4_mmq_moe_map_build: mm_ids_helper failed: %s\n",
+                cudaGetErrorString(err));
+        return -2;
+    }
+
+    map->ids_src1 = ids_src1;
+    map->ids_dst = ids_dst;
+    map->expert_bounds = expert_bounds;
+    map->n_rows = (int)rows;
+    map->n_expert = n_expert;
+    return 0;
+}
+
+extern "C" void ds4_mmq_moe_map_flatten(
+        ds4_mmq_moe_map * out, const ds4_mmq_moe_map * pair) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!pair || !pair->ids_dst) return;
+    /* One expert per row: the assignment index is both the activation row the
+     * GEMM reads and the column it writes, and that index is what the pair
+     * map's ids_dst already holds. */
+    out->ids_src1 = pair->ids_dst;
+    out->ids_dst = pair->ids_dst;
+    out->expert_bounds = pair->expert_bounds;
+    out->n_rows = pair->n_rows;
+    out->n_expert = pair->n_expert;
+}
+
 extern "C" int ds4_mmq_q8_0_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, int max_rows_per_expert) {
+        cudaStream_t stream, int max_rows_per_expert,
+        const ds4_mmq_moe_map * map) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             /*x_soa=*/NULL, /*soa_blocks=*/0,
-                                            (int64_t)max_rows_per_expert);
+                                            (int64_t)max_rows_per_expert, map);
 }
 
 extern "C" int ds4_mmq_q2_K_moe(
@@ -2051,11 +2191,12 @@ extern "C" int ds4_mmq_q4_K_moe(
 extern "C" int ds4_mmq_q5_1_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, int max_rows_per_expert) {
+        cudaStream_t stream, int max_rows_per_expert,
+        const ds4_mmq_moe_map * map) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q5_1>("ds4_mmq_q5_1_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             /*x_soa=*/NULL, /*soa_blocks=*/0,
-                                            (int64_t)max_rows_per_expert);
+                                            (int64_t)max_rows_per_expert, map);
 }
 
 /* qwen4exp: one layer of the shipped UD-Q4_K_XL mix stores its routed gate and
@@ -2063,11 +2204,12 @@ extern "C" int ds4_mmq_q5_1_moe(
 extern "C" int ds4_mmq_q5_K_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, int max_rows_per_expert) {
+        cudaStream_t stream, int max_rows_per_expert,
+        const ds4_mmq_moe_map * map) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q5_K>("ds4_mmq_q5_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream,
                                             /*x_soa=*/NULL, /*soa_blocks=*/0,
-                                            (int64_t)max_rows_per_expert);
+                                            (int64_t)max_rows_per_expert, map);
 }
 
 extern "C" int ds4_mmq_mxfp4_moe(
@@ -2322,13 +2464,14 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream, int max_rows_per_expert) {
+        cudaStream_t stream, int max_rows_per_expert,
+        const ds4_mmq_moe_map * map) {
     return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream,
         /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
         /*fused_down=*/nullptr,
-        (int64_t)max_rows_per_expert);
+        (int64_t)max_rows_per_expert, map);
 }
 
 extern "C" int ds4_mmq_mxfp4_moe_pair(

@@ -3177,9 +3177,24 @@ int ds4_gpu_q4e_qsa_attention_sparse(ds4_gpu_tensor *out, ds4_gpu_tensor *part, 
 void *ds4_gpu_q4e_host_alloc(uint64_t bytes);
 void ds4_gpu_q4e_host_free(void *p);
 
-int ds4_gpu_q4e_moe_gate_up( ds4_gpu_tensor *mid, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used, int *fused_silu);
+/* Handle to the routed-expert map the batched MoE GEMMs sort their work by.
+ * The map follows from the router's ids alone, so one MoE block builds it
+ * once: gate/up fills the handle and down consumes it.  Zero it before the
+ * pair call; a handle that stays zeroed (decode, where the routed GEMMs take
+ * the per-token vector path) makes each GEMM build its own map, so the
+ * sharing is a speed path and never a correctness one.  The map borrows GPU
+ * scratch that the next block's build overwrites: use it inside one block. */
+typedef struct ds4_q4e_moe_map {
+    const void *ids_src1;
+    const void *ids_dst;
+    const void *expert_bounds;
+    uint32_t n_rows;
+    uint32_t n_expert;
+} ds4_q4e_moe_map;
 
-int ds4_gpu_q4e_moe_down( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used);
+int ds4_gpu_q4e_moe_gate_up( ds4_gpu_tensor *mid, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used, int *fused_silu, ds4_q4e_moe_map *map_out);
+
+int ds4_gpu_q4e_moe_down( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used, const ds4_q4e_moe_map *map);
 
 int ds4_gpu_q4e_moe_matmul( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used);
 

@@ -2482,6 +2482,43 @@ extern "C" int ds4_gpu_q4e_qsa_gate(ds4_gpu_tensor *x, const ds4_gpu_tensor *gat
  * change in rounding -- and it keeps short prompts on exactly the kernels the
  * llama.cpp trace comparison validates. */
 #define Q4E_MOE_BATCH_MIN_TOK q4e_moe_batch_min_tok()
+/* Mirrors the public `ds4_q4e_moe_map` in ds4_gpu.h.  This translation unit
+ * does not include that header (project convention, see the note near the top
+ * of ds4_cuda.cu), so the handle is redeclared and size-checked here. */
+struct ds4_q4e_moe_map {
+    const void *ids_src1;
+    const void *ids_dst;
+    const void *expert_bounds;
+    uint32_t n_rows;
+    uint32_t n_expert;
+};
+static_assert(sizeof(ds4_q4e_moe_map) == 3u * sizeof(void *) + 2u * sizeof(uint32_t),
+              "ds4_q4e_moe_map must match the ds4_gpu.h decl");
+
+/* The routed map the host passes from the gate/up GEMM to the down GEMM is
+ * mmq's map behind an opaque handle, so ds4.c never sees mmq's header.  Both
+ * hold the same three device pointers; the conversion lives here only. */
+static void q4e_moe_map_export(ds4_q4e_moe_map *h, const ds4_mmq_moe_map *m) {
+    if (!h) return;
+    memset(h, 0, sizeof(*h));
+    if (!m || !m->ids_src1) return;
+    h->ids_src1 = m->ids_src1;
+    h->ids_dst = m->ids_dst;
+    h->expert_bounds = m->expert_bounds;
+    h->n_rows = (uint32_t)m->n_rows;
+    h->n_expert = (uint32_t)m->n_expert;
+}
+
+static void q4e_moe_map_import(ds4_mmq_moe_map *m, const ds4_q4e_moe_map *h) {
+    memset(m, 0, sizeof(*m));
+    if (!h || !h->ids_src1) return;
+    m->ids_src1 = (const int32_t *)h->ids_src1;
+    m->ids_dst = (const int32_t *)h->ids_dst;
+    m->expert_bounds = (const int32_t *)h->expert_bounds;
+    m->n_rows = (int)h->n_rows;
+    m->n_expert = (int)h->n_expert;
+}
+
 static uint32_t q4e_moe_batch_min_tok(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -2706,7 +2743,8 @@ extern "C" int ds4_gpu_q4e_moe_down(
         const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint32_t weight_type,
         uint32_t out_dim, uint32_t in_dim,
-        uint32_t n_tok, uint32_t n_expert, uint32_t n_used) {
+        uint32_t n_tok, uint32_t n_expert, uint32_t n_used,
+        const ds4_q4e_moe_map *map) {
     if (!out || !x || !ids || !n_tok || (in_dim % 32u) != 0u) return 0;
     const uint32_t block_bytes = (weight_type == 7u) ? 24u : (weight_type == 8u) ? 34u : 0u;
     if (block_bytes == 0u) {
@@ -2734,6 +2772,13 @@ extern "C" int ds4_gpu_q4e_moe_down(
      * expert map it already is. */
     const uint32_t n_rows = n_tok * n_used;
     if (n_tok >= Q4E_MOE_BATCH_MIN_TOK) {
+        /* The gate/up GEMM already sorted these very assignments by expert;
+         * flattened, its dst column *is* this GEMM's row index, so the map
+         * carries over unchanged (ds4_mmq_moe_map_flatten). */
+        ds4_mmq_moe_map pair, flat;
+        q4e_moe_map_import(&pair, map);
+        ds4_mmq_moe_map_flatten(&flat, &pair);
+        const ds4_mmq_moe_map *shared = flat.ids_src1 ? &flat : NULL;
         /* Flattening to one expert per row makes n_rows the gathered total, but
          * the rows still come from n_tok tokens that each picked an expert at
          * most once, so n_tok -- not n_rows -- bounds any expert's bucket. */
@@ -2741,11 +2786,11 @@ extern "C" int ds4_gpu_q4e_moe_down(
             ? ds4_mmq_q5_1_moe(w, (const float *)x->ptr, (const int32_t *)ids->ptr,
                                (float *)out->ptr, (int)out_dim, (int)in_dim,
                                (int)n_rows, (int)n_expert, 1, cuda_decode_stream(),
-                               (int)n_tok)
+                               (int)n_tok, shared)
             : ds4_mmq_q8_0_moe(w, (const float *)x->ptr, (const int32_t *)ids->ptr,
                                (float *)out->ptr, (int)out_dim, (int)in_dim,
                                (int)n_rows, (int)n_expert, 1, cuda_decode_stream(),
-                               (int)n_tok);
+                               (int)n_tok, shared);
         if (brc == 0) return cuda_ok(cudaGetLastError(), "qwen4exp moe down batched");
         fprintf(stderr, "ds4: qwen4exp batched routed down returned %d; "
                         "falling back to the grouped kernel\n", brc);
@@ -2814,9 +2859,10 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
         uint64_t gate_offset, uint64_t up_offset, uint32_t weight_type,
         uint32_t out_dim, uint32_t in_dim,
         uint32_t n_tok, uint32_t n_expert, uint32_t n_used,
-        int *fused_silu) {
+        int *fused_silu, ds4_q4e_moe_map *map_out) {
     if (!mid || !gate || !up || !x || !ids || !n_tok) return 0;
     *fused_silu = 0;
+    if (map_out) memset(map_out, 0, sizeof(*map_out));
 
     uint64_t block_elems = 0, block_bytes = 0;
     switch (weight_type) {
@@ -2840,6 +2886,14 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
      * entries sort rows by expert first, so each expert's weights are read
      * once per chunk however many tokens picked it. */
     if (n_tok >= Q4E_MOE_BATCH_MIN_TOK) {
+        /* One routed map for the whole block: this GEMM and the down GEMM
+         * after it sort the same assignments by expert, and building it twice
+         * cost a whole-ids scan per expert per layer.  A failed build leaves
+         * the map empty, which sends each GEMM back to building its own. */
+        ds4_mmq_moe_map map;
+        (void)ds4_mmq_moe_map_build(&map, (const int32_t *)ids->ptr, (int)n_tok,
+                                    (int)n_expert, (int)n_used, cuda_decode_stream());
+        const ds4_mmq_moe_map *shared = map.ids_src1 ? &map : NULL;
         int brc;
         if (weight_type == 12u) {
             /* The router picks 10 distinct experts per token, so no expert can
@@ -2850,35 +2904,39 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
                                         (float *)gate->ptr, (float *)up->ptr,
                                         (int)out_dim, (int)in_dim, (int)n_tok,
                                         (int)n_expert, (int)n_used,
-                                        cuda_decode_stream(), /*max_rows_per_expert=*/(int)n_tok);
+                                        cuda_decode_stream(), /*max_rows_per_expert=*/(int)n_tok,
+                                        shared);
         } else if (weight_type == 8u) {
             brc = ds4_mmq_q8_0_moe(wg, (const float *)x->ptr,
                                    (const int32_t *)ids->ptr, (float *)gate->ptr,
                                    (int)out_dim, (int)in_dim, (int)n_tok,
                                    (int)n_expert, (int)n_used, cuda_decode_stream(),
-                                   /*max_rows_per_expert=*/(int)n_tok);
+                                   /*max_rows_per_expert=*/(int)n_tok, shared);
             if (brc == 0) {
                 brc = ds4_mmq_q8_0_moe(wu, (const float *)x->ptr,
                                        (const int32_t *)ids->ptr, (float *)up->ptr,
                                        (int)out_dim, (int)in_dim, (int)n_tok,
                                        (int)n_expert, (int)n_used, cuda_decode_stream(),
-                                       /*max_rows_per_expert=*/(int)n_tok);
+                                       /*max_rows_per_expert=*/(int)n_tok, shared);
             }
         } else {
             brc = ds4_mmq_q5_K_moe(wg, (const float *)x->ptr,
                                    (const int32_t *)ids->ptr, (float *)gate->ptr,
                                    (int)out_dim, (int)in_dim, (int)n_tok,
                                    (int)n_expert, (int)n_used, cuda_decode_stream(),
-                                   /*max_rows_per_expert=*/(int)n_tok);
+                                   /*max_rows_per_expert=*/(int)n_tok, shared);
             if (brc == 0) {
                 brc = ds4_mmq_q5_K_moe(wu, (const float *)x->ptr,
                                        (const int32_t *)ids->ptr, (float *)up->ptr,
                                        (int)out_dim, (int)in_dim, (int)n_tok,
                                        (int)n_expert, (int)n_used, cuda_decode_stream(),
-                                       /*max_rows_per_expert=*/(int)n_tok);
+                                       /*max_rows_per_expert=*/(int)n_tok, shared);
             }
         }
-        if (brc == 0) return cuda_ok(cudaGetLastError(), "qwen4exp moe gate/up batched");
+        if (brc == 0) {
+            q4e_moe_map_export(map_out, shared);
+            return cuda_ok(cudaGetLastError(), "qwen4exp moe gate/up batched");
+        }
         fprintf(stderr, "ds4: qwen4exp batched routed gate/up returned %d; "
                         "falling back to the per-token path\n", brc);
     }

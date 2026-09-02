@@ -66059,16 +66059,22 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
 
     /* Gate and up read the same activation, so they run as one call that
      * quantizes it once; at a single token that call also folds in the
-     * SwiGLU, leaving one launch where there were three. */
+     * SwiGLU, leaving one launch where there were three.
+     *
+     * The routed map both GEMMs of this block sort their work by is built by
+     * the first of them and handed to the second; see ds4_q4e_moe_map. */
     t = q4e_phase_begin();
     int fused_silu = 0;
+    ds4_q4e_moe_map routed_map;
+    memset(&routed_map, 0, sizeof(routed_map));
     if (!ds4_gpu_q4e_moe_gate_up(g->moe_mid, g->moe_gate, g->moe_up,
                                  g->mixed, g->moe_ids, m->map, m->size,
                                  l->ffn_gate_exps->abs_offset,
                                  l->ffn_up_exps->abs_offset,
                                  l->ffn_gate_exps->type,
                                  DS4_N_FF_EXP, DS4_N_EMBD, n_tok,
-                                 DS4_N_EXPERT, DS4_N_EXPERT_USED, &fused_silu)) return 0;
+                                 DS4_N_EXPERT, DS4_N_EXPERT_USED, &fused_silu,
+                                 &routed_map)) return 0;
     if (!fused_silu) {
         q4e_trace("ffn_moe_gate", (int)il, g->moe_gate,
                   (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_FF_EXP);
@@ -66090,7 +66096,8 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
     if (!ds4_gpu_q4e_moe_down(g->moe_down, g->moe_mid, g->moe_ids, m->map, m->size,
                               l->ffn_down_exps->abs_offset, l->ffn_down_exps->type,
                               DS4_N_EMBD, DS4_N_FF_EXP,
-                              n_tok, DS4_N_EXPERT, DS4_N_EXPERT_USED)) return 0;
+                              n_tok, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                              &routed_map)) return 0;
     q4e_trace("ffn_moe_down", (int)il, g->moe_down,
               (uint64_t)n_tok * DS4_N_EXPERT_USED * DS4_N_EMBD);
     if (!ds4_gpu_q4e_moe_combine(g->blk_out, g->moe_down, g->moe_w,
