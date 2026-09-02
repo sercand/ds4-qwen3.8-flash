@@ -65962,8 +65962,24 @@ static int q4e_matmul_at(ds4_gpu_tensor *out, const void *map, uint64_t map_size
         /* fall through */
     case DS4_TENSOR_Q4_K:
         /* Q5_0 and Q6_K appear only in unsloth's Q4_K_M MTP head (the
-         * hyper-connection up projections and attn_v); they have no narrow
-         * entry, so they go straight to the generic MMQ dense path. */
+         * hyper-connection up projections, attn_v and hc_ffn_down); they have
+         * no narrow entry, so they go straight to the generic MMQ dense path.
+         *
+         * The three Q5_0 tensors are K = 320, which is not a multiple of
+         * MMQ_ITER_K (256): mmq's last K tile loads six 32-weight blocks past
+         * each row, so every row reads into the next row's weights and the
+         * LAST row reads past the tensor.  The activation lanes there are
+         * zero (quantize.cu fills past ne00 with 0.0f), so the products
+         * vanish -- but only while the bytes decode to a finite fp16 block
+         * scale, because 0 * inf is NaN.  These rows therefore depend on the
+         * zeroed tail the weight-span arena puts past every cached span, and
+         * on the span builder keeping a row-unaligned tensor last so that
+         * tail is what its final row reads (commit 0991e49).  Until that
+         * lands here the head is read through a host-registered file mapping
+         * rather than the arena, so the over-read hits the next tensor's real
+         * file bytes; measured finite, but it is the pad that makes it safe,
+         * not the layout.  A K-unaligned tensor placed last in a file would
+         * read past the mapping itself. */
     case DS4_TENSOR_Q5_0:
     case DS4_TENSOR_Q6_K:
         return ds4_gpu_matmul_quant_tensor(out, map, map_size, w->abs_offset, w->type,
