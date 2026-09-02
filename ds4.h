@@ -156,10 +156,18 @@ typedef struct {
      * the default, which holds one full context's working set; the hit rate
      * is bounded by n-gram repetition, so a much larger cache buys nothing. */
     uint64_t ple_cache_bytes;
-    /* qwen4exp only: the KV page pool, in token positions (rounded up to
-     * whole pages, never below the context size).  Zero sizes it to the
-     * context, which is all one sequence can own. */
+    /* qwen4exp only: the shared KV page pool, in token positions (rounded up
+     * to whole pages, never below the context size).  Zero derives the plan's
+     * budget from the context -- four resident conversations, capped at
+     * 600000 positions (18 GB). */
     uint32_t kv_pool_tokens;
+    /* qwen4exp only: GDN checkpoints the prefix cache may hold, 113 MB each
+     * (0 picks the default, 40).  A checkpoint is what lets a request resume
+     * in the middle of a token sequence instead of prefilling it again. */
+    uint32_t ssm_checkpoints;
+    /* qwen4exp only: execution contexts, each a live recurrent state and page
+     * table over the shared pool (0 picks the default, 2). */
+    uint32_t exec_contexts;
     bool warm_weights;
     bool quality;
     bool glm_mtp;
@@ -450,8 +458,9 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 /* Leading prompt tokens the session can reuse without recomputation: the live
- * checkpoint when the prompt extends it, or (qwen4exp) the state snapshot
- * taken at the end of the previous prompt.  A chunked prefill starts here. */
+ * checkpoint when the prompt extends it, or (qwen4exp) the deepest GDN
+ * checkpoint the prefix cache holds on a path the prompt extends.  A chunked
+ * prefill starts here. */
 int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt);
 
 /* Where a reusable prefix comes from.  Callers only name the source, so a new
@@ -459,13 +468,18 @@ int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt);
 typedef enum {
     DS4_REUSE_COLD = 0,     /* nothing reusable: the prefill starts at 0 */
     DS4_REUSE_LIVE,         /* the live checkpoint, which the prompt extends */
-    DS4_REUSE_SNAPSHOT,     /* a state snapshot below the live frontier */
+    DS4_REUSE_CHECKPOINT,   /* a checkpoint below the frontier of this path */
+    DS4_REUSE_TREE,         /* a checkpoint on another path of the prefix tree */
 } ds4_reuse_source;
 
 typedef struct {
     ds4_reuse_source source;
     int reused_tokens;      /* leading prompt tokens the backend already holds */
     int prefilled_tokens;   /* prompt tokens the next sync has to evaluate */
+    /* qwen4exp: leading prompt tokens whose KV the prefix tree holds (p_kv).
+     * It can exceed reused_tokens, which is where the recurrent state can
+     * actually resume; the gap is prefilled again. */
+    int matched_tokens;
 } ds4_session_reuse;
 
 /* What a sync to `prompt` would reuse and what it would recompute.  A pure
@@ -476,15 +490,46 @@ void ds4_session_reuse_report(ds4_session *s, const ds4_tokens *prompt,
 const char *ds4_reuse_source_name(ds4_reuse_source source);
 
 /* Occupancy of the backend's reuse tier, for cache accounting.  Zero entries
- * for families whose only reusable state is the live checkpoint. */
+ * for families whose only reusable state is the live checkpoint.  The
+ * qwen4exp numbers are engine-wide: one prefix cache serves every session. */
 typedef struct {
-    int entries;            /* reusable states held right now */
+    int entries;            /* recurrent checkpoints held right now */
     int capacity;
-    /* Valid states dropped: evicted by a newer one, superseded by a restore,
-     * or invalidated by a cold prefill. */
-    uint64_t evictions;
+    uint64_t evictions;     /* checkpoints dropped by the utility policy */
+    /* qwen4exp paged KV: pool occupancy and the span tree over it. */
+    uint32_t pool_pages;
+    uint32_t pool_pages_used;
+    uint32_t tree_nodes;
+    uint64_t page_evictions;   /* leaf spans dropped to free pages */
 } ds4_session_cache_stats;
 void ds4_session_cache_stats_get(ds4_session *s, ds4_session_cache_stats *out);
+
+/* One cached path, as the disk tier will serialize it: the tokens it covers,
+ * the KV pages behind them and the recurrent state at its end.  Reports the
+ * path the session is standing on; false for families with no such cache. */
+typedef struct {
+    int tokens;
+    int pages;
+    uint64_t page_bytes;
+    uint64_t state_bytes;   /* 0 when the frontier carries no checkpoint */
+} ds4_session_path_info;
+bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out);
+
+/* The position a client will branch from on its next turn -- the end of the
+ * rendered chat scaffolding, which the server already computes.  qwen4exp
+ * places a recurrent checkpoint there, so the next turn prefills only its own
+ * suffix.  -1 (the default) means the caller has no boundary to offer; the
+ * hint applies to the next sync only. */
+void ds4_session_set_cache_boundary_hint(ds4_session *s, int position);
+
+/* The request is over: checkpoint the frontier so a continuation, or the same
+ * conversation's next turn after another one has run, resumes here. */
+void ds4_session_cache_commit(ds4_session *s);
+
+/* Whether this model's family keeps one prefix cache shared by all sessions,
+ * in which case the server's independent per-slot sessions are the wrong
+ * shape and --batched-session is refused. */
+bool ds4_engine_shares_prefix_cache(const ds4_engine *e);
 
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);

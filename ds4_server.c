@@ -10925,6 +10925,7 @@ typedef struct {
     uint64_t reused_tokens;
     uint64_t prefilled_tokens;
     ds4_session_cache_stats engine;
+    ds4_session_path_info path;
 } server_cache_report;
 
 static void server_cache_report_get(server *s, server_cache_report *out) {
@@ -10936,15 +10937,13 @@ static void server_cache_report_get(server *s, server_cache_report *out) {
     out->reused_tokens = s->cache_reused_tokens;
     out->prefilled_tokens = s->cache_prefilled_tokens;
     pthread_mutex_unlock(&s->mu);
-    /* Each resident slot keeps its own reuse tier, so the occupancy reported
-     * here is their sum. */
+    /* The families that report a reuse tier at all (qwen4exp) keep one cache
+     * shared by every session, so slot 0's numbers are the engine's; the rest
+     * report zeros. */
     pthread_mutex_lock(&s->inference_mu);
-    for (int i = 0; i < s->slot_count; i++) {
-        ds4_session_cache_stats st = {0};
-        ds4_session_cache_stats_get(s->slots[i].session, &st);
-        out->engine.entries += st.entries;
-        out->engine.capacity += st.capacity;
-        out->engine.evictions += st.evictions;
+    if (s->slot_count > 0) {
+        ds4_session_cache_stats_get(s->slots[0].session, &out->engine);
+        ds4_session_cache_path(s->slots[0].session, &out->path);
     }
     pthread_mutex_unlock(&s->inference_mu);
 }
@@ -10976,14 +10975,18 @@ static void server_cache_note_request(server *s, const char *source,
     server_cache_report_get(s, &rep);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: cache totals requests=%llu hits=%llu hit_rate=%.2f "
-               "reused=%llu prefilled=%llu states=%d/%d evictions=%llu",
+               "reused=%llu prefilled=%llu checkpoints=%d/%d evicted=%llu "
+               "pages=%u/%u spans=%u evicted=%llu",
                (unsigned long long)rep.requests,
                (unsigned long long)rep.hits,
                server_cache_hit_rate(&rep),
                (unsigned long long)rep.reused_tokens,
                (unsigned long long)rep.prefilled_tokens,
                rep.engine.entries, rep.engine.capacity,
-               (unsigned long long)rep.engine.evictions);
+               (unsigned long long)rep.engine.evictions,
+               rep.engine.pool_pages_used, rep.engine.pool_pages,
+               rep.engine.tree_nodes,
+               (unsigned long long)rep.engine.page_evictions);
 }
 
 /* The cache-source name for a prefix the engine supplied.  A new
@@ -10991,22 +10994,26 @@ static void server_cache_note_request(server *s, const char *source,
  * adding one warns until it is. */
 static const char *cache_source_for_reuse(ds4_reuse_source source) {
     switch (source) {
-    case DS4_REUSE_SNAPSHOT: return "memory-snapshot";
-    case DS4_REUSE_LIVE:     return "memory-token";
-    case DS4_REUSE_COLD:     break;
+    case DS4_REUSE_TREE:       return "memory-tree";
+    case DS4_REUSE_CHECKPOINT: return "memory-checkpoint";
+    case DS4_REUSE_LIVE:       return "memory-token";
+    case DS4_REUSE_COLD:       break;
     }
     return "none";
 }
 
-/* The reuse label for one request: `<source>@<reused>` when the engine
- * answered, else the matcher name, else "cold". */
+/* The reuse label for one request: `<source>@<position>` when the engine
+ * answered, else the matcher name, else "cold".  The position is where the
+ * prefill resumes, except for `tree`, which names the KV prefix the tree
+ * matched (p_kv) -- the resume point is the `reused=` field beside it. */
 static void request_reuse_label(char *out, size_t cap,
                                 const ds4_session_reuse *reuse,
                                 const char *cache_source, int cached) {
     if (!out || cap == 0) return;
     if (reuse && reuse->reused_tokens > 0) {
-        snprintf(out, cap, "%s@%d", ds4_reuse_source_name(reuse->source),
-                 reuse->reused_tokens);
+        const int at = reuse->source == DS4_REUSE_TREE && reuse->matched_tokens > 0
+                     ? reuse->matched_tokens : reuse->reused_tokens;
+        snprintf(out, cap, "%s@%d", ds4_reuse_source_name(reuse->source), at);
         return;
     }
     snprintf(out, cap, "%s", cached > 0 && cache_source ? cache_source : "cold");
@@ -12881,6 +12888,15 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
+    /* The boundary this client will branch from next turn.  A recurrent family
+     * puts a checkpoint there, which is what makes the follow-up turn prefill
+     * only its own suffix; the disk cache uses the same position (gated by its
+     * minimum size) for its cold checkpoint. */
+    ds4_session_set_cache_boundary_hint(
+        slot->session,
+        ds4_kvstore_chat_boundary_pos(prompt_for_sync,
+                                      ds4_token_user(s->engine),
+                                      ds4_token_assistant(s->engine)));
 
     int cold_store_len = 0;
     if (!multimodal && cached == 0 &&
@@ -13854,6 +13870,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
     ds4_session_set_cancel(slot->session, NULL, NULL);
+    /* The sequence is over: let a recurrent family checkpoint the frontier, so
+     * this conversation's next turn resumes here even after another one has
+     * used the context in between. */
+    ds4_session_cache_commit(slot->session);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -14190,14 +14210,23 @@ static bool send_cache_report(server *s, int fd) {
     buf_printf(&b,
         "{\"requests\":%llu,\"hits\":%llu,\"hit_rate\":%.4f,"
         "\"tokens_reused\":%llu,\"tokens_prefilled\":%llu,"
-        "\"states\":{\"entries\":%d,\"capacity\":%d,\"evictions\":%llu}}\n",
+        "\"states\":{\"entries\":%d,\"capacity\":%d,\"evictions\":%llu},"
+        "\"pages\":{\"used\":%u,\"total\":%u,\"spans\":%u,\"evictions\":%llu},"
+        "\"path\":{\"tokens\":%d,\"pages\":%d,\"page_bytes\":%llu,"
+        "\"state_bytes\":%llu}}\n",
         (unsigned long long)rep.requests,
         (unsigned long long)rep.hits,
         server_cache_hit_rate(&rep),
         (unsigned long long)rep.reused_tokens,
         (unsigned long long)rep.prefilled_tokens,
         rep.engine.entries, rep.engine.capacity,
-        (unsigned long long)rep.engine.evictions);
+        (unsigned long long)rep.engine.evictions,
+        rep.engine.pool_pages_used, rep.engine.pool_pages,
+        rep.engine.tree_nodes,
+        (unsigned long long)rep.engine.page_evictions,
+        rep.path.tokens, rep.path.pages,
+        (unsigned long long)rep.path.page_bytes,
+        (unsigned long long)rep.path.state_bytes);
     bool ok = http_response(fd, s->enable_cors, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -14754,6 +14783,17 @@ static server_config parse_options(int argc, char **argv) {
                 exit(2);
             }
             c.engine.kv_pool_tokens = (uint32_t)v;
+        } else if (!strcmp(arg, "--ssm-checkpoints")) {
+            c.engine.ssm_checkpoints =
+                (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--exec-contexts")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --exec-contexts must be positive");
+                exit(2);
+            }
+            c.engine.exec_contexts = (uint32_t)v;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -14902,6 +14942,16 @@ int main(int argc, char **argv) {
         return rc;
     }
 
+    /* A family with one prefix cache shared by every session has no use for
+     * independent slots: they would draw from the same page pool and the same
+     * checkpoint store, and batched mode also turns MTP speculation off. */
+    if (cfg.batched_sessions > 0 && ds4_engine_shares_prefix_cache(engine)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: --batched-session %d ignored: this model shares one "
+                   "prefix cache across sessions (see --exec-contexts)",
+                   cfg.batched_sessions);
+        cfg.batched_sessions = 0;
+    }
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     log_context_memory(cfg.engine.backend,
                        cfg.ctx_size,
@@ -19153,12 +19203,20 @@ static void test_kv_cache_chat_anchor_uses_last_user_before_assistant(void) {
 static void test_request_reuse_label_names_engine_source(void) {
     char label[48];
 
-    ds4_session_reuse snapshot = {
-        .source = DS4_REUSE_SNAPSHOT, .reused_tokens = 6144,
-        .prefilled_tokens = 512,
+    ds4_session_reuse checkpoint = {
+        .source = DS4_REUSE_CHECKPOINT, .reused_tokens = 6144,
+        .prefilled_tokens = 512, .matched_tokens = 6656,
     };
-    request_reuse_label(label, sizeof(label), &snapshot, "memory-snapshot", 6144);
-    TEST_ASSERT(!strcmp(label, "snapshot@6144"));
+    request_reuse_label(label, sizeof(label), &checkpoint, "memory-checkpoint", 6144);
+    TEST_ASSERT(!strcmp(label, "checkpoint@6144"));
+
+    /* A tree hit names the KV prefix it matched, not the resume point. */
+    ds4_session_reuse tree = {
+        .source = DS4_REUSE_TREE, .reused_tokens = 4096,
+        .prefilled_tokens = 17564, .matched_tokens = 5000,
+    };
+    request_reuse_label(label, sizeof(label), &tree, "memory-tree", 4096);
+    TEST_ASSERT(!strcmp(label, "tree@5000"));
 
     ds4_session_reuse live = {
         .source = DS4_REUSE_LIVE, .reused_tokens = 27, .prefilled_tokens = 3,

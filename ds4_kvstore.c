@@ -708,10 +708,9 @@ int ds4_kvstore_store_len(const ds4_kvstore *kc, int tokens) {
     return tokens;
 }
 
-int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
-                                const ds4_tokens *prompt,
-                                int user_token_id,
-                                int assistant_token_id) {
+int ds4_kvstore_chat_boundary_pos(const ds4_tokens *prompt,
+                                  int user_token_id,
+                                  int assistant_token_id) {
     if (!prompt || user_token_id < 0 || assistant_token_id < 0) return -1;
 
     /* Cold checkpoints maximize reuse across independent agent sessions.  The
@@ -724,7 +723,16 @@ int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
         if (token == assistant_token_id) break;
         if (token == user_token_id) last_user = i;
     }
-    return last_user >= kc->opt.min_tokens ? last_user : -1;
+    return last_user;
+}
+
+int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
+                                const ds4_tokens *prompt,
+                                int user_token_id,
+                                int assistant_token_id) {
+    const int pos = ds4_kvstore_chat_boundary_pos(prompt, user_token_id,
+                                                  assistant_token_id);
+    return pos >= kc->opt.min_tokens ? pos : -1;
 }
 
 static int kv_cache_continued_step(const ds4_kvstore *kc) {

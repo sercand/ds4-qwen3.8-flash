@@ -38899,6 +38899,11 @@ typedef struct {
     bool active;
 } ds4_engine_tp_state;
 
+/* The qwen4exp prefix cache: one page pool, one radix tree of token spans and
+ * one GDN checkpoint store, shared by every session (see "qwen4exp prefix
+ * cache" beside the qwen4exp session code).  Opaque here. */
+typedef struct q4e_cache q4e_cache;
+
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
@@ -38932,6 +38937,9 @@ struct ds4_engine {
     uint64_t ssd_streaming_cache_bytes;
     uint64_t ple_cache_bytes;
     uint32_t kv_pool_tokens;
+    uint32_t ssm_checkpoints;
+    uint32_t exec_contexts;
+    q4e_cache *q4e_cache;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
@@ -54664,40 +54672,95 @@ static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
 #endif /* DS4_NO_GPU */
 
 /* ---------------------------------------------------------------------------
- * qwen4exp paged KV: the page pool, and one sequence's page table.
+ * qwen4exp prefix cache, part 1: the page pool and the radix tree of token
+ * spans.  Part 2 -- the GDN checkpoint store and the operations that touch a
+ * live execution context -- needs GPU tensors and lives below the guard.
  *
  * A sequence's KV -- QSA K and V for the twelve attention layers, the
- * indexer's raw and pooled keys, the draft head's K and V -- used to be one
- * contiguous run of ctx_size rows per buffer, addressed by position.  It is
- * now a pool of fixed pages of DS4_Q4E_PAGE_TOKENS positions
- * (ds4_q4e_page.h carries the geometry and why 256), plus a table mapping the
+ * indexer's raw and pooled keys, the draft head's K and V -- is carved into
+ * fixed pages of DS4_Q4E_PAGE_TOKENS positions (ds4_q4e_page.h carries the
+ * geometry and why 256), 7.5 MiB per page across every buffer.  One pool of
+ * pages, owned by the engine, serves every conversation; a page table maps a
  * sequence's logical page i, covering positions [256 i, 256 i + 256), to a
- * pool page.  Every KV-touching kernel takes that table and translates.
+ * pool page, and every KV-touching kernel translates through it.
  *
- * Today one execution context owns the pool and appends pages in order, so
- * this is only a change of address arithmetic.  The indirection is for the
- * step after it, where a radix tree of token spans lets contexts share pages;
- * the two rules that make sharing safe already hold.  A page is immutable
- * once the frontier has moved past it: the only writes are at the frontier,
- * and a rejected speculative suffix is rewritten in place at those same
- * positions by the next step.  And a page is released only when the frontier
- * retreats below it -- a snapshot restore or a reset -- by which point every
- * snapshot above that point has been dropped.
+ * The tree.  Nodes are token spans; a node's children branch by first token.
+ * Node n covers positions [n->start, n->end) and owns the pool pages for
+ * logical pages [n->pg_lo, n->pg_hi) = [start / 256, ceil(end / 256)), so the
+ * page table of a path is built by walking it and letting the deepest node
+ * win: consecutive nodes overlap in at most the one page that holds their
+ * boundary, and the child's copy of that page is the one with the child's
+ * tokens in it.  A node may carry one GDN checkpoint at its end position.
+ *
+ * Lifetime and immutability.  A page is written only at some context's
+ * frontier and is immutable from the moment that frontier moves past it, so
+ * a reader never sees a row move.  A context that resumes at a position
+ * inside a shared page copies that one page (q4e_page_copy) rather than
+ * writing into it: below the resume point the bytes belong to the other
+ * path, above it they are this context's to rewrite.
+ *
+ * Refcounts.  pool.refs[p] counts the holders of pool page p: one per tree
+ * node that lists it and one per live page table.  A page returns to the free
+ * stack when the last holder drops it, so a node's pages outlive the context
+ * that wrote them and a context's un-committed frontier pages outlive nothing.
+ * n->live counts the execution contexts whose path runs through n; a node with
+ * live holders is never evicted.
+ *
+ * Utility eviction.  Both policies price an entry as prefill seconds saved
+ * per mebibyte, decayed by time since its last hit (Marconi's point: LRU
+ * throws away the large SSM entries that are worth the most).  A page saves
+ * its 256 positions of prefill, so every page is worth the same and the page
+ * ranking reduces to recency -- but leaves go before interior nodes, which is
+ * what dropping whole leaf spans gives.  A checkpoint saves the prefill from
+ * the nearest lower checkpoint on its path to its own position, so one 300
+ * tokens above its neighbour is nearly worthless and a lone one at 20k is
+ * worth 28 seconds.
  *
  * This block is deliberately outside the GPU guard: it is array bookkeeping
  * with an off-by-one in every direction, so ds4_test exercises it.
  * ------------------------------------------------------------------------ */
+
+/* Prefill runs at roughly 700 tok/s at long context, so a token of prefill
+ * saved is 1.4 ms.  A page is 256 positions in 7.5 MiB; a GDN checkpoint is
+ * 113 MiB.  The decay halves an entry's utility after DECAY seconds idle. */
+#define Q4E_PREFILL_S_PER_TOKEN 0.0014
+#define Q4E_PAGE_MIB            7.5
+#define Q4E_CKPT_MIB            113.0
+#define Q4E_CACHE_DECAY_S       600.0
+
 typedef struct {
-    uint32_t n_pages;      /* pool capacity, in pages */
-    uint32_t n_free;
-    int32_t *free_ids;     /* free page ids; taken from the top */
+    uint32_t  n_pages;      /* pool capacity, in pages */
+    uint32_t  n_free;
+    int32_t  *free_ids;     /* free page ids; taken from the top */
+    uint32_t *refs;         /* holders per page: tree nodes plus page tables */
 } q4e_page_pool;
 
 typedef struct {
-    int32_t *map;          /* logical page -> pool page id */
-    uint32_t len;          /* logical pages the sequence owns */
+    int32_t *map;           /* logical page -> pool page id */
+    uint32_t len;           /* logical pages this context holds */
     uint32_t cap;
 } q4e_page_table;
+
+typedef struct q4e_tree_node q4e_tree_node;
+struct q4e_tree_node {
+    q4e_tree_node *parent;
+    q4e_tree_node *child;   /* first child */
+    q4e_tree_node *next;    /* next sibling */
+    uint32_t  start, end;   /* the span of positions this node adds */
+    int32_t  *tok;          /* end - start tokens */
+    int32_t  *pages;        /* pool pages for logical [pg_lo, pg_hi) */
+    uint32_t  pg_lo, pg_hi;
+    int32_t   ckpt;         /* checkpoint slot at `end`, or -1 */
+    uint32_t  live;         /* execution contexts whose path runs through here */
+    double    hit;          /* monotonic seconds of the last lookup hit */
+};
+
+typedef struct {
+    q4e_page_pool  pool;
+    q4e_tree_node *root;    /* the empty span at position 0 */
+    uint32_t       nodes;   /* nodes below the root */
+    uint64_t       page_evictions;   /* leaf spans dropped to free pages */
+} q4e_span_tree;
 
 /* Pages needed to cover positions [0, n_pos). */
 static uint32_t q4e_pages_for(uint32_t n_pos) {
@@ -54712,6 +54775,8 @@ static uint32_t q4e_pages_for(uint32_t n_pos) {
  * pages abut fails it). */
 static void q4e_page_pool_init(q4e_page_pool *pool, uint32_t n_pages, bool reverse) {
     pool->free_ids = xmalloc((size_t)n_pages * sizeof(int32_t));
+    pool->refs = xmalloc((size_t)n_pages * sizeof(uint32_t));
+    memset(pool->refs, 0, (size_t)n_pages * sizeof(uint32_t));
     pool->n_pages = n_pages;
     pool->n_free = n_pages;
     for (uint32_t i = 0; i < n_pages; i++) {
@@ -54721,7 +54786,26 @@ static void q4e_page_pool_init(q4e_page_pool *pool, uint32_t n_pages, bool rever
 
 static void q4e_page_pool_free(q4e_page_pool *pool) {
     free(pool->free_ids);
+    free(pool->refs);
     memset(pool, 0, sizeof(*pool));
+}
+
+/* Take a page with one holder, or -1 when the pool is empty. */
+static int32_t q4e_page_take(q4e_page_pool *pool) {
+    if (pool->n_free == 0u) return -1;
+    const int32_t id = pool->free_ids[--pool->n_free];
+    pool->refs[id] = 1u;
+    return id;
+}
+
+static void q4e_page_ref(q4e_page_pool *pool, int32_t id) {
+    if (id >= 0) pool->refs[id]++;
+}
+
+/* Drop one holder; the page goes back to the pool with the last one. */
+static void q4e_page_unref(q4e_page_pool *pool, int32_t id) {
+    if (id < 0 || pool->refs[id] == 0u) return;
+    if (--pool->refs[id] == 0u) pool->free_ids[pool->n_free++] = id;
 }
 
 static void q4e_page_table_free(q4e_page_table *t) {
@@ -54729,7 +54813,13 @@ static void q4e_page_table_free(q4e_page_table *t) {
     memset(t, 0, sizeof(*t));
 }
 
-/* Own pages for positions [0, n_pos).  The logical pages added are
+static void q4e_page_table_reserve(q4e_page_table *t, uint32_t want) {
+    if (want <= t->cap) return;
+    t->map = xrealloc(t->map, (size_t)want * sizeof(int32_t));
+    t->cap = want;
+}
+
+/* Own fresh pages for positions [0, n_pos).  The logical pages added are
  * [*first_new, *first_new + *n_new), which is what the caller has to hand the
  * kernels; returns 1 without touching the table if the pool is short. */
 static int q4e_page_table_grow(q4e_page_pool *pool, q4e_page_table *t, uint32_t n_pos,
@@ -54739,21 +54829,269 @@ static int q4e_page_table_grow(q4e_page_pool *pool, q4e_page_table *t, uint32_t 
     *n_new = 0;
     if (want <= t->len) return 0;
     if (want - t->len > pool->n_free) return 1;
-    if (want > t->cap) {
-        t->map = xrealloc(t->map, (size_t)want * sizeof(int32_t));
-        t->cap = want;
-    }
-    while (t->len < want) t->map[t->len++] = pool->free_ids[--pool->n_free];
+    q4e_page_table_reserve(t, want);
+    while (t->len < want) t->map[t->len++] = q4e_page_take(pool);
     *n_new = t->len - *first_new;
     return 0;
 }
 
 /* Release the pages that hold only positions >= n_pos.  The page holding
  * n_pos - 1 stays: its tail is rewritten by whatever runs next, which is what
- * a restore and a speculative rewrite both do. */
+ * a resume and a speculative rewrite both do. */
 static void q4e_page_table_trim(q4e_page_pool *pool, q4e_page_table *t, uint32_t n_pos) {
     const uint32_t want = q4e_pages_for(n_pos);
-    while (t->len > want) pool->free_ids[pool->n_free++] = t->map[--t->len];
+    while (t->len > want) q4e_page_unref(pool, t->map[--t->len]);
+}
+
+/* Rebuild `t` as the page table of the path root..node, covering positions
+ * [0, n_pos); every entry gains a holder.  Deepest node wins, so the one page
+ * two consecutive nodes share is taken from the child -- the copy with the
+ * child's tokens in it.  Returns 1 (leaving the table empty) if the path does
+ * not in fact cover every page, which would mean a node lost pages while a
+ * descendant still needed them. */
+static int q4e_page_table_from_path(q4e_page_pool *pool, q4e_page_table *t,
+                                    const q4e_tree_node *node, uint32_t n_pos) {
+    const uint32_t want = q4e_pages_for(n_pos);
+    while (t->len > 0u) q4e_page_unref(pool, t->map[--t->len]);
+    if (want == 0u) return 0;
+    q4e_page_table_reserve(t, want);
+    for (uint32_t i = 0; i < want; i++) t->map[i] = -1;
+    t->len = want;
+    for (const q4e_tree_node *n = node; n; n = n->parent) {
+        const uint32_t hi = n->pg_hi < want ? n->pg_hi : want;
+        for (uint32_t i = n->pg_lo; i < hi; i++) {
+            if (t->map[i] >= 0) continue;
+            t->map[i] = n->pages[i - n->pg_lo];
+            q4e_page_ref(pool, t->map[i]);
+        }
+    }
+    for (uint32_t i = 0; i < want; i++) {
+        if (t->map[i] < 0) {
+            while (t->len > 0u) q4e_page_unref(pool, t->map[--t->len]);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void q4e_tree_init(q4e_span_tree *t, uint32_t n_pages, bool reverse) {
+    memset(t, 0, sizeof(*t));
+    q4e_page_pool_init(&t->pool, n_pages, reverse);
+    t->root = xmalloc(sizeof(*t->root));
+    memset(t->root, 0, sizeof(*t->root));
+    t->root->ckpt = -1;
+}
+
+static void q4e_tree_node_destroy(q4e_span_tree *t, q4e_tree_node *n) {
+    for (uint32_t i = n->pg_lo; i < n->pg_hi; i++) {
+        q4e_page_unref(&t->pool, n->pages[i - n->pg_lo]);
+    }
+    free(n->pages);
+    free(n->tok);
+    free(n);
+}
+
+static void q4e_tree_free(q4e_span_tree *t) {
+    /* Post-order without recursion: the tree can be thousands deep. */
+    q4e_tree_node *n = t->root;
+    while (n) {
+        if (n->child) { n = n->child; continue; }
+        q4e_tree_node *up = n->parent;
+        if (up) {
+            up->child = n->next;
+        }
+        q4e_tree_node_destroy(t, n);
+        n = up;
+    }
+    q4e_page_pool_free(&t->pool);
+    memset(t, 0, sizeof(*t));
+}
+
+/* Walk the tree with `tok`, returning the deepest node reached -- possibly
+ * only partway into its span -- and in *matched the number of tokens matched.
+ * The node satisfies node->start <= *matched <= node->end. */
+static q4e_tree_node *q4e_tree_walk(q4e_span_tree *t, const int32_t *tok, uint32_t n,
+                                    uint32_t *matched) {
+    q4e_tree_node *cur = t->root;
+    uint32_t m = 0;
+    for (;;) {
+        if (m >= n) break;
+        q4e_tree_node *pick = NULL;
+        for (q4e_tree_node *c = cur->child; c; c = c->next) {
+            if (c->tok[0] == tok[m]) { pick = c; break; }
+        }
+        if (!pick) break;
+        const uint32_t span = pick->end - pick->start;
+        uint32_t k = 0;
+        while (k < span && m + k < n && pick->tok[k] == tok[m + k]) k++;
+        m += k;
+        cur = pick;
+        if (k < span) break;     /* the prompt leaves this node partway */
+    }
+    *matched = m;
+    return cur;
+}
+
+/* The deepest node at or above `n` carrying a checkpoint no higher than
+ * `limit`. */
+static q4e_tree_node *q4e_tree_ckpt_below(q4e_tree_node *n, uint32_t limit) {
+    for (; n; n = n->parent) {
+        if (n->ckpt >= 0 && n->end <= limit) return n;
+    }
+    return NULL;
+}
+
+/* The position of the nearest checkpoint strictly below `n`'s own, which is
+ * where a resume at n->end would otherwise have to start. */
+static uint32_t q4e_tree_lower_ckpt_pos(const q4e_tree_node *n) {
+    for (const q4e_tree_node *p = n->parent; p; p = p->parent) {
+        if (p->ckpt >= 0) return p->end;
+    }
+    return 0;
+}
+
+static void q4e_tree_relink(q4e_tree_node *parent, q4e_tree_node *old,
+                            q4e_tree_node *fresh) {
+    if (parent->child == old) { parent->child = fresh; return; }
+    for (q4e_tree_node *c = parent->child; c; c = c->next) {
+        if (c->next == old) { c->next = fresh; return; }
+    }
+}
+
+/* Split `n` so that a node ends exactly at `pos`, and return that lower node.
+ * The upper half keeps n's children and its checkpoint; the pages of the one
+ * logical page they straddle end up in both halves, each with its own holder.
+ * Radix discipline: this is what keeps two paths that share a prefix from
+ * holding two copies of it. */
+static q4e_tree_node *q4e_tree_split(q4e_span_tree *t, q4e_tree_node *n, uint32_t pos) {
+    if (pos <= n->start || pos >= n->end || !n->parent) return NULL;
+    q4e_tree_node *lo = xmalloc(sizeof(*lo));
+    memset(lo, 0, sizeof(*lo));
+    lo->parent = n->parent;
+    lo->child = n;
+    lo->next = n->next;
+    lo->start = n->start;
+    lo->end = pos;
+    lo->ckpt = -1;
+    lo->live = n->live;
+    lo->hit = n->hit;
+
+    const uint32_t lo_len = pos - n->start;
+    lo->tok = xmalloc((size_t)lo_len * sizeof(int32_t));
+    memcpy(lo->tok, n->tok, (size_t)lo_len * sizeof(int32_t));
+    lo->pg_lo = n->pg_lo;
+    lo->pg_hi = q4e_pages_for(pos);
+    lo->pages = xmalloc((size_t)(lo->pg_hi - lo->pg_lo) * sizeof(int32_t));
+    for (uint32_t i = lo->pg_lo; i < lo->pg_hi; i++) {
+        lo->pages[i - lo->pg_lo] = n->pages[i - n->pg_lo];
+        q4e_page_ref(&t->pool, lo->pages[i - lo->pg_lo]);
+    }
+
+    q4e_tree_relink(n->parent, n, lo);
+
+    const uint32_t hi_len = n->end - pos;
+    int32_t *tok = xmalloc((size_t)hi_len * sizeof(int32_t));
+    memcpy(tok, n->tok + lo_len, (size_t)hi_len * sizeof(int32_t));
+    free(n->tok);
+    n->tok = tok;
+    const uint32_t new_lo = pos >> DS4_Q4E_PAGE_SHIFT;
+    for (uint32_t i = n->pg_lo; i < new_lo; i++) {
+        q4e_page_unref(&t->pool, n->pages[i - n->pg_lo]);
+    }
+    int32_t *pages = xmalloc((size_t)(n->pg_hi - new_lo) * sizeof(int32_t));
+    memcpy(pages, n->pages + (new_lo - n->pg_lo),
+           (size_t)(n->pg_hi - new_lo) * sizeof(int32_t));
+    free(n->pages);
+    n->pages = pages;
+    n->pg_lo = new_lo;
+    n->start = pos;
+    n->parent = lo;
+    n->next = NULL;
+    t->nodes++;
+    return lo;
+}
+
+/* Hand the pages a context wrote for [start, end) to a new child of `parent`,
+ * whose tokens are `tok`.  The context's table keeps its own holder on each
+ * page, so the node and the context release them independently. */
+static q4e_tree_node *q4e_tree_add(q4e_span_tree *t, q4e_tree_node *parent,
+                                   const int32_t *tok, uint32_t start, uint32_t end,
+                                   const q4e_page_table *table, double now) {
+    if (end <= start || start != parent->end) return NULL;
+    const uint32_t pg_lo = start >> DS4_Q4E_PAGE_SHIFT;
+    const uint32_t pg_hi = q4e_pages_for(end);
+    if (pg_hi > table->len) return NULL;
+    q4e_tree_node *n = xmalloc(sizeof(*n));
+    memset(n, 0, sizeof(*n));
+    n->parent = parent;
+    n->next = parent->child;
+    parent->child = n;
+    n->start = start;
+    n->end = end;
+    n->ckpt = -1;
+    n->hit = now;   /* live: the caller marks its context on it */
+    n->tok = xmalloc((size_t)(end - start) * sizeof(int32_t));
+    memcpy(n->tok, tok + start, (size_t)(end - start) * sizeof(int32_t));
+    n->pg_lo = pg_lo;
+    n->pg_hi = pg_hi;
+    n->pages = xmalloc((size_t)(pg_hi - pg_lo) * sizeof(int32_t));
+    for (uint32_t i = pg_lo; i < pg_hi; i++) {
+        n->pages[i - pg_lo] = table->map[i];
+        q4e_page_ref(&t->pool, n->pages[i - pg_lo]);
+    }
+    t->nodes++;
+    return n;
+}
+
+/* Seconds of prefill a leaf's pages save per mebibyte, decayed by idle time.
+ * A page is worth the same wherever it is, so this ranks leaves by recency
+ * and by how much of their last page they actually fill; the interior nodes
+ * of a path are unreachable here, which is the "leaves before interior" rule. */
+static double q4e_node_utility(const q4e_tree_node *n, double now) {
+    const double pages = (double)(n->pg_hi - n->pg_lo);
+    const double saved = (double)(n->end - n->start) * Q4E_PREFILL_S_PER_TOKEN;
+    const double age = now > n->hit ? now - n->hit : 0.0;
+    if (pages <= 0.0) return 0.0;
+    return saved / (pages * Q4E_PAGE_MIB) / (1.0 + age / Q4E_CACHE_DECAY_S);
+}
+
+/* The least useful leaf whose pages nothing is reading: no children, and no
+ * execution context on its path. */
+static q4e_tree_node *q4e_tree_pick_victim(q4e_span_tree *t, double now) {
+    q4e_tree_node *best = NULL;
+    double best_u = 0.0;
+    /* Iterative pre-order walk. */
+    q4e_tree_node *n = t->root;
+    while (n) {
+        if (n != t->root && !n->child && n->live == 0u) {
+            const double u = q4e_node_utility(n, now);
+            if (!best || u < best_u) { best = n; best_u = u; }
+        }
+        if (n->child) { n = n->child; continue; }
+        while (n && !n->next) n = n->parent;
+        if (n) n = n->next;
+    }
+    return best;
+}
+
+/* Unlink and free a leaf whose checkpoint (if any) the caller has released. */
+static void q4e_tree_drop(q4e_span_tree *t, q4e_tree_node *n) {
+    if (!n || n == t->root || n->child || n->ckpt >= 0) return;
+    q4e_tree_relink(n->parent, n, n->next);
+    q4e_tree_node_destroy(t, n);
+    t->nodes--;
+    t->page_evictions++;
+}
+
+/* Add or drop one execution context along the path from `node` up to but not
+ * including `stop` (NULL for the whole path to the root).  Bounded because a
+ * context marks the nodes it adopts as it prefills forward, and marking the
+ * ancestors again would count it twice. */
+static void q4e_tree_mark_live(q4e_tree_node *node, const q4e_tree_node *stop, int delta) {
+    for (q4e_tree_node *n = node; n && n != stop; n = n->parent) {
+        if (delta > 0) n->live++;
+        else if (n->live > 0u) n->live--;
+    }
 }
 
 bool ds4_test_q4e_page_table(void) {
@@ -54787,11 +55125,96 @@ bool ds4_test_q4e_page_table(void) {
     if (q4e_page_table_grow(&pool, &t, 4u * P, &first, &n) != 0 || t.len != 4 ||
         pool.n_free != 0) return false;
     if (q4e_page_table_grow(&pool, &t, 4u * P + 1u, &first, &n) == 0 || t.len != 4) return false;
+    /* A second holder keeps a page out of the free stack. */
+    q4e_page_ref(&pool, t.map[3]);
+    q4e_page_table_trim(&pool, &t, 3u * P);
+    if (t.len != 3 || pool.n_free != 0) return false;
+    q4e_page_unref(&pool, 3);
+    if (pool.n_free != 1) return false;
     q4e_page_table_trim(&pool, &t, 0);
     if (t.len != 0 || pool.n_free != 4) return false;
 
     q4e_page_table_free(&t);
     q4e_page_pool_free(&pool);
+    return true;
+}
+
+bool ds4_test_q4e_span_tree(void) {
+    q4e_span_tree tree;
+    q4e_page_table t;
+    uint32_t first = 0, n = 0, matched = 0;
+    /* Two 700-token paths sharing a 300-token prefix: 3 + 2 + 2 pages. */
+    int32_t a[700], b[700];
+    for (uint32_t i = 0; i < 700u; i++) { a[i] = (int32_t)i; b[i] = (int32_t)i; }
+    for (uint32_t i = 300u; i < 700u; i++) b[i] = (int32_t)(1000u + i);
+
+    q4e_tree_init(&tree, 16u, false);
+    memset(&t, 0, sizeof(t));
+
+    /* An empty tree matches nothing and offers no checkpoint. */
+    if (q4e_tree_walk(&tree, a, 700u, &matched) != tree.root || matched != 0u) return false;
+    if (q4e_tree_ckpt_below(tree.root, 700u) != NULL) return false;
+
+    /* Path A: one node [0, 700), 3 pages, checkpoint at its end. */
+    if (q4e_page_table_grow(&tree.pool, &t, 700u, &first, &n) != 0 || n != 3u) return false;
+    q4e_tree_node *na = q4e_tree_add(&tree, tree.root, a, 0u, 700u, &t, 1.0);
+    if (!na || na->pg_lo != 0u || na->pg_hi != 3u || tree.nodes != 1u) return false;
+    na->ckpt = 0;
+    /* Both the node and the table hold every page. */
+    if (tree.pool.refs[t.map[0]] != 2u) return false;
+    q4e_page_table_trim(&tree.pool, &t, 0u);
+    if (tree.pool.n_free != 13u || tree.pool.refs[na->pages[0]] != 1u) return false;
+
+    /* Path B walks A for 300 tokens and then leaves it partway. */
+    if (q4e_tree_walk(&tree, b, 700u, &matched) != na || matched != 300u) return false;
+    if (q4e_tree_ckpt_below(na, 300u) != NULL) return false;   /* A's is at 700 */
+
+    /* Split A at 300: the lower half ends there, the upper keeps the
+     * checkpoint, and the page holding 300 is in both. */
+    q4e_tree_node *lo = q4e_tree_split(&tree, na, 300u);
+    if (!lo || lo->end != 300u || na->start != 300u || tree.nodes != 2u) return false;
+    if (lo->pg_lo != 0u || lo->pg_hi != 2u || na->pg_lo != 1u || na->pg_hi != 3u) return false;
+    if (lo->ckpt != -1 || na->ckpt != 0) return false;
+    if (tree.pool.refs[lo->pages[1]] != 2u || tree.pool.refs[lo->pages[0]] != 1u) return false;
+    if (q4e_tree_walk(&tree, a, 700u, &matched) != na || matched != 700u) return false;
+
+    /* A resume at 300 takes the shared pages for [0, 300) -- two of them,
+     * because 300 lands inside the second -- and then copies that second one,
+     * because positions 300.. are B's to write and a shared page is
+     * immutable. */
+    if (q4e_page_table_from_path(&tree.pool, &t, lo, 300u) != 0 || t.len != 2u) return false;
+    if (t.map[0] != lo->pages[0] || t.map[1] != lo->pages[1]) return false;
+    const int32_t cow = q4e_page_take(&tree.pool);
+    if (cow < 0) return false;
+    q4e_page_unref(&tree.pool, t.map[1]);
+    t.map[1] = cow;
+    if (tree.pool.refs[lo->pages[1]] != 2u) return false;   /* lo and A's tail */
+    /* Grow to 700 with fresh pages and commit B under the split. */
+    if (q4e_page_table_grow(&tree.pool, &t, 700u, &first, &n) != 0 || first != 2u || n != 1u) return false;
+    q4e_tree_node *nb = q4e_tree_add(&tree, lo, b, 300u, 700u, &t, 2.0);
+    if (!nb || nb->pg_lo != 1u || nb->pg_hi != 3u || tree.nodes != 3u) return false;
+    if (nb->pages[0] != cow || nb->pages[0] == lo->pages[1]) return false;
+    if (q4e_tree_walk(&tree, b, 700u, &matched) != nb || matched != 700u) return false;
+    q4e_page_table_trim(&tree.pool, &t, 0u);
+
+    /* Eviction: only leaves with no live context, least useful first.  A's
+     * tail was hit at t=1 and B's at t=2, so A goes first; the interior
+     * split node is not a candidate while either child lives. */
+    nb->live = 1u;
+    if (q4e_tree_pick_victim(&tree, 3.0) != na) return false;
+    na->ckpt = -1;
+    q4e_tree_drop(&tree, na);
+    if (tree.nodes != 2u || tree.page_evictions != 1u) return false;
+    if (q4e_tree_pick_victim(&tree, 3.0) != NULL) return false;   /* B is live */
+    nb->live = 0u;
+    if (q4e_tree_pick_victim(&tree, 3.0) != nb) return false;
+    q4e_tree_drop(&tree, nb);
+    if (q4e_tree_pick_victim(&tree, 3.0) != lo) return false;     /* now a leaf */
+    q4e_tree_drop(&tree, lo);
+    if (tree.nodes != 0u || tree.pool.n_free != tree.pool.n_pages) return false;
+
+    q4e_page_table_free(&t);
+    q4e_tree_free(&tree);
     return true;
 }
 
@@ -54804,7 +55227,6 @@ bool ds4_test_q4e_page_table(void) {
 #define Q4E_GDN_V    ((uint32_t)(DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM))
 #define Q4E_GDN_IN   (2u * Q4E_GDN_K + Q4E_GDN_V)
 #define Q4E_PLE_HIST ((DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM)
-#define Q4E_SNAP_MAX 8u
 #define Q4E_IDX_QB   512u    /* indexer/sparse-attention rows per pass */
 #define Q4E_IDX_WIDTH (2048u + 3u)
 
@@ -54818,21 +55240,35 @@ typedef struct {
 
     /* Persistent recurrent state.  The gated DeltaNet layers carry a conv
      * window and a 128x128 matrix per value head; the PLE block carries its
-     * own dilated conv window; the QSA layers carry an f16 KV cache, paged. */
+     * own dilated conv window.  These are this execution context's own; the
+     * QSA KV below is not. */
     ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
-    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];   /* [pool_slots][kv_dim] f16 */
-    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv;
 
-    /* Paged KV (see q4e_page_pool): the pool every KV buffer here is carved
-     * into, this execution context's page table, and that table as the
-     * kernels read it.  pool_slots is the pool in positions -- what every KV
-     * buffer is sized for. */
-    q4e_page_pool   kv_pool;
+    /* Paged KV.  k_cache/v_cache -- and the indexer and draft caches below --
+     * are *borrowed* from the shared cache: one allocation of pool_slots rows
+     * per buffer for every context, because a page id has to mean the same
+     * rows in every context that shares it.  kv_table is this context's own
+     * logical-page -> pool-page map and kv_pages is that map as the kernels
+     * read it.  q4e_graph_free must not free the borrowed buffers. */
+    q4e_cache      *cache;         /* the engine's shared prefix cache */
     q4e_page_table  kv_table;
     ds4_gpu_tensor *kv_pages;      /* int32 per logical page */
-    uint32_t        pool_slots;
+    uint32_t        pool_slots;    /* the pool in positions: every KV buffer's rows */
+    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];   /* borrowed: [pool_slots][kv_dim] f16 */
+    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];   /* borrowed */
+
+    /* This context's place in the tree: the deepest node it has committed,
+     * and the branch point of the request it is serving (rule 3's b, so a
+     * commit at or below it lands on the shared path instead of copying it).
+     * hint_pos is the message boundary the caller asked for; ctx_slot is the
+     * execution-context slot this graph claimed, and the MTP head's shallow
+     * copy has -1 and owns none of it. */
+    q4e_tree_node  *node;
+    uint32_t        matched_end;
+    int32_t         hint_pos;      /* -1 when the caller gave no boundary */
+    int32_t         ctx_slot;
 
     /* Per-step inputs. */
     ds4_gpu_tensor *tokens;
@@ -54907,20 +55343,11 @@ typedef struct {
     ds4_gpu_tensor *gdn_state_ckpt[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv_ckpt;
 
-    /* Snapshots of the recurrent state at prefill chunk boundaries (a ring
-     * of the most recent Q4E_SNAP_MAX), in the spirit of Marconi: the GDN
-     * state cannot be rewound, so a follow-up prompt that shares a prefix
-     * resumes from the longest snapshot that is a prefix of it and prefills
-     * only the rest.  Clients re-render the assistant turn, so the shared
-     * prefix ends just before the previous prompt's generation header; the
-     * last chunk boundary below that point is what gets reused.  The KV
-     * caches need no copy: positions below a snapshot are only rewritten
-     * after every longer snapshot has been dropped.  ~113 MB each. */
     /* QSA indexer state and scratch (see ds4_gpu_q4e_idx_*): raw f16 indexer
      * keys and pooled/normed/rotated block keys per attention layer; the
      * per-forward scratch is sized for Q4E_IDX_QB rows at a time. */
-    ds4_gpu_tensor *idx_k_cache[DS4_MAX_LAYER];   /* [pool_slots][128] f16 */
-    ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];    /* [pool_slots/4][128] f16 */
+    ds4_gpu_tensor *idx_k_cache[DS4_MAX_LAYER];   /* borrowed: [pool_slots][128] f16 */
+    ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];    /* borrowed: [pool_slots/4][128] f16 */
     ds4_gpu_tensor *idx_k;        /* [tok_cap][128] f32 */
     ds4_gpu_tensor *idx_q;        /* [tok_cap][4*128] f32 */
     ds4_gpu_tensor *idx_qn;       /* [tok_cap][4*128] f16 */
@@ -54935,25 +55362,6 @@ typedef struct {
     bool            qsa_sparse;   /* this forward selects blocks (context past the budget) */
     bool            is_draft;     /* the MTP head's shallow copy: dense attention, own KV */
 
-    struct q4e_snapshot {
-        bool            valid;
-        uint32_t        pos;
-        uint64_t        serial;      /* insertion order, for eviction */
-        ds4_tokens      tokens;
-        ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
-        ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
-        ds4_gpu_tensor *ple_conv;
-        ds4_gpu_tensor *pend_row;    /* the draft's pending residual row */
-        bool            pend_valid;
-        uint32_t        pend_pos0;
-        float          *logits;      /* host: the last row's logits */
-        bool            logits_valid; /* only a prompt-final chunk has them */
-    } snap[Q4E_SNAP_MAX];
-    uint32_t        snap_count;      /* allocated entries */
-    uint64_t        snap_serial;
-    /* Valid snapshots dropped since the graph was allocated, so the server can
-     * report whether the ring is thrashing rather than reusing. */
-    uint64_t        snap_evictions;
     ds4_gpu_tensor *argmax_dev;      /* int32 per logits row */
     int32_t        *argmax_host;     /* the verify rows' greedy picks */
 
@@ -54966,8 +55374,8 @@ typedef struct {
     ds4_gpu_tensor *mtp_embed;
     ds4_gpu_tensor *mtp_tokens;
     ds4_gpu_tensor *mtp_positions;
-    ds4_gpu_tensor *mtp_k_cache;
-    ds4_gpu_tensor *mtp_v_cache;
+    ds4_gpu_tensor *mtp_k_cache;   /* borrowed */
+    ds4_gpu_tensor *mtp_v_cache;   /* borrowed */
     ds4_gpu_tensor *mtp_logits;
     FILE           *mtp_dump_fp;     /* DS4_QWEN4EXP_MTP_DUMP record awaiting its logits */
 
@@ -54996,6 +55404,408 @@ typedef struct {
     double   spec_draft_ms;
     double   spec_verify_ms;
 } ds4_q4e_graph;
+
+/* ---------------------------------------------------------------------------
+ * qwen4exp prefix cache, part 2: the GDN checkpoint store, and the cache the
+ * engine owns.
+ *
+ * A checkpoint is everything the recurrent stack cannot rewind: the DeltaNet
+ * conv window and 128x128 state matrix of all 36 GDN layers, the PLE block's
+ * dilated conv window, the draft head's pending residual row, and -- when it
+ * sits at a prompt's last position -- that prompt's logits.  113 MB.  It is
+ * what lets a request resume in the middle of a token sequence instead of
+ * prefilling it again, and it is deliberately independent of the pages: the
+ * tree node it hangs on supplies the KV, the slot supplies the state.
+ *
+ * Everything is shared by every session, because a page id has to mean the
+ * same rows in every context that reads it.  So the cache, not the graph,
+ * owns the pool, the tree, the checkpoint slots and the KV buffers; a graph
+ * borrows the buffers and keeps its own page table.  An execution context
+ * (D1) is a graph that claimed one of --exec-contexts slots: its own live GDN
+ * state, page table and per-generation n-gram state, drawing pages from the
+ * one pool.
+ * ------------------------------------------------------------------------ */
+
+/* --ssm-checkpoints (or DS4_QWEN4EXP_SNAPSHOTS) GDN checkpoints of 113 MB;
+ * A0's budget is 40, i.e. 4.5 GB.  Slots are allocated on first use, so a
+ * short-lived session pays only for the checkpoints it takes. */
+#define Q4E_CKPT_DEFAULT 40u
+#define Q4E_CKPT_MAX     256u
+
+/* Execution contexts (D1): two by default, each 113 MB of live GDN state plus
+ * its own prefill scratch.  The server drives context 0; the second is what
+ * the gate's speculative session and, later, the executor use. */
+#define Q4E_CTX_DEFAULT  2u
+#define Q4E_CTX_MAX      8u
+
+/* The pool holds the KV of every conversation the tree remembers, not of the
+ * live contexts, so it is sized by residency: A0 targets four resident
+ * conversations at --ctx 150000, which is exactly its 600000 positions and
+ * 18 GB at 30 KiB per position.  Deriving the default as 4 x ctx lands on
+ * that number at the target context and keeps a 26k test from reserving 18 GB
+ * it could never address.  --kv-pool-tokens (or DS4_QWEN4EXP_KV_POOL_TOKENS)
+ * overrides it; the floor is one context, all a single sequence can own. */
+#define Q4E_POOL_RESIDENT    4u
+#define Q4E_POOL_MAX_TOKENS  600000u
+
+typedef struct {
+    bool     used;
+    bool     ready;              /* tensors allocated (they outlive eviction) */
+    uint32_t pos;                /* the position the state is *at* */
+    q4e_tree_node *owner;        /* the node whose end this is */
+    bool     logits_valid;       /* only a prompt-final position has them */
+    bool     pend_valid;
+    uint32_t pend_pos0;
+    double   hit;                /* monotonic seconds of the last resume */
+    ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *ple_conv;
+    ds4_gpu_tensor *pend_row;    /* the draft's pending residual row */
+    float          *logits;
+} q4e_ckpt;
+
+struct q4e_cache {
+    /* One mutex over the tree, the pool and the slots.  Lookups and page
+     * allocations are microseconds; the two 113 MB state copies are under it
+     * too, which costs about a millisecond and keeps the rules simple. */
+    pthread_mutex_t mu;
+    q4e_span_tree   tree;
+    uint32_t        pool_slots;  /* the pool in positions: every KV buffer's rows */
+    uint32_t        ctx_size;    /* the context the buffers were sized for */
+
+    /* The shared KV: one allocation per buffer for every context. */
+    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *idx_k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];
+    ds4_gpu_tensor *mtp_k_cache;
+    ds4_gpu_tensor *mtp_v_cache;
+    bool            idx_ready;
+    bool            mtp_ready;
+
+    q4e_ckpt       *ckpt;
+    uint32_t        ckpt_cap;
+    uint64_t        ckpt_evictions;
+
+    bool            ctx_busy[Q4E_CTX_MAX];
+    uint32_t        ctx_cap;
+};
+
+static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes);
+static int q4e_indexer_enabled(void);
+
+static uint32_t q4e_ckpt_budget(const ds4_engine *e) {
+    long want = e->ssm_checkpoints > 0 ? (long)e->ssm_checkpoints : (long)Q4E_CKPT_DEFAULT;
+    const char *env = getenv("DS4_QWEN4EXP_SNAPSHOTS");
+    if (env && env[0]) want = strtol(env, NULL, 10);
+    if (want < 0) want = 0;
+    if (want > (long)Q4E_CKPT_MAX) want = (long)Q4E_CKPT_MAX;
+    return (uint32_t)want;
+}
+
+/* Copy the recurrent state between the graph's live buffers and slot `k`. */
+static int q4e_ckpt_copy(ds4_q4e_graph *g, q4e_ckpt *k, bool to_ckpt) {
+    const uint64_t f = sizeof(float);
+    const uint64_t conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                 DS4_N_GDN_HEAD_DIM * f;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->gdn_conv[il] || !k->gdn_conv[il]) continue;
+        ds4_gpu_tensor *c_live = g->gdn_conv[il], *c_snap = k->gdn_conv[il];
+        ds4_gpu_tensor *s_live = g->gdn_state[il], *s_snap = k->gdn_state[il];
+        if (!ds4_gpu_tensor_copy(to_ckpt ? c_snap : c_live, 0,
+                                 to_ckpt ? c_live : c_snap, 0, conv_bytes) ||
+            !ds4_gpu_tensor_copy(to_ckpt ? s_snap : s_live, 0,
+                                 to_ckpt ? s_live : s_snap, 0, state_bytes)) return 1;
+    }
+    if (g->ple_conv && k->ple_conv) {
+        const uint64_t ple_bytes = (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f;
+        if (!ds4_gpu_tensor_copy(to_ckpt ? k->ple_conv : g->ple_conv, 0,
+                                 to_ckpt ? g->ple_conv : k->ple_conv, 0, ple_bytes)) return 1;
+    }
+    return 0;
+}
+
+static bool q4e_ckpt_alloc(q4e_ckpt *k, const ds4_q4e_graph *g) {
+    const uint64_t f = sizeof(float);
+    const uint64_t conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
+    const uint64_t state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                 DS4_N_GDN_HEAD_DIM * f;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!g->gdn_conv[il]) continue;
+        ok = q4e_alloc(&k->gdn_conv[il], conv_bytes) &&
+             q4e_alloc(&k->gdn_state[il], state_bytes);
+    }
+    if (ok) ok = q4e_alloc(&k->ple_conv, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f) &&
+                 q4e_alloc(&k->pend_row, (uint64_t)Q4E_HC_DIM * f);
+    if (ok) k->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    k->ready = ok;
+    return ok;
+}
+
+static void q4e_ckpt_free(q4e_ckpt *k) {
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(k->gdn_conv[il]);
+        ds4_gpu_tensor_free(k->gdn_state[il]);
+    }
+    ds4_gpu_tensor_free(k->ple_conv);
+    ds4_gpu_tensor_free(k->pend_row);
+    free(k->logits);
+    memset(k, 0, sizeof(*k));
+}
+
+/* Prefill seconds a checkpoint saves per mebibyte, decayed by idle time: the
+ * distance to the nearest lower checkpoint on its path is exactly the prefill
+ * a resume here avoids, so one 300 tokens above its neighbour is nearly
+ * worthless and a lone one at 20k is worth 28 s and stays. */
+static double q4e_ckpt_utility(const q4e_ckpt *k, double now) {
+    const uint32_t lower = k->owner ? q4e_tree_lower_ckpt_pos(k->owner) : 0u;
+    const double saved = (double)(k->pos > lower ? k->pos - lower : 0u) *
+                         Q4E_PREFILL_S_PER_TOKEN;
+    const double age = now > k->hit ? now - k->hit : 0.0;
+    return saved / Q4E_CKPT_MIB / (1.0 + age / Q4E_CACHE_DECAY_S);
+}
+
+static void q4e_ckpt_release(q4e_cache *c, int32_t slot) {
+    if (slot < 0 || (uint32_t)slot >= c->ckpt_cap) return;
+    q4e_ckpt *k = &c->ckpt[slot];
+    if (k->owner && k->owner->ckpt == slot) k->owner->ckpt = -1;
+    k->owner = NULL;
+    k->used = false;
+    k->logits_valid = false;
+    k->pend_valid = false;
+}
+
+static bool q4e_ckpt_any_free(q4e_cache *c) {
+    for (uint32_t i = 0; i < c->ckpt_cap; i++) {
+        if (!c->ckpt[i].used) return true;
+    }
+    return false;
+}
+
+/* A slot for a checkpoint at the caller's frontier: a free one, else -- only
+ * when the caller says this position is worth it (admission rules 1 to 3, not
+ * a chunk boundary) -- the least useful used one. */
+static int32_t q4e_ckpt_claim(q4e_cache *c, const ds4_q4e_graph *g,
+                              bool allow_evict, double now) {
+    for (uint32_t i = 0; i < c->ckpt_cap; i++) {
+        q4e_ckpt *k = &c->ckpt[i];
+        if (k->used) continue;
+        if (!k->ready && !q4e_ckpt_alloc(k, g)) {
+            /* Out of device memory: stop growing the store rather than
+             * failing the request; what is already allocated still works. */
+            q4e_ckpt_free(k);
+            return -1;
+        }
+        return (int32_t)i;
+    }
+    if (!allow_evict) return -1;
+    int32_t worst = -1;
+    double worst_u = 0.0;
+    for (uint32_t i = 0; i < c->ckpt_cap; i++) {
+        if (!c->ckpt[i].used) continue;
+        const double u = q4e_ckpt_utility(&c->ckpt[i], now);
+        if (worst < 0 || u < worst_u) { worst = (int32_t)i; worst_u = u; }
+    }
+    if (worst < 0) return -1;
+    q4e_ckpt_release(c, worst);
+    c->ckpt_evictions++;
+    return worst;
+}
+
+/* Free `want` pages by dropping the least useful leaf spans.  Called with the
+ * mutex held. */
+static int q4e_cache_free_pages(q4e_cache *c, uint32_t want, double now) {
+    while (c->tree.pool.n_free < want) {
+        q4e_tree_node *v = q4e_tree_pick_victim(&c->tree, now);
+        if (!v) return 1;
+        if (v->ckpt >= 0) {
+            q4e_ckpt_release(c, v->ckpt);
+            c->ckpt_evictions++;
+        }
+        q4e_tree_drop(&c->tree, v);
+    }
+    return 0;
+}
+
+/* Copy every KV row of pool page `src` into pool page `dst`: the twelve
+ * attention layers' K and V, the indexer's raw and pooled keys, and the draft
+ * head's K and V -- one page is the same 256 positions of all of them. */
+static int q4e_page_copy(ds4_q4e_graph *g, int32_t dst, int32_t src) {
+    const uint64_t rows = DS4_Q4E_PAGE_TOKENS;
+    const uint64_t kv = (uint64_t)Q4E_KV_DIM * sizeof(uint16_t);
+    const uint64_t ik = 128u * sizeof(uint16_t);
+    const uint64_t pooled = rows / 4u;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (g->k_cache[il] &&
+            (!ds4_gpu_tensor_copy(g->k_cache[il], (uint64_t)dst * rows * kv,
+                                  g->k_cache[il], (uint64_t)src * rows * kv, rows * kv) ||
+             !ds4_gpu_tensor_copy(g->v_cache[il], (uint64_t)dst * rows * kv,
+                                  g->v_cache[il], (uint64_t)src * rows * kv, rows * kv))) return 1;
+        if (g->idx_k_cache[il] &&
+            (!ds4_gpu_tensor_copy(g->idx_k_cache[il], (uint64_t)dst * rows * ik,
+                                  g->idx_k_cache[il], (uint64_t)src * rows * ik, rows * ik) ||
+             !ds4_gpu_tensor_copy(g->idx_pooled[il], (uint64_t)dst * pooled * ik,
+                                  g->idx_pooled[il], (uint64_t)src * pooled * ik,
+                                  pooled * ik))) return 1;
+    }
+    if (g->mtp_k_cache &&
+        (!ds4_gpu_tensor_copy(g->mtp_k_cache, (uint64_t)dst * rows * kv,
+                              g->mtp_k_cache, (uint64_t)src * rows * kv, rows * kv) ||
+         !ds4_gpu_tensor_copy(g->mtp_v_cache, (uint64_t)dst * rows * kv,
+                              g->mtp_v_cache, (uint64_t)src * rows * kv, rows * kv))) return 1;
+    return 0;
+}
+
+static void q4e_cache_close(ds4_engine *e) {
+    q4e_cache *c = e->q4e_cache;
+    if (!c) return;
+    for (uint32_t i = 0; i < c->ckpt_cap; i++) q4e_ckpt_free(&c->ckpt[i]);
+    free(c->ckpt);
+    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
+        ds4_gpu_tensor_free(c->k_cache[il]);
+        ds4_gpu_tensor_free(c->v_cache[il]);
+        ds4_gpu_tensor_free(c->idx_k_cache[il]);
+        ds4_gpu_tensor_free(c->idx_pooled[il]);
+    }
+    ds4_gpu_tensor_free(c->mtp_k_cache);
+    ds4_gpu_tensor_free(c->mtp_v_cache);
+    q4e_tree_free(&c->tree);
+    pthread_mutex_destroy(&c->mu);
+    free(c);
+    e->q4e_cache = NULL;
+}
+
+/* Open the engine's cache on the first graph, sizing the pool and allocating
+ * the shared KV.  Later graphs share it; one sized for a smaller context
+ * cannot serve a larger one, because kv_pages is only ceil(ctx/256) wide. */
+static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp) {
+    if (e->q4e_cache) {
+        if (ctx_size > e->q4e_cache->ctx_size) {
+            fprintf(stderr, "ds4: the qwen4exp prefix cache was sized for context %u; "
+                            "a session of %u cannot share it\n",
+                    e->q4e_cache->ctx_size, ctx_size);
+            return NULL;
+        }
+        return e->q4e_cache;
+    }
+    q4e_cache *c = xmalloc(sizeof(*c));
+    memset(c, 0, sizeof(*c));
+    pthread_mutex_init(&c->mu, NULL);
+    c->ctx_size = ctx_size;
+    c->mtp_ready = mtp;
+    c->idx_ready = q4e_indexer_enabled() != 0;
+    c->ctx_cap = e->exec_contexts ? e->exec_contexts : Q4E_CTX_DEFAULT;
+    if (c->ctx_cap > Q4E_CTX_MAX) c->ctx_cap = Q4E_CTX_MAX;
+
+    uint32_t pool_tokens = e->kv_pool_tokens;
+    const char *env = getenv("DS4_QWEN4EXP_KV_POOL_TOKENS");
+    if (env && env[0]) {
+        const long v = strtol(env, NULL, 10);
+        if (v > 0) pool_tokens = (uint32_t)v;
+    }
+    if (pool_tokens == 0u) {
+        pool_tokens = ctx_size > Q4E_POOL_MAX_TOKENS / Q4E_POOL_RESIDENT
+                    ? Q4E_POOL_MAX_TOKENS : ctx_size * Q4E_POOL_RESIDENT;
+    }
+    if (pool_tokens < ctx_size) pool_tokens = ctx_size;
+    const uint32_t pool_pages = q4e_pages_for(pool_tokens);
+    c->pool_slots = pool_pages * DS4_Q4E_PAGE_TOKENS;
+    q4e_tree_init(&c->tree, pool_pages, getenv("DS4_QWEN4EXP_KV_POOL_REVERSE") != NULL);
+
+    c->ckpt_cap = q4e_ckpt_budget(e);
+    if (c->ckpt_cap) {
+        c->ckpt = xmalloc((size_t)c->ckpt_cap * sizeof(*c->ckpt));
+        memset(c->ckpt, 0, (size_t)c->ckpt_cap * sizeof(*c->ckpt));
+        for (uint32_t i = 0; i < c->ckpt_cap; i++) c->ckpt[i].owner = NULL;
+    }
+
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!ds4_qwen4exp_layer_is_full_attn(il)) continue;
+        const uint64_t slots = (uint64_t)c->pool_slots * Q4E_KV_DIM * sizeof(uint16_t);
+        ok = q4e_alloc(&c->k_cache[il], slots) && q4e_alloc(&c->v_cache[il], slots);
+        if (ok && c->idx_ready) {
+            /* Paged like the QSA cache: raw keys per position, pooled keys per
+             * 4-position block, so a page's pooled slice is its own quarter of
+             * the pool's block rows. */
+            ok = q4e_alloc(&c->idx_k_cache[il],
+                           (uint64_t)c->pool_slots * 128u * sizeof(uint16_t)) &&
+                 q4e_alloc(&c->idx_pooled[il],
+                           (uint64_t)(c->pool_slots / 4u) * 128u * sizeof(uint16_t));
+        }
+    }
+    if (ok && mtp) {
+        const uint64_t slots = (uint64_t)c->pool_slots * Q4E_KV_DIM * sizeof(uint16_t);
+        ok = q4e_alloc(&c->mtp_k_cache, slots) && q4e_alloc(&c->mtp_v_cache, slots);
+    }
+    if (!ok) {
+        e->q4e_cache = c;
+        q4e_cache_close(e);
+        fprintf(stderr, "ds4: cannot allocate the qwen4exp KV page pool "
+                        "(%u pages, %.1f GB); lower --kv-pool-tokens\n",
+                pool_pages, (double)pool_pages * 7.5 / 1024.0);
+        return NULL;
+    }
+    e->q4e_cache = c;
+    return c;
+}
+
+/* Claim an execution-context slot.  Two by default (D1): the state a context
+ * owns is its live GDN buffers, its page table and its per-generation n-gram
+ * memory, all in the graph; the pool, the tree and the checkpoints are
+ * shared. */
+static int32_t q4e_ctx_claim(q4e_cache *c) {
+    pthread_mutex_lock(&c->mu);
+    int32_t slot = -1;
+    for (uint32_t i = 0; i < c->ctx_cap; i++) {
+        if (!c->ctx_busy[i]) { c->ctx_busy[i] = true; slot = (int32_t)i; break; }
+    }
+    pthread_mutex_unlock(&c->mu);
+    return slot;
+}
+
+/* Let go of this context's path: the tree nodes stop counting it, and the
+ * pages its table holds lose that holder -- the ones a tree node also holds
+ * stay, which is the whole point.  Called with the mutex held. */
+static void q4e_ctx_detach_locked(ds4_q4e_graph *g) {
+    q4e_cache *c = g->cache;
+    if (g->node) q4e_tree_mark_live(g->node, NULL, -1);
+    g->node = NULL;
+    g->matched_end = 0;
+    while (g->kv_table.len > 0u) {
+        q4e_page_unref(&c->tree.pool, g->kv_table.map[--g->kv_table.len]);
+    }
+}
+
+/* Own KV pages for positions [0, n_pos) and hand the kernels the new table
+ * entries.  Called before anything writes KV, so a page always exists by the
+ * time a kernel translates a position into it; when the pool is short, the
+ * least useful leaf spans in the tree go first. */
+static int q4e_kv_reserve(ds4_q4e_graph *g, uint32_t n_pos) {
+    q4e_cache *c = g->cache;
+    uint32_t first = 0, n_new = 0;
+    int rc = 0;
+    pthread_mutex_lock(&c->mu);
+    const uint32_t want = q4e_pages_for(n_pos);
+    if (want > g->kv_table.len) {
+        rc = q4e_cache_free_pages(c, want - g->kv_table.len, now_sec());
+    }
+    if (rc == 0) {
+        rc = q4e_page_table_grow(&c->tree.pool, &g->kv_table, n_pos, &first, &n_new);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (rc != 0) {
+        fprintf(stderr, "ds4: qwen4exp KV page pool exhausted: %u pages for %u positions "
+                        "(raise --kv-pool-tokens)\n", c->tree.pool.n_pages, n_pos);
+        return 1;
+    }
+    if (n_new == 0u) return 0;
+    return ds4_gpu_tensor_write(g->kv_pages, (uint64_t)first * sizeof(int32_t),
+                                &g->kv_table.map[first],
+                                (uint64_t)n_new * sizeof(int32_t)) ? 0 : 1;
+}
 #endif /* DS4_NO_GPU */
 
 struct ds4_session {
@@ -63633,6 +64443,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ple_cache_bytes = opt->ple_cache_bytes;
     e->kv_pool_tokens = opt->kv_pool_tokens;
+    e->ssm_checkpoints = opt->ssm_checkpoints;
+    e->exec_contexts = opt->exec_contexts;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
@@ -65271,6 +66083,11 @@ void ds4_engine_close(ds4_engine *e) {
     }
 #endif
     ds4_expert_profile_close();
+#ifndef DS4_NO_GPU
+    /* Before ds4_gpu_cleanup(): the prefix cache holds the shared KV pool and
+     * the checkpoint slots. */
+    q4e_cache_close(e);
+#endif
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
@@ -65575,11 +66392,11 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
                 (unsigned long long)g->spec_ngram_zero,
                 (unsigned long long)g->spec_ngram_vetoed);
     }
+    /* k_cache/v_cache, the indexer caches and the draft caches are borrowed
+     * from the shared prefix cache; only the engine frees those. */
     for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
         ds4_gpu_tensor_free(g->gdn_conv[il]);
         ds4_gpu_tensor_free(g->gdn_state[il]);
-        ds4_gpu_tensor_free(g->k_cache[il]);
-        ds4_gpu_tensor_free(g->v_cache[il]);
         ds4_gpu_tensor_free(g->gdn_conv_ckpt[il]);
         ds4_gpu_tensor_free(g->gdn_state_ckpt[il]);
     }
@@ -65593,33 +66410,22 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         g->sh_mid, g->sh_out, g->sh_logit, g->ple_rows, g->ple_emb, g->ple_k,
         g->ple_v, g->ple_q, g->ple_gv, g->ple_cv, g->logits,
         g->ple_conv_ckpt, g->mtp_res, g->mtp_embed, g->mtp_tokens,
-        g->mtp_positions, g->mtp_k_cache, g->mtp_v_cache, g->mtp_logits,
-        g->argmax_dev,
+        g->mtp_positions, g->mtp_logits, g->argmax_dev,
     };
     for (size_t i = 0; i < sizeof(flat) / sizeof(flat[0]); i++) ds4_gpu_tensor_free(flat[i]);
-    for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-        ds4_gpu_tensor_free(g->idx_k_cache[il]);
-        ds4_gpu_tensor_free(g->idx_pooled[il]);
-    }
     {
         ds4_gpu_tensor *idx_flat[] = { g->idx_k, g->idx_q, g->idx_qn, g->idx_score, g->idx_sel,
                                        g->idx_cnt, g->idx_tokens, g->idx_nsel, g->idx_part };
         for (size_t i = 0; i < sizeof(idx_flat) / sizeof(idx_flat[0]); i++) ds4_gpu_tensor_free(idx_flat[i]);
     }
-    for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) {
-        struct q4e_snapshot *sn = &g->snap[k];
-        for (uint32_t il = 0; il < DS4_MAX_LAYER; il++) {
-            ds4_gpu_tensor_free(sn->gdn_conv[il]);
-            ds4_gpu_tensor_free(sn->gdn_state[il]);
-        }
-        ds4_gpu_tensor_free(sn->ple_conv);
-        ds4_gpu_tensor_free(sn->pend_row);
-        ds4_tokens_free(&sn->tokens);
-        free(sn->logits);
-    }
     ds4_gpu_tensor_free(g->kv_pages);
+    if (g->cache) {
+        pthread_mutex_lock(&g->cache->mu);
+        q4e_ctx_detach_locked(g);
+        if (g->ctx_slot >= 0) g->cache->ctx_busy[g->ctx_slot] = false;
+        pthread_mutex_unlock(&g->cache->mu);
+    }
     q4e_page_table_free(&g->kv_table);
-    q4e_page_pool_free(&g->kv_pool);
     ds4_ple_stream_close(g->ple_stream);
     free(g->ple_row_ids);
     free(g->ple_row_data);
@@ -65627,33 +66433,8 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
     memset(g, 0, sizeof(*g));
 }
 
-/* Own KV pages for positions [0, n_pos) and hand the kernels the new table
- * entries.  Called before anything writes KV, so a page always exists by the
- * time a kernel translates a position into it. */
-static int q4e_kv_reserve(ds4_q4e_graph *g, uint32_t n_pos) {
-    uint32_t first = 0, n_new = 0;
-    if (q4e_page_table_grow(&g->kv_pool, &g->kv_table, n_pos, &first, &n_new) != 0) {
-        fprintf(stderr, "ds4: qwen4exp KV page pool exhausted: %u pages for %u positions "
-                        "(raise --kv-pool-tokens)\n", g->kv_pool.n_pages, n_pos);
-        return 1;
-    }
-    if (n_new == 0u) return 0;
-    return ds4_gpu_tensor_write(g->kv_pages, (uint64_t)first * sizeof(int32_t),
-                                &g->kv_table.map[first],
-                                (uint64_t)n_new * sizeof(int32_t)) ? 0 : 1;
-}
-
-/* Give back the pages that hold only positions >= n_pos.  The device copy of
- * the table needs no update: kernels only translate positions below the
- * frontier, and the next reserve rewrites whatever entries it hands out. */
-static void q4e_kv_trim(ds4_q4e_graph *g, uint32_t n_pos) {
-    q4e_page_table_trim(&g->kv_pool, &g->kv_table, n_pos);
-}
-
 /* Drop every recurrent trace of the current sequence.  There is no partial
  * rewind: the DeltaNet state and the two conv windows only move forward. */
-static int q4e_indexer_enabled(void);
-
 static void q4e_graph_reset(ds4_q4e_graph *g) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (g->gdn_conv[il]) {
@@ -65669,151 +66450,319 @@ static void q4e_graph_reset(ds4_q4e_graph *g) {
     }
     g->pos = 0;
     g->pend_valid = false;
-    /* The prefill that follows starts from position 0, so this sequence owns
-     * no pages any more; the pool takes them all back. */
-    q4e_kv_trim(g, 0);
-    for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) {
-        if (g->snap[k].valid) g->snap_evictions++;
-        g->snap[k].valid = false;
+    /* The prefill that follows starts from position 0, so this context lets
+     * go of its path entirely and stands on the root again.  The tree keeps
+     * whatever other conversations still reference -- which is the whole
+     * difference from the snapshot ring this replaced, where a cold prompt
+     * invalidated every snapshot and then rewrote the KV under them. */
+    if (g->cache) {
+        pthread_mutex_lock(&g->cache->mu);
+        q4e_ctx_detach_locked(g);
+        g->node = g->cache->tree.root;
+        q4e_tree_mark_live(g->node, NULL, +1);
+        pthread_mutex_unlock(&g->cache->mu);
     }
 }
 
-/* Copy the recurrent state between the live buffers and snapshot `sn`. */
-static int q4e_snapshot_copy(ds4_q4e_graph *g, struct q4e_snapshot *sn, bool to_snapshot) {
-    const uint64_t f = sizeof(float);
-    const uint64_t conv_bytes = (uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN * f;
-    const uint64_t state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
-                                 DS4_N_GDN_HEAD_DIM * f;
-    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        if (!g->gdn_conv[il] || !sn->gdn_conv[il]) continue;
-        ds4_gpu_tensor *c_live = g->gdn_conv[il], *c_snap = sn->gdn_conv[il];
-        ds4_gpu_tensor *s_live = g->gdn_state[il], *s_snap = sn->gdn_state[il];
-        if (!ds4_gpu_tensor_copy(to_snapshot ? c_snap : c_live, 0,
-                                 to_snapshot ? c_live : c_snap, 0, conv_bytes) ||
-            !ds4_gpu_tensor_copy(to_snapshot ? s_snap : s_live, 0,
-                                 to_snapshot ? s_live : s_snap, 0, state_bytes)) return 1;
+/* What a sync to `prompt` can reuse.  Read-only: this runs from the pure
+ * reuse query as well as from the sync itself. */
+typedef struct {
+    uint32_t       matched;      /* p_kv: prompt tokens whose KV the tree holds */
+    q4e_tree_node *ckpt_node;    /* the node carrying the checkpoint to resume from */
+    int32_t        ckpt;
+    uint32_t       ckpt_pos;     /* c: where the prefill would start */
+    bool           live;         /* the context's own frontier answers instead */
+    uint32_t       live_pos;
+    ds4_reuse_source source;
+} q4e_plan;
+
+static bool q4e_tree_is_ancestor(const q4e_tree_node *maybe, const q4e_tree_node *of) {
+    for (const q4e_tree_node *n = of; n; n = n->parent) {
+        if (n == maybe) return true;
     }
-    if (g->ple_conv && sn->ple_conv) {
-        const uint64_t ple_bytes = (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f;
-        if (!ds4_gpu_tensor_copy(to_snapshot ? sn->ple_conv : g->ple_conv, 0,
-                                 to_snapshot ? g->ple_conv : sn->ple_conv, 0, ple_bytes)) return 1;
-    }
-    return 0;
+    return false;
 }
 
-/* Snapshot the live state at g->pos, which must equal s->checkpoint.len.
- * Reuses the entry already at this position, else a free one, else the
- * oldest. */
-static int q4e_snapshot_take(ds4_session *s, bool logits_valid) {
+/* The walk itself, with the mutex held.  The node pointer it returns is only
+ * valid under that same hold, which is why the resume repeats the walk rather
+ * than trusting the query's answer. */
+static void q4e_plan_locked(ds4_session *s, const ds4_tokens *prompt, q4e_plan *out) {
     ds4_q4e_graph *g = &s->q4e_graph;
-    if (g->snap_count == 0 || (uint32_t)s->checkpoint.len != g->pos) return 0;
-    struct q4e_snapshot *sn = NULL;
-    for (uint32_t k = 0; k < g->snap_count; k++) {
-        if (g->snap[k].valid && g->snap[k].pos == g->pos) { sn = &g->snap[k]; break; }
+    q4e_cache *c = g->cache;
+    memset(out, 0, sizeof(*out));
+    out->ckpt = -1;
+    out->source = DS4_REUSE_COLD;
+    if (s->checkpoint_valid && (uint32_t)s->checkpoint.len == g->pos &&
+        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        out->live = true;
+        out->live_pos = g->pos;
     }
-    if (!sn) for (uint32_t k = 0; k < g->snap_count; k++) {
-        if (!g->snap[k].valid) { sn = &g->snap[k]; break; }
+    q4e_tree_node *match =
+        q4e_tree_walk(&c->tree, prompt->v, (uint32_t)prompt->len, &out->matched);
+    q4e_tree_node *cn = q4e_tree_ckpt_below(match, out->matched);
+    /* Resuming exactly at the prompt's end means answering from that
+     * position's logits, which only a prompt-final checkpoint kept. */
+    while (cn && cn->end == (uint32_t)prompt->len && !c->ckpt[cn->ckpt].logits_valid) {
+        cn = cn->parent ? q4e_tree_ckpt_below(cn->parent, out->matched) : NULL;
     }
-    if (!sn) {
-        sn = &g->snap[0];
-        for (uint32_t k = 1; k < g->snap_count; k++) {
-            if (g->snap[k].serial < sn->serial) sn = &g->snap[k];
+    if (cn) {
+        out->ckpt_node = cn;
+        out->ckpt = cn->ckpt;
+        out->ckpt_pos = cn->end;
+    }
+    if (out->ckpt >= 0 && out->ckpt_pos > out->live_pos) {
+        /* A checkpoint on the path this context is already standing on is the
+         * same conversation rewinding to a message boundary; one anywhere
+         * else is a different conversation the tree remembered. */
+        out->source = (g->node && q4e_tree_is_ancestor(out->ckpt_node, g->node))
+                    ? DS4_REUSE_CHECKPOINT : DS4_REUSE_TREE;
+        out->live = false;
+    } else if (out->live && out->live_pos > 0u) {
+        out->ckpt = -1;
+        out->source = DS4_REUSE_LIVE;
+    } else {
+        out->ckpt = -1;
+        out->live = false;
+    }
+}
+
+/* What a sync to `prompt` would reuse.  A pure query: it holds the mutex only
+ * long enough to walk, and hands back positions rather than node pointers. */
+static void q4e_cache_plan(ds4_session *s, const ds4_tokens *prompt, q4e_plan *out) {
+    q4e_cache *c = s->q4e_graph.cache;
+    memset(out, 0, sizeof(*out));
+    out->ckpt = -1;
+    out->source = DS4_REUSE_COLD;
+    if (!c || !s->q4e_graph.ready || prompt->len <= 0) return;
+    pthread_mutex_lock(&c->mu);
+    q4e_plan_locked(s, prompt, out);
+    out->ckpt_node = NULL;
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* Rewind this context onto the plan's checkpoint: take the path's pages for
+ * everything below it, copy the one page the resume point lands inside, and
+ * load the recurrent state. */
+/* Rewind this context onto the deepest checkpoint the prompt can use.
+ * Returns 0 on success, 2 when there is nothing to resume from (the caller
+ * prefills cold) and 1 when the resume itself failed. */
+static int q4e_cache_resume(ds4_session *s, const ds4_tokens *prompt) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    q4e_cache *c = g->cache;
+    const double now = now_sec();
+    q4e_plan plan;
+    pthread_mutex_lock(&c->mu);
+    q4e_plan_locked(s, prompt, &plan);
+    const q4e_plan *pl = &plan;
+    if (pl->ckpt < 0 || !pl->ckpt_node) {
+        pthread_mutex_unlock(&c->mu);
+        return 2;
+    }
+    const uint32_t cpos = pl->ckpt_pos;
+    q4e_ctx_detach_locked(g);
+    if (q4e_page_table_from_path(&c->tree.pool, &g->kv_table, pl->ckpt_node, cpos) != 0) {
+        pthread_mutex_unlock(&c->mu);
+        return 1;
+    }
+    /* The page holding cpos - 1 is shared and immutable, and the prefill is
+     * about to rewrite its tail, so this context takes a private copy of that
+     * one page.  A checkpoint on a 256-multiple (every chunk boundary is one)
+     * needs none. */
+    if ((cpos & DS4_Q4E_PAGE_MASK) != 0u && g->kv_table.len > 0u) {
+        const uint32_t last = g->kv_table.len - 1u;
+        int32_t dst = -1;
+        if (q4e_cache_free_pages(c, 1u, now) == 0) dst = q4e_page_take(&c->tree.pool);
+        if (dst < 0 || q4e_page_copy(g, dst, g->kv_table.map[last]) != 0) {
+            if (dst >= 0) q4e_page_unref(&c->tree.pool, dst);
+            while (g->kv_table.len > 0u) {
+                q4e_page_unref(&c->tree.pool, g->kv_table.map[--g->kv_table.len]);
+            }
+            pthread_mutex_unlock(&c->mu);
+            return 1;
         }
+        q4e_page_unref(&c->tree.pool, g->kv_table.map[last]);
+        g->kv_table.map[last] = dst;
     }
-    /* Overwriting a live entry at another position is an eviction; rewriting
-     * the entry already at this position is only a refresh. */
-    if (sn->valid && sn->pos != g->pos) g->snap_evictions++;
-    sn->valid = false;
-    if (q4e_snapshot_copy(g, sn, true) != 0) return 1;
-    sn->pend_valid = false;
-    if (g->mtp_ready && g->pend_valid && g->pend_n == 1u) {
-        if (!ds4_gpu_tensor_copy(sn->pend_row, 0, g->res,
-                                 (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
-                                 (uint64_t)Q4E_HC_DIM * sizeof(float))) return 1;
-        sn->pend_valid = true;
-        sn->pend_pos0 = g->pend_pos0;
-    }
-    sn->tokens.len = 0;
-    for (int i = 0; i < s->checkpoint.len; i++) ds4_tokens_push(&sn->tokens, s->checkpoint.v[i]);
-    sn->logits_valid = logits_valid && sn->logits != NULL;
-    if (sn->logits_valid) memcpy(sn->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
-    sn->pos = g->pos;
-    sn->serial = ++g->snap_serial;
-    sn->valid = true;
-    return 0;
-}
-
-/* The longest valid snapshot whose tokens are a prefix of `prompt`. */
-static struct q4e_snapshot *q4e_snapshot_find(ds4_q4e_graph *g, const ds4_tokens *prompt) {
-    struct q4e_snapshot *best = NULL;
-    for (uint32_t k = 0; k < g->snap_count; k++) {
-        struct q4e_snapshot *sn = &g->snap[k];
-        if (!sn->valid || (uint32_t)sn->tokens.len != sn->pos) continue;
-        if ((uint32_t)prompt->len < sn->pos) continue;
-        /* An exact match needs the logits of that position. */
-        if ((uint32_t)prompt->len == sn->pos && !sn->logits_valid) continue;
-        if (best && sn->pos <= best->pos) continue;
-        if (ds4_tokens_starts_with(prompt, &sn->tokens)) best = sn;
-    }
-    return best;
-}
-
-/* Rewind the live state to snapshot `sn`.  Snapshots above it describe KV
- * positions the next prefill rewrites, so they are dropped. */
-static int q4e_snapshot_restore(ds4_session *s, struct q4e_snapshot *sn) {
-    ds4_q4e_graph *g = &s->q4e_graph;
-    if (q4e_snapshot_copy(g, sn, false) != 0) return 1;
-    g->pos = sn->pos;
+    q4e_tree_mark_live(pl->ckpt_node, NULL, +1);
+    g->node = pl->ckpt_node;
+    g->matched_end = pl->matched;
+    pl->ckpt_node->hit = now;
+    q4e_ckpt *k = &c->ckpt[pl->ckpt];
+    k->hit = now;
+    const bool k_logits = k->logits_valid;
+    const bool k_pend = k->pend_valid;
+    const uint32_t k_pend_pos0 = k->pend_pos0;
+    int rc = q4e_ckpt_copy(g, k, false);
+    if (rc == 0 && k_logits) memcpy(s->logits, k->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    if (rc == 0 && g->mtp_ready && k_pend &&
+        !ds4_gpu_tensor_copy(g->res, 0, k->pend_row, 0,
+                             (uint64_t)Q4E_HC_DIM * sizeof(float))) rc = 1;
+    pthread_mutex_unlock(&c->mu);
+    if (rc != 0) return 1;
+    if (g->kv_table.len &&
+        !ds4_gpu_tensor_write(g->kv_pages, 0, g->kv_table.map,
+                              (uint64_t)g->kv_table.len * sizeof(int32_t))) return 1;
+    g->pos = cpos;
     s->checkpoint.len = 0;
-    for (int i = 0; i < sn->tokens.len; i++) token_vec_push(&s->checkpoint, sn->tokens.v[i]);
-    if (sn->logits_valid) memcpy(s->logits, sn->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    for (uint32_t i = 0; i < cpos; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     g->pend_valid = false;
-    if (g->mtp_ready && sn->pend_valid) {
-        if (!ds4_gpu_tensor_copy(g->res, 0, sn->pend_row, 0,
-                                 (uint64_t)Q4E_HC_DIM * sizeof(float))) return 1;
+    if (g->mtp_ready && k_pend) {
         g->pend_valid = true;
         g->pend_row0 = 0;
         g->pend_n = 1u;
-        g->pend_pos0 = sn->pend_pos0;
+        g->pend_pos0 = k_pend_pos0;
     }
-    for (uint32_t k = 0; k < g->snap_count; k++) {
-        if (g->snap[k].valid && g->snap[k].pos > sn->pos) {
-            g->snap[k].valid = false;
-            g->snap_evictions++;
-        }
-    }
-    /* Only now that no snapshot above sn->pos survives can the pages holding
-     * those positions go back to the pool.  Releasing them before the loop
-     * would hand them out again while the `return 1` above still left a
-     * higher snapshot claiming them. */
-    q4e_kv_trim(g, sn->pos);
     return 0;
 }
 
-/* How many leading prompt tokens the session can take as already computed:
- * the live checkpoint when the prompt extends it, else the longest snapshot
- * the prompt extends.  `source` names which of the two answered. */
-static uint32_t q4e_reusable_prefix(ds4_session *s, const ds4_tokens *prompt,
-                                    ds4_reuse_source *source) {
+/* Admission.  Give the tree the span this context has just prefilled and, if
+ * the position earns a slot, a GDN checkpoint at its end.  `chunk_only` marks
+ * rule 4 -- a prefill chunk boundary, which fills an idle slot but never
+ * evicts a better checkpoint to get one.
+ *
+ * Up to the branch point the tokens are already in the tree, so the commit
+ * splits the shared path instead of copying it; only above the branch point
+ * does this context contribute spans (and pages) of its own. */
+static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
+                            bool with_logits, bool chunk_only) {
     ds4_q4e_graph *g = &s->q4e_graph;
-    if (s->checkpoint_valid && (uint32_t)s->checkpoint.len == g->pos &&
-        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
-        *source = DS4_REUSE_LIVE;
-        return g->pos;
+    q4e_cache *c = g->cache;
+    if (!c || q == 0u || !g->node || q <= g->node->end) return 0;
+    const double now = now_sec();
+    pthread_mutex_lock(&c->mu);
+    while (g->node->end < q && g->node->end < g->matched_end) {
+        /* Walk again rather than keep a node pointer across an unlock: the
+         * tree can have been split or pruned since the plan. */
+        const uint32_t upto = q < g->matched_end ? q : g->matched_end;
+        uint32_t m = 0;
+        q4e_tree_node *target = q4e_tree_walk(&c->tree, tok, upto, &m);
+        if (m < upto || target == c->tree.root) break;
+        if (target->end > upto) target = q4e_tree_split(&c->tree, target, upto);
+        /* Only ever move *down* from where this context already stands. */
+        if (!target || target->end != upto ||
+            !q4e_tree_is_ancestor(g->node, target)) break;
+        q4e_tree_mark_live(target, g->node, +1);
+        g->node = target;
     }
-    const struct q4e_snapshot *sn = q4e_snapshot_find(g, prompt);
-    if (!sn) return 0;
-    *source = DS4_REUSE_SNAPSHOT;
-    return sn->pos;
+    if (g->node->end < q) {
+        q4e_tree_node *n = q4e_tree_add(&c->tree, g->node, tok, g->node->end, q,
+                                        &g->kv_table, now);
+        if (!n) {
+            pthread_mutex_unlock(&c->mu);
+            return 1;
+        }
+        q4e_tree_mark_live(n, g->node, +1);
+        g->node = n;
+    }
+    g->node->hit = now;
+    int32_t slot = g->node->ckpt;
+    if (slot < 0) slot = q4e_ckpt_claim(c, g, !chunk_only, now);
+    if (slot >= 0) {
+        q4e_ckpt *k = &c->ckpt[slot];
+        if (q4e_ckpt_copy(g, k, true) != 0) {
+            q4e_ckpt_release(c, slot);
+            pthread_mutex_unlock(&c->mu);
+            return 1;
+        }
+        k->pend_valid = false;
+        if (g->mtp_ready && g->pend_valid && g->pend_n == 1u &&
+            ds4_gpu_tensor_copy(k->pend_row, 0, g->res,
+                                (uint64_t)g->pend_row0 * Q4E_HC_DIM * sizeof(float),
+                                (uint64_t)Q4E_HC_DIM * sizeof(float))) {
+            k->pend_valid = true;
+            k->pend_pos0 = g->pend_pos0;
+        }
+        k->logits_valid = with_logits && k->logits != NULL;
+        if (k->logits_valid) memcpy(k->logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+        k->pos = q;
+        k->owner = g->node;
+        k->hit = now;
+        k->used = true;
+        g->node->ckpt = slot;
+    }
+    pthread_mutex_unlock(&c->mu);
+    return 0;
 }
 
-static void q4e_cache_stats(const ds4_q4e_graph *g,
-                            ds4_session_cache_stats *out) {
-    for (uint32_t k = 0; k < g->snap_count; k++) {
-        if (g->snap[k].valid) out->entries++;
+/* The next position at or before `len` where admission wants the frontier to
+ * land: the sequence end always, the message boundary the server passed and
+ * the branch point a diverging request just proved shared, and -- only while
+ * checkpoint slots are going spare -- the next prefill chunk boundary. */
+static uint32_t q4e_next_admission(ds4_q4e_graph *g, uint32_t pos, uint32_t len) {
+    uint32_t stop = len;
+    if (g->hint_pos > (int32_t)pos && (uint32_t)g->hint_pos < stop) {
+        stop = (uint32_t)g->hint_pos;
     }
-    out->capacity = (int)g->snap_count;
-    out->evictions = g->snap_evictions;
+    if (g->matched_end > pos && g->matched_end < stop) stop = g->matched_end;
+    q4e_cache *c = g->cache;
+    bool spare = false;
+    if (c) {
+        pthread_mutex_lock(&c->mu);
+        spare = q4e_ckpt_any_free(c);
+        pthread_mutex_unlock(&c->mu);
+    }
+    if (spare && g->tok_cap) {
+        const uint32_t next = (pos / g->tok_cap + 1u) * g->tok_cap;
+        if (next > pos && next < stop) stop = next;
+    }
+    return stop;
+}
+
+/* How many leading prompt tokens the next sync would not have to evaluate,
+ * and where that comes from. */
+static uint32_t q4e_reusable_prefix(ds4_session *s, const ds4_tokens *prompt,
+                                    ds4_reuse_source *source, uint32_t *matched) {
+    q4e_plan pl;
+    q4e_cache_plan(s, prompt, &pl);
+    *source = pl.source;
+    *matched = pl.matched;
+    if (pl.source == DS4_REUSE_LIVE) return pl.live_pos;
+    if (pl.ckpt >= 0) return pl.ckpt_pos;
+    return 0;
+}
+
+static void q4e_cache_stats(ds4_session *s, ds4_session_cache_stats *out) {
+    q4e_cache *c = s->q4e_graph.cache;
+    if (!c) return;
+    pthread_mutex_lock(&c->mu);
+    for (uint32_t i = 0; i < c->ckpt_cap; i++) {
+        if (c->ckpt[i].used) out->entries++;
+    }
+    out->capacity = (int)c->ckpt_cap;
+    out->evictions = c->ckpt_evictions;
+    out->pool_pages = c->tree.pool.n_pages;
+    out->pool_pages_used = c->tree.pool.n_pages - c->tree.pool.n_free;
+    out->tree_nodes = c->tree.nodes;
+    out->page_evictions = c->tree.page_evictions;
+    pthread_mutex_unlock(&c->mu);
+}
+
+/* The path a context is standing on, as one value: the tokens it covers, the
+ * pool pages behind them and the bytes of each.  This is the surface the disk
+ * tier (A3) serializes -- the page list is the context's own kv_table, so a
+ * writer reads those rows straight out of the shared KV buffers and a reader
+ * fills fresh pages and hands them to q4e_cache_commit -- and it is what the
+ * server's /cache report prints as the live path. */
+static bool q4e_cache_path(ds4_session *s, ds4_session_path_info *out) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    q4e_cache *c = g->cache;
+    if (!c || !g->ready) return false;
+    pthread_mutex_lock(&c->mu);
+    out->tokens = (int)g->pos;
+    out->pages = (int)g->kv_table.len;
+    /* 30 KiB of KV per position, so a page is 7.5 MiB across every buffer. */
+    out->page_bytes = (uint64_t)g->kv_table.len * DS4_Q4E_PAGE_TOKENS * 30u * 1024u;
+    out->state_bytes = 0;
+    if (g->node && g->node->ckpt >= 0 && g->node->end == g->pos) {
+        const uint64_t f = sizeof(float);
+        out->state_bytes = (uint64_t)DS4_N_LAYER *
+                               ((uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN +
+                                (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
+                                DS4_N_GDN_HEAD_DIM) * f +
+                           (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f;
+    }
+    pthread_mutex_unlock(&c->mu);
+    return true;
 }
 
 static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
@@ -65878,34 +66827,28 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     const uint64_t gdn_state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
                                      DS4_N_GDN_HEAD_DIM * f;
 
-    /* The KV page pool.  Every KV buffer below is the pool, not one context's
-     * worth of positions, so they are all sized to it.  --kv-pool-tokens (or
-     * DS4_QWEN4EXP_KV_POOL_TOKENS) sets it in positions and cannot go below
-     * this session's context, which is all a single sequence can own; the
-     * default is exactly that context.  A0's 600000-position pool belongs to
-     * the shared pool of the radix tree, where several conversations draw
-     * from one -- with one sequence per context it would only reserve 18 GB
-     * of pages nothing can use. */
-    {
-        uint32_t pool_tokens = e->kv_pool_tokens;
-        const char *env = getenv("DS4_QWEN4EXP_KV_POOL_TOKENS");
-        if (env && env[0]) {
-            const long v = strtol(env, NULL, 10);
-            if (v > 0) pool_tokens = (uint32_t)v;
-        }
-        if (pool_tokens < ctx_size) pool_tokens = ctx_size;
-        const uint32_t pool_pages = q4e_pages_for(pool_tokens);
-        g->pool_slots = pool_pages * DS4_Q4E_PAGE_TOKENS;
-        q4e_page_pool_init(&g->kv_pool, pool_pages,
-                           getenv("DS4_QWEN4EXP_KV_POOL_REVERSE") != NULL);
-        /* One sequence cannot own more logical pages than its context. */
-        ok = q4e_alloc(&g->kv_pages, (uint64_t)q4e_pages_for(ctx_size) * sizeof(int32_t));
+    /* This graph becomes an execution context of the engine's shared prefix
+     * cache: it borrows the pool's KV buffers (a page id has to mean the same
+     * rows everywhere) and keeps its own page table, live GDN state and
+     * per-generation state.  The cache is opened by whichever graph gets
+     * there first. */
+    q4e_cache *cache = q4e_cache_open(e, ctx_size, mtp);
+    if (!cache) return 1;
+    g->cache = cache;
+    g->pool_slots = cache->pool_slots;
+    g->hint_pos = -1;
+    g->ctx_slot = q4e_ctx_claim(cache);
+    if (g->ctx_slot < 0) {
+        fprintf(stderr, "ds4: all %u qwen4exp execution contexts are in use "
+                        "(raise --exec-contexts)\n", cache->ctx_cap);
+        return 1;
     }
-
+    /* One sequence cannot own more logical pages than its context. */
+    ok = q4e_alloc(&g->kv_pages, (uint64_t)q4e_pages_for(ctx_size) * sizeof(int32_t));
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (ds4_qwen4exp_layer_is_full_attn(il)) {
-            const uint64_t slots = (uint64_t)g->pool_slots * Q4E_KV_DIM * sizeof(uint16_t);
-            ok = q4e_alloc(&g->k_cache[il], slots) && q4e_alloc(&g->v_cache[il], slots);
+            g->k_cache[il] = cache->k_cache[il];
+            g->v_cache[il] = cache->v_cache[il];
         } else {
             ok = q4e_alloc(&g->gdn_conv[il], gdn_conv_bytes) &&
                  q4e_alloc(&g->gdn_state[il], gdn_state_bytes);
@@ -65972,41 +66915,14 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     if (ok && g->spec_k) {
         ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
     }
-    if (ok) {
-        /* DS4_QWEN4EXP_SNAPSHOTS (default 8, 0 disables) chunk-boundary
-         * snapshots, ~113 MB each. */
-        const char *env = getenv("DS4_QWEN4EXP_SNAPSHOTS");
-        long want = (env && env[0]) ? strtol(env, NULL, 10) : (long)Q4E_SNAP_MAX;
-        if (want < 0) want = 0;
-        if (want > (long)Q4E_SNAP_MAX) want = (long)Q4E_SNAP_MAX;
-        g->snap_count = 0;
-        for (long k = 0; k < want && ok; k++) {
-            struct q4e_snapshot *sn = &g->snap[k];
-            for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
-                if (!g->gdn_conv[il]) continue;
-                ok = q4e_alloc(&sn->gdn_conv[il], gdn_conv_bytes) &&
-                     q4e_alloc(&sn->gdn_state[il], gdn_state_bytes);
-            }
-            if (ok) ok = q4e_alloc(&sn->ple_conv, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f) &&
-                        q4e_alloc(&sn->pend_row, (uint64_t)Q4E_HC_DIM * f);
-            if (ok) {
-                sn->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
-                g->snap_count = (uint32_t)k + 1u;
-            }
-        }
-    }
     if (ok && q4e_indexer_enabled()) {
         const uint32_t max_blocks = ctx_size / 4u + 1u;
         g->idx_max_blocks = max_blocks;
         const uint32_t qb = T < Q4E_IDX_QB ? T : Q4E_IDX_QB;
-        for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
             if (!ds4_qwen4exp_layer_is_full_attn(il)) continue;
-            /* Paged like the QSA cache: raw keys per position, pooled keys
-             * per 4-position block, so a page's pooled slice is its own
-             * quarter of the pool's block rows. */
-            ok = q4e_alloc(&g->idx_k_cache[il], (uint64_t)g->pool_slots * 128u * sizeof(uint16_t)) &&
-                 q4e_alloc(&g->idx_pooled[il],
-                           (uint64_t)(g->pool_slots / 4u) * 128u * sizeof(uint16_t));
+            g->idx_k_cache[il] = cache->idx_k_cache[il];
+            g->idx_pooled[il] = cache->idx_pooled[il];
         }
         if (ok) {
             ok = q4e_alloc(&g->idx_k, (uint64_t)T * 128u * f) &&
@@ -66030,10 +66946,12 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
           && q4e_alloc(&g->mtp_embed, (uint64_t)T * DS4_N_EMBD * f)
           && q4e_alloc(&g->mtp_tokens, (uint64_t)T * sizeof(int32_t))
           && q4e_alloc(&g->mtp_positions, (uint64_t)T * sizeof(int32_t))
-          && q4e_alloc(&g->mtp_k_cache, (uint64_t)g->pool_slots * Q4E_KV_DIM * sizeof(uint16_t))
-          && q4e_alloc(&g->mtp_v_cache, (uint64_t)g->pool_slots * Q4E_KV_DIM * sizeof(uint16_t))
           && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
-        if (ok) g->mtp_ready = true;
+        if (ok) {
+            g->mtp_k_cache = cache->mtp_k_cache;
+            g->mtp_v_cache = cache->mtp_v_cache;
+            g->mtp_ready = g->mtp_k_cache != NULL;
+        }
     }
 
     if (!ok) {
@@ -66070,6 +66988,12 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
         }
     }
     ds4_gpu_tensor_fill_f32(g->ple_conv, 0.0f, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM);
+    /* An empty context stands on the tree root: it owns no span and no page,
+     * and its first commit hangs a node under the root. */
+    pthread_mutex_lock(&cache->mu);
+    g->node = cache->tree.root;
+    q4e_tree_mark_live(g->node, NULL, +1);
+    pthread_mutex_unlock(&cache->mu);
     g->ready = true;
     return 0;
 }
@@ -68963,10 +69887,13 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     }
 #ifndef DS4_NO_GPU
     if (ds4_model_is_qwen4exp()) {
-        /* Every layer carries recurrent state -- the DeltaNet matrices, the two
-         * conv windows -- and none of it can be rewound partway, so a prompt
-         * that is not an extension of the live checkpoint rebuilds from zero.
-         * Prefix reuse still covers the common agent case of appending turns. */
+        /* Every layer carries recurrent state -- the DeltaNet matrices, the
+         * two conv windows -- and none of it can be rewound partway, so a
+         * prefill can only start where a GDN checkpoint exists.  The prefix
+         * cache decides where that is: it walks the shared radix tree with
+         * this prompt for the longest matching prefix p_kv and the deepest
+         * checkpoint c <= p_kv, restores the state at c, attaches the path's
+         * KV pages below it, and prefills [c, len). */
         ds4_q4e_graph *g = &s->q4e_graph;
         /* A new prompt is a new generation: the n-gram lookup keys off the
          * text generated after this prompt, and last generation's rejected
@@ -68974,36 +69901,48 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         g->ngram_gen_start = (uint32_t)prompt->len;
         g->ngram_mem.n = 0;
         g->ngram_mem.next = 0;
+        const uint32_t len = (uint32_t)prompt->len;
+        const int32_t hint = g->hint_pos;
+        g->hint_pos = -1;              /* the hint applies to this sync only */
+
+        q4e_plan pl;
+        q4e_cache_plan(s, prompt, &pl);
         uint32_t start = 0;
-        if (s->checkpoint_valid && ds4_tokens_starts_with(prompt, &s->checkpoint) &&
-            (uint32_t)s->checkpoint.len == g->pos) {
-            start = g->pos;
-        } else if (q4e_snapshot_find(g, prompt) != NULL) {
-            /* The agent case: a new prompt sharing a prefix with the previous
-             * one (up to the re-rendered assistant turn).  Rewind to the last
-             * chunk boundary inside the shared prefix. */
-            struct q4e_snapshot *sn = q4e_snapshot_find(g, prompt);
-            if (q4e_snapshot_restore(s, sn) != 0) {
-                snprintf(err, errlen, "qwen4exp snapshot restore failed");
+        if (pl.source == DS4_REUSE_LIVE) {
+            start = pl.live_pos;
+            g->matched_end = pl.matched;
+        } else if (pl.ckpt >= 0) {
+            const int rc = q4e_cache_resume(s, prompt);
+            if (rc == 1) {
+                snprintf(err, errlen, "qwen4exp checkpoint resume failed");
                 ds4_session_invalidate(s);
                 return 1;
             }
+            if (rc == 2) pl.ckpt = -1;   /* it went away: prefill cold below */
             start = g->pos;
             if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
-                fprintf(stderr, "q4e sync: restored snapshot at %u, prefilling %u new tokens\n",
-                        start, (uint32_t)prompt->len - start);
+                fprintf(stderr, "q4e sync: resumed %s checkpoint at %u (kv match %u), "
+                                "prefilling %u new tokens\n",
+                        ds4_reuse_source_name(pl.source), start, pl.matched, len - start);
             }
-            if (start == (uint32_t)prompt->len) {
-                /* The identical prefix again: its logits were snapshotted. */
+            if (start == len) {
+                /* The identical prefix again: those logits were checkpointed
+                 * with the state, so nothing has to run. */
                 s->checkpoint_valid = true;
                 s->mtp_draft_valid = false;
                 return 0;
             }
-        } else {
+        }
+        if (pl.ckpt < 0 && pl.source != DS4_REUSE_LIVE) {
             q4e_graph_reset(g);
             s->checkpoint.len = 0;
+            start = 0;
+            /* A cold prefill can still run through a prefix the tree holds:
+             * remember where this prompt left the shared path so admission
+             * rule 3 puts a checkpoint at exactly that branch point. */
+            g->matched_end = pl.matched;
         }
-        if (start == (uint32_t)prompt->len) {
+        if (start == len) {
             /* The prompt is exactly the live checkpoint, so s->logits already
              * holds the last row's distribution.  Re-running that row would
              * advance the DeltaNet and conv states a second time on the same
@@ -69011,10 +69950,19 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->mtp_draft_valid = false;
             return 0;
         }
+        /* Admission rule 2: the boundary the client will branch from next
+         * turn.  Kept out of the plan because it says nothing about reuse --
+         * it only makes the prefill stop there on the way past. */
+        if (hint > (int32_t)start && (uint32_t)hint < len) g->hint_pos = hint;
 
-        for (uint32_t pos = start; pos < (uint32_t)prompt->len; ) {
-            const uint32_t take = ((g->tok_cap < (uint32_t)prompt->len - pos) ? g->tok_cap : (uint32_t)prompt->len - pos);
-            const bool last = (pos + take) == (uint32_t)prompt->len;
+        for (uint32_t pos = start; pos < len; ) {
+            /* Chunk to the next admission position, so a checkpoint can be
+             * taken exactly there rather than at whatever multiple of the
+             * chunk width the prefill happens to land on. */
+            const uint32_t stop = q4e_next_admission(g, pos, len);
+            const uint32_t left = stop - pos;
+            const uint32_t take = g->tok_cap < left ? g->tok_cap : left;
+            const bool last = (pos + take) == len;
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
@@ -69038,14 +69986,25 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
             pos += take;
-            /* The checkpoint tracks the prefilled prefix so a snapshot can be
-             * taken at this chunk boundary (only the last chunk has logits
-             * worth keeping; earlier ones are restored for prefix reuse). */
+            /* The session checkpoint tracks the prefilled prefix; the cache
+             * commit needs it to agree with g->pos. */
             s->checkpoint.len = 0;
             for (uint32_t i = 0; i < pos; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
-            (void)q4e_snapshot_take(s, last);
+            if (pos == stop) {
+                /* Only the prompt's own end has logits worth keeping; and a
+                 * stop that is only a chunk boundary must not evict a better
+                 * checkpoint to get a slot. */
+                const bool chunk_only = pos != len && (int32_t)pos != g->hint_pos &&
+                                        pos != g->matched_end;
+                if (q4e_cache_commit(s, prompt->v, pos, last, chunk_only) != 0) {
+                    snprintf(err, errlen, "qwen4exp cache commit failed at %u", pos);
+                    ds4_session_invalidate(s);
+                    return 1;
+                }
+            }
             ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
         }
+        g->hint_pos = -1;
         s->checkpoint.len = 0;
         for (int i = 0; i < prompt->len; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
         s->checkpoint_valid = true;
@@ -70060,14 +71019,16 @@ void ds4_session_reuse_report(ds4_session *s, const ds4_tokens *prompt,
     out->source = DS4_REUSE_COLD;
     out->reused_tokens = 0;
     out->prefilled_tokens = prompt ? prompt->len : 0;
+    out->matched_tokens = 0;
     if (!s || !prompt) return;
 
     int reused = 0;
+    uint32_t matched = 0;
     ds4_reuse_source source = DS4_REUSE_COLD;
     bool family_answered = false;
 #ifndef DS4_NO_GPU
     if (ds4_model_is_qwen4exp()) {
-        reused = (int)q4e_reusable_prefix(s, prompt, &source);
+        reused = (int)q4e_reusable_prefix(s, prompt, &source, &matched);
         family_answered = true;
     }
 #endif
@@ -70079,6 +71040,7 @@ void ds4_session_reuse_report(ds4_session *s, const ds4_tokens *prompt,
             source = DS4_REUSE_LIVE;
         }
     }
+    out->matched_tokens = (int)matched;
     if (reused <= 0) return;
     out->source = source;
     out->reused_tokens = reused;
@@ -70093,9 +71055,10 @@ int ds4_session_reusable_prefix(ds4_session *s, const ds4_tokens *prompt) {
 
 const char *ds4_reuse_source_name(ds4_reuse_source source) {
     switch (source) {
-    case DS4_REUSE_LIVE:     return "live";
-    case DS4_REUSE_SNAPSHOT: return "snapshot";
-    case DS4_REUSE_COLD:     break;
+    case DS4_REUSE_LIVE:       return "live";
+    case DS4_REUSE_CHECKPOINT: return "checkpoint";
+    case DS4_REUSE_TREE:       return "tree";
+    case DS4_REUSE_COLD:       break;
     }
     return "cold";
 }
@@ -70105,8 +71068,50 @@ void ds4_session_cache_stats_get(ds4_session *s, ds4_session_cache_stats *out) {
     memset(out, 0, sizeof(*out));
     if (!s) return;
 #ifndef DS4_NO_GPU
-    if (ds4_model_is_qwen4exp()) q4e_cache_stats(&s->q4e_graph, out);
+    if (ds4_model_is_qwen4exp()) q4e_cache_stats(s, out);
 #endif
+}
+
+bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out) {
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!s) return false;
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) return q4e_cache_path(s, out);
+#endif
+    return false;
+}
+
+void ds4_session_set_cache_boundary_hint(ds4_session *s, int position) {
+    if (!s) return;
+#ifndef DS4_NO_GPU
+    if (ds4_model_is_qwen4exp()) s->q4e_graph.hint_pos = position;
+#else
+    (void)position;
+#endif
+}
+
+void ds4_session_cache_commit(ds4_session *s) {
+    if (!s) return;
+#ifndef DS4_NO_GPU
+    /* Admission rule 1: the sequence end.  The frontier is the prompt plus
+     * everything just generated, and the next turn of this conversation
+     * re-renders exactly that -- so a checkpoint here is what turns that turn
+     * into a sub-hundred-token prefill even after other conversations have
+     * run through this context in between. */
+    if (!ds4_model_is_qwen4exp() || !s->checkpoint_valid) return;
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (!g->ready || (uint32_t)s->checkpoint.len != g->pos) return;
+    /* s->logits still holds the distribution after the last committed token,
+     * so this checkpoint can answer an exact re-send of prompt-plus-answer
+     * without running anything. */
+    (void)q4e_cache_commit(s, s->checkpoint.v, g->pos, true, false);
+#endif
+}
+
+bool ds4_engine_shares_prefix_cache(const ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen4exp();
 }
 
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
