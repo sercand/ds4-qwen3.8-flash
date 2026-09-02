@@ -65875,8 +65875,11 @@ static int q4e_hc_mix(ds4_q4e_graph *g, const ds4_model *m,
                       const ds4_tensor *norm, const ds4_tensor *down,
                       const ds4_tensor *up, const ds4_tensor *inject,
                       uint32_t n_tok) {
-    if (!ds4_gpu_q4e_hc_norm(g->xn, g->res, m->map, m->size, norm->abs_offset,
-                             DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
+    /* `norm` NULL means the residual update that closed the previous block
+     * already produced this mix's normed input in the same pass over the
+     * residual (see the island chain below). */
+    if (norm && !ds4_gpu_q4e_hc_norm(g->xn, g->res, m->map, m->size, norm->abs_offset,
+                                     DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
     if (!q4e_matmul(g->lora, m, down, g->xn, n_tok)) return 0;
     if (!ds4_gpu_q4e_scale_silu(g->lora, 1.0f / (float)DS4_N_HC,
                                 (uint64_t)n_tok * DS4_N_HC_LOWRANK)) return 0;
@@ -66130,7 +66133,8 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
  * on the GPU, and a replayed graph pays that once at capture. */
 static int q4e_encode_attn_island(ds4_q4e_graph *g, const ds4_model *m,
                                   const ds4_layer_weights *l, uint32_t il,
-                                  uint32_t n_tok) {
+                                  uint32_t n_tok, bool xn_ready,
+                                  const ds4_tensor *next_norm) {
     double t;
     if (ds4_qwen4exp_layer_has_ple(il)) {
         t = q4e_phase_begin();
@@ -66139,7 +66143,8 @@ static int q4e_encode_attn_island(ds4_q4e_graph *g, const ds4_model *m,
     }
 
     t = q4e_phase_begin();
-    if (!q4e_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up,
+    if (!q4e_hc_mix(g, m, xn_ready ? NULL : l->hc_attn_norm,
+                    l->hc_attn_down, l->hc_attn_up,
                     l->hc_attn_inject, n_tok)) return 0;
     q4e_phase_end(Q4E_PH_HC_MIX, t);
     q4e_trace("hc_mixed", (int)il, g->mixed, (uint64_t)n_tok * DS4_N_EMBD);
@@ -66154,8 +66159,11 @@ static int q4e_encode_attn_island(ds4_q4e_graph *g, const ds4_model *m,
     }
 
     t = q4e_phase_begin();
-    if (!ds4_gpu_q4e_hc_combine(g->res, g->blk_out, g->inject,
-                                DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+    if (!ds4_gpu_q4e_hc_combine(g->res, g->xn, g->blk_out, g->inject,
+                                m->map, m->size,
+                                next_norm ? next_norm->abs_offset : 0u,
+                                next_norm != NULL,
+                                DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
     q4e_phase_end(Q4E_PH_HC_COMBINE, t);
     q4e_trace("hc_combine", (int)il, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
     return 1;
@@ -66163,9 +66171,11 @@ static int q4e_encode_attn_island(ds4_q4e_graph *g, const ds4_model *m,
 
 static int q4e_encode_ffn_island(ds4_q4e_graph *g, const ds4_model *m,
                                  const ds4_layer_weights *l, uint32_t il,
-                                 uint32_t n_tok) {
+                                 uint32_t n_tok, bool xn_ready,
+                                 const ds4_tensor *next_norm) {
     double t = q4e_phase_begin();
-    if (!q4e_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up,
+    if (!q4e_hc_mix(g, m, xn_ready ? NULL : l->hc_ffn_norm,
+                    l->hc_ffn_down, l->hc_ffn_up,
                     l->hc_ffn_inject, n_tok)) return 0;
     q4e_phase_end(Q4E_PH_HC_MIX, t);
 
@@ -66173,18 +66183,31 @@ static int q4e_encode_ffn_island(ds4_q4e_graph *g, const ds4_model *m,
     q4e_trace("ffn_out", (int)il, g->blk_out, (uint64_t)n_tok * DS4_N_EMBD);
 
     t = q4e_phase_begin();
-    if (!ds4_gpu_q4e_hc_combine(g->res, g->blk_out, g->inject,
-                                DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+    if (!ds4_gpu_q4e_hc_combine(g->res, g->xn, g->blk_out, g->inject,
+                                m->map, m->size,
+                                next_norm ? next_norm->abs_offset : 0u,
+                                next_norm != NULL,
+                                DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
     q4e_phase_end(Q4E_PH_HC_COMBINE, t);
     q4e_trace("l_last", (int)il, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
     return 1;
 }
 
+/* The residual update that closes an island and the group-norm that opens the
+ * next one are one kernel (ds4_gpu_q4e_hc_combine), so an island consumes the
+ * normed input its predecessor left behind and leaves the next one's.  The
+ * chain is described by two arguments per island: `xn_ready` says the input is
+ * already normed, `next_norm` is the weight to leave normed with, NULL where
+ * the chain breaks.  It breaks in three places -- the first island of a pass
+ * (nothing preceded it), an island whose PLE block reads and writes the
+ * residual between the update and the mix, and the last layer of the pass,
+ * whose successor is either the collapsing output mixer or nothing at all. */
 static int q4e_encode_island(ds4_q4e_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il,
-                             uint32_t island, uint32_t n_tok) {
-    return island == 0u ? q4e_encode_attn_island(g, m, l, il, n_tok)
-                        : q4e_encode_ffn_island(g, m, l, il, n_tok);
+                             uint32_t island, uint32_t n_tok, bool xn_ready,
+                             const ds4_tensor *next_norm) {
+    return island == 0u ? q4e_encode_attn_island(g, m, l, il, n_tok, xn_ready, next_norm)
+                        : q4e_encode_ffn_island(g, m, l, il, n_tok, xn_ready, next_norm);
 }
 
 /* Run one island, replaying its captured graph when there is one.  The
@@ -66194,8 +66217,11 @@ static int q4e_encode_island(ds4_q4e_graph *g, const ds4_model *m,
  * island stays eager for the rest of the session. */
 static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
                           const ds4_layer_weights *l, uint32_t il,
-                          uint32_t island, uint32_t n_tok, bool graphs_ok) {
-    if (!graphs_ok) return q4e_encode_island(g, m, l, il, island, n_tok);
+                          uint32_t island, uint32_t n_tok, bool graphs_ok,
+                          bool xn_ready, const ds4_tensor *next_norm) {
+    if (!graphs_ok) {
+        return q4e_encode_island(g, m, l, il, island, n_tok, xn_ready, next_norm);
+    }
 
     ds4_decode_graph_key key;
     memset(&key, 0, sizeof(key));
@@ -66217,16 +66243,16 @@ static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
         const int state = ds4_gpu_decode_graph_begin(&key);
         if (state == 1) return 1;              /* replayed */
         if (state == 0) {
-            if (!q4e_encode_island(g, m, l, il, island, n_tok)) {
+            if (!q4e_encode_island(g, m, l, il, island, n_tok, xn_ready, next_norm)) {
                 ds4_gpu_decode_graph_abort(&key);
-                return q4e_encode_island(g, m, l, il, island, n_tok);
+                return q4e_encode_island(g, m, l, il, island, n_tok, xn_ready, next_norm);
             }
             if (ds4_gpu_decode_graph_end(&key) == 0) return 1;
             continue;                          /* capture failed: retry */
         }
         break;                                 /* warm pass, or disabled */
     }
-    return q4e_encode_island(g, m, l, il, island, n_tok);
+    return q4e_encode_island(g, m, l, il, island, n_tok, xn_ready, next_norm);
 }
 
 /* Gather the PLE rows for this chunk.  The hash reads up to ngram_size - 1
@@ -66313,8 +66339,21 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
-        if (!q4e_run_island(g, m, l, il, 0u, n_tok, graphs_ok)) return 1;
-        if (!q4e_run_island(g, m, l, il, 1u, n_tok, graphs_ok)) return 1;
+        /* Which norm each island hands to the next: see q4e_encode_island.
+         * The attention island always feeds this layer's FFN mix; the FFN
+         * island feeds the next layer's attention mix unless that layer's PLE
+         * block sits in between, and the last layer feeds nothing (the
+         * collapsing output mixer norms its own input, and a prefill chunk
+         * that produces no logits does not run it at all). */
+        const bool next_is_ple = il + 1u < DS4_N_LAYER &&
+                                 ds4_qwen4exp_layer_has_ple(il + 1u);
+        const ds4_tensor *after_ffn = (il + 1u < DS4_N_LAYER && !next_is_ple)
+            ? w->layer[il + 1u].hc_attn_norm : NULL;
+        const bool attn_xn_ready = il > 0u && !ds4_qwen4exp_layer_has_ple(il);
+        if (!q4e_run_island(g, m, l, il, 0u, n_tok, graphs_ok, attn_xn_ready,
+                            l->hc_ffn_norm)) return 1;
+        if (!q4e_run_island(g, m, l, il, 1u, n_tok, graphs_ok, /*xn_ready=*/true,
+                            after_ffn)) return 1;
     }
 
     if (logit_rows == 0u) {
@@ -66452,8 +66491,13 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
                            !q4e_trace_enabled() &&
                            !q4e_profile_enabled() &&
                            ds4_gpu_decode_graphs_supported() != 0;
-    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 0u, n, graphs_ok)) return 1;
-    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 1u, n, graphs_ok)) return 1;
+    /* The draft's residual comes from the init-add above, not from a previous
+     * block's update, so its attention island norms its own input; its FFN
+     * island is followed by the collapsing mixer, which norms its own. */
+    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 0u, n, graphs_ok,
+                        /*xn_ready=*/false, mw->block.hc_ffn_norm)) return 1;
+    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 1u, n, graphs_ok,
+                        /*xn_ready=*/true, /*next_norm=*/NULL)) return 1;
     /* DS4_QWEN4EXP_MTP_DUMP=<dir>: one binary record per draft call, for a
      * numerical check against vLLM's PyTorch MTP module (and later, training
      * pairs).  Layout, all little-endian: int32 magic 0x4d545031, n, hc_dim,

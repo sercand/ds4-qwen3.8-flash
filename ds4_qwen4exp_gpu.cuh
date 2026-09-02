@@ -54,6 +54,10 @@ __device__ static float q4e_block_max(float v) {
  * Hyper-connections.
  * ------------------------------------------------------------------------ */
 
+/* Values one thread of q4e_hc_combine_norm_kernel carries: ceil(n_embd /
+ * threads), 10 at the shipped 2560 with 256 threads. */
+#define Q4E_HC_FUSE_MAX 16u
+
 /* res[t][h][e] = embed[t][e] for every stream h.  The residual starts as the
  * embedding tiled across the streams, not zero padded. */
 __global__ static void q4e_hc_init_kernel(
@@ -132,20 +136,80 @@ __global__ static void q4e_hc_collapse_kernel(
     }
 }
 
-/* res += block_out (x) 2*sigmoid(inject / n_hc), broadcast over the stream.
- * The injection logits come from the normed input of the *paired* mix, which
- * the caller must keep alive across the block. */
-__global__ static void q4e_hc_combine_kernel(
-        float *res, const float *block_out, const float *inject,
-        uint32_t n_embd, uint32_t n_hc) {
-    const uint32_t t = blockIdx.y;
-    const uint32_t h = blockIdx.z;
-    const float w = 2.0f / (1.0f + __expf(-inject[(uint64_t)t * n_hc + h] / (float)n_hc));
-    const uint64_t base = ((uint64_t)t * n_hc + h) * n_embd;
+/* The residual update that closes a block, fused with the group-RMSNorm that
+ * opens the next one.
+ *
+ * Both traverse the whole hc * n_embd residual, which at a prefill chunk is
+ * the widest stream in the model (2048 tokens x 40 KiB), and the update's
+ * result is exactly the norm's input.  Run apart they cost four passes over
+ * it -- update reads and writes it, the norm reads it and writes the normed
+ * copy -- and the block output once per stream; run together, three, and the
+ * block output once.  Measured at 26k: 1.08 + 0.78 ms -> 1.17 ms per layer
+ * and per direction.
+ *
+ * One block per token, not per (token, stream): that is what lets the block
+ * output be read once for all n_hc streams.  The per-stream reduction, the
+ * element-to-thread mapping and every expression are the ones the two
+ * separate kernels used, so the result is bit-identical to them.
+ *
+ * The streams are walked grid-strided, so the launcher can spread them over
+ * gridDim.y blocks instead: at one token, four blocks that each read the
+ * block output are worth more than one block that reads it once and then
+ * reduces four times in sequence (decode measured 22.6 against 23.9 tok/s
+ * before this was a grid stride).
+ *
+ * `w` is the next mix's norm weight, or NULL where no mix follows in this
+ * pass (the last layer) or something else reads the residual in between (the
+ * PLE block); then this is the residual update alone and the mix norms its
+ * own input. */
+__global__ static void q4e_hc_combine_norm_kernel(
+        float *res, float *xn, const float *block_out, const float *inject,
+        const float *w, uint32_t n_embd, uint32_t n_hc, float eps) {
+    const uint32_t t = blockIdx.x;
     const float *src = block_out + (uint64_t)t * n_embd;
-    for (uint32_t e = blockIdx.x * blockDim.x + threadIdx.x; e < n_embd;
-         e += gridDim.x * blockDim.x) {
-        res[base + e] += src[e] * w;
+    const uint32_t h0 = blockIdx.y;
+    const uint32_t hstep = gridDim.y;
+
+    /* The block output, held for every stream, and the updated residual, held
+     * for the norm's second pass.  Both loops are unrolled over a fixed bound
+     * with a guard rather than run to a runtime trip count: a dynamic index
+     * into a local array is a local-memory array, and the spill traffic cost
+     * more than the pass it saved (1.51 ms against 1.17 ms per call at 26k).
+     * The launcher refuses shapes above the bound. */
+    float sv[Q4E_HC_FUSE_MAX];
+#pragma unroll
+    for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
+        const uint32_t i = threadIdx.x + n * blockDim.x;
+        sv[n] = (i < n_embd) ? src[i] : 0.0f;
+    }
+
+    for (uint32_t h = h0; h < n_hc; h += hstep) {
+        const float wgt =
+            2.0f / (1.0f + __expf(-inject[(uint64_t)t * n_hc + h] / (float)n_hc));
+        float *dst = res + ((uint64_t)t * n_hc + h) * n_embd;
+        float vv[Q4E_HC_FUSE_MAX];
+        float sum = 0.0f;
+#pragma unroll
+        for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
+            const uint32_t i = threadIdx.x + n * blockDim.x;
+            if (i < n_embd) {
+                float v = dst[i];
+                v += sv[n] * wgt;
+                dst[i] = v;
+                vv[n] = v;
+                sum += v * v;
+            }
+        }
+        if (!w) continue;
+        sum = q4e_block_sum(sum);
+        const float scale = rsqrtf(sum / (float)n_embd + eps);
+        const float *wh = w + (uint64_t)h * n_embd;
+        float *out = xn + ((uint64_t)t * n_hc + h) * n_embd;
+#pragma unroll
+        for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
+            const uint32_t i = threadIdx.x + n * blockDim.x;
+            if (i < n_embd) out[i] = vv[n] * scale * wh[i];
+        }
     }
 }
 
@@ -1025,14 +1089,36 @@ extern "C" int ds4_gpu_q4e_hc_collapse(
     return cuda_ok(cudaGetLastError(), "qwen4exp hc collapse");
 }
 
+/* res += block_out (x) 2*sigmoid(inject / n_hc) per stream, and, when a norm
+ * follows in this pass, the next mix's normed input in the same pass.
+ * `fuse_norm` = 0 leaves xn alone (see q4e_hc_combine_norm_kernel).  The
+ * injection logits come from the normed input of the *paired* mix, which the
+ * caller must keep alive across the block. */
 extern "C" int ds4_gpu_q4e_hc_combine(
-        ds4_gpu_tensor *res, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *inject,
-        uint32_t n_embd, uint32_t n_hc, uint32_t n_tok) {
+        ds4_gpu_tensor *res, ds4_gpu_tensor *xn, const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *inject, const void *model_map, uint64_t model_size,
+        uint64_t next_norm_offset, int fuse_norm,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps) {
     if (!res || !block_out || !inject || !n_tok) return 0;
-    const dim3 grid((n_embd + 255u) / 256u, n_tok, n_hc);
-    q4e_hc_combine_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
-            (float *)res->ptr, (const float *)block_out->ptr,
-            (const float *)inject->ptr, n_embd, n_hc);
+    const unsigned threads = 256u;
+    if (n_embd > threads * Q4E_HC_FUSE_MAX) return 0;
+    const float *w = NULL;
+    if (fuse_norm) {
+        if (!xn) return 0;
+        w = q4e_weight(model_map, model_size, next_norm_offset,
+                       (uint64_t)n_embd * n_hc * sizeof(float), res,
+                       "qwen4exp hc combine norm");
+        if (!w) return 0;
+    }
+    /* One block per token once there are enough tokens to fill the machine
+     * that way (the block output is then read once, not once per stream);
+     * below that, one block per (token, stream) so a decode step's four
+     * groups run at once instead of in sequence. */
+    const dim3 grid(n_tok, n_tok >= 256u ? 1u : n_hc, 1);
+    q4e_hc_combine_norm_kernel<<<grid, threads, 0, cuda_decode_stream()>>>(
+            (float *)res->ptr, xn ? (float *)xn->ptr : NULL,
+            (const float *)block_out->ptr, (const float *)inject->ptr,
+            w, n_embd, n_hc, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp hc combine");
 }
 

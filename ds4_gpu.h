@@ -3130,7 +3130,7 @@ int ds4_gpu_q4e_scale_silu(ds4_gpu_tensor *x, float inv_scale, uint64_t n);
 
 int ds4_gpu_q4e_hc_collapse( ds4_gpu_tensor *out, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *up, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 
-int ds4_gpu_q4e_hc_combine( ds4_gpu_tensor *res, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *inject, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+int ds4_gpu_q4e_hc_combine( ds4_gpu_tensor *res, ds4_gpu_tensor *xn, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *inject, const void *model_map, uint64_t model_size, uint64_t next_norm_offset, int fuse_norm, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
 
 int ds4_gpu_q4e_moe_route( ds4_gpu_tensor *ids, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits, uint32_t n_expert, uint32_t n_used, uint32_t n_tok);
 
