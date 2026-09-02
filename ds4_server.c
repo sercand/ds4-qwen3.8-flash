@@ -9704,8 +9704,6 @@ struct server {
     int mixed_prefill_quantum;
     int last_prefill_slot;
     int last_decode_slot;
-    /* The widest chunk the engine will run, for the startup log line only. */
-    int prefill_chunk_rows;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -11851,12 +11849,17 @@ static char *build_invalid_tool_call_error_suffix(const request *r,
  * goes before a queued prefill quantum until every generating context has had
  * its step since the last quantum, and then the prefiller takes one -- or a
  * long prompt would never finish while anyone is decoding.  Round-robin
- * inside each class.  A prefill quantum is one engine prefill chunk
- * (--prefill-chunk; 512 rows for qwen4exp once there is more than one
- * context), so a decoding stream waits at most one chunk for the model.  The
- * quantum is the chunk width rather than a cap on top of it because chunk
- * width perturbs the router logits of a 512-expert MoE: an answer must not
- * depend on whether the request happened to share the model.
+ * inside each class.
+ *
+ * A prefill quantum is one engine prefill chunk (--prefill-chunk), narrowed
+ * to --mixed-prefill-quantum rows while another context has work: the cap is
+ * applied on top of the chunk, per chunk, by server_prefill_chunk_rows, so a
+ * prefill that is alone runs at the engine's full width and a decoding stream
+ * never waits more than the narrow quantum for the model.  Chunk width
+ * perturbs the router logits of a 512-expert MoE, so a request that shared
+ * the model with a peer can answer differently from the same request run
+ * solo, at a near-tie -- the alternative was making every solo prefill pay
+ * the narrow width, which costs several times the prefill throughput.
  *
  * D5, true batched decode, would replace the per-context steps with one
  * forward carrying rows from both contexts.  Nothing here assumes a step is
@@ -14680,7 +14683,6 @@ static void server_cancel_job(server *s, job *j) {
     job_mark_cancelled(j);
 
     bool detached = false;
-    int detached_slot = -1;
     pthread_mutex_lock(&s->mu);
     job *prev = NULL;
     for (job *it = s->head; it; prev = it, it = it->next) {
@@ -14700,7 +14702,20 @@ static void server_cancel_job(server *s, job *j) {
             slot->work = NULL;
             slot->busy = false;
             detached = true;
-            detached_slot = i;
+            /* A job cancelled between dispatch and its worker picking it up
+             * never reaches generate_job, which is the only other place that
+             * clears this.  Leaving it set would make
+             * server_startup_pending_locked report a startup that never
+             * finishes, and every prefill quantum on every context would wait
+             * for it -- for the life of the process.
+             *
+             * Clear it here, *before* the dispatch: dispatch_jobs_locked can
+             * hand this very slot to a queued job and set the flag again for
+             * that job, so a clear after the loop would clear the new job's
+             * flag and leave the cancelled one's effect in place. */
+            pthread_mutex_lock(&s->model_mu);
+            slot->awaiting_first_grant = false;
+            pthread_mutex_unlock(&s->model_mu);
             dispatch_jobs_locked(s);
             break;
         }
@@ -14709,12 +14724,6 @@ static void server_cancel_job(server *s, job *j) {
     pthread_mutex_unlock(&s->mu);
 
     pthread_mutex_lock(&s->model_mu);
-    /* A job cancelled between dispatch and its worker picking it up never
-     * reaches generate_job, which is the only other place that clears this.
-     * Leaving it set would make server_startup_pending_locked report a
-     * startup that never finishes, and every prefill quantum on every context
-     * would wait for it -- for the life of the process. */
-    if (detached_slot >= 0) s->slots[detached_slot].awaiting_first_grant = false;
     for (int i = 0; i < s->slot_count; i++) {
         server_slot *slot = &s->slots[i];
         if (slot->running == j) {
@@ -15392,7 +15401,6 @@ int main(int argc, char **argv) {
     s.batched_mode = cfg.batched_sessions > 0;
     s.multi_ctx_mode = multi_ctx_mode;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
-    s.prefill_chunk_rows = (int)ds4_engine_prefill_chunk(engine);
     /* The executor's contended quantum.  128 -- this flag's default, sized for
      * DeepSeek -- is far too small for a 512-expert MoE, where a chunk that
      * thin leaves each expert two rows; multi-context mode asks for about a
@@ -15709,8 +15717,9 @@ static void test_multi_ctx_executor_alternation(void) {
 }
 
 /* The adaptive quantum: a solo prefill runs the engine's own chunk width (0),
- * a contended one is capped -- and "contended" is queued or starting, not
- * generating, because the request that matters has not decoded anything yet. */
+ * a contended one is capped -- and "contended" is any peer with a request in
+ * flight, queued, starting, or between steps doing host work, since all four
+ * are a stream that would otherwise wait a full-width chunk. */
 static void test_multi_ctx_adaptive_chunk(void) {
     server s = {0};
     server_slot slots[2] = {0};
@@ -19631,6 +19640,34 @@ static void test_cancel_clears_awaiting_first_grant(void) {
     TEST_ASSERT(!slot.awaiting_first_grant);
     TEST_ASSERT(!server_startup_pending_locked(&s, -1));
 
+    /* And the clear has to land on the cancelled job's slot before the
+     * dispatch that re-fills it.  server_cancel_job frees the slot and calls
+     * dispatch_jobs_locked while it still holds s->mu, so a queued job can
+     * take the same slot and set the flag for itself; a clear after that
+     * would clear the *new* job's flag and leave the request that just
+     * started with no startup pending. */
+    job assigned, queued;
+    test_cancel_job_init(&assigned);
+    test_cancel_job_init(&queued);
+    slot.assigned = &assigned;
+    slot.work = &assigned;
+    slot.busy = true;
+    slot.awaiting_first_grant = true;
+    s.head = &queued;
+    s.tail = &queued;
+
+    server_cancel_job(&s, &assigned);
+    TEST_ASSERT(assigned.done);
+    TEST_ASSERT(!queued.done);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(slot.assigned == &queued);
+    TEST_ASSERT(slot.work == &queued);
+    TEST_ASSERT(slot.busy);
+    TEST_ASSERT(slot.awaiting_first_grant);
+    TEST_ASSERT(server_startup_pending_locked(&s, -1));
+
+    test_cancel_job_destroy(&queued);
+    test_cancel_job_destroy(&assigned);
     test_cancel_job_destroy(&j);
     test_cancel_server_destroy(&s);
 }

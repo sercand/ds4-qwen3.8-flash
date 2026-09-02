@@ -71616,7 +71616,7 @@ bool ds4_engine_shares_prefix_cache(const ds4_engine *e) {
 }
 
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
-    if (!s->checkpoint_valid) return 0;
+    if (!s || !s->checkpoint_valid) return 0;
     int n = s->checkpoint.len < prompt->len ? s->checkpoint.len : prompt->len;
     int i = 0;
     while (i < n && s->checkpoint.v[i] == prompt->v[i]) i++;
