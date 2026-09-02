@@ -381,7 +381,8 @@ __global__ static void q4e_gdn_gates_kernel(
  *              S[:,j]  += delta[j] * k
  *              out[j]   = <S[:,j], q> / sqrt(head_dim)
  */
-__global__ static void q4e_gdn_recurrent_kernel(
+#define Q4E_GDN_SPLIT 4u   /* lanes per state column */
+__global__ static void __launch_bounds__(512) q4e_gdn_recurrent_kernel(
         float *attn_out, float *state,
         const float *qkv, const float *decay, const float *beta,
         uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
@@ -391,16 +392,23 @@ __global__ static void q4e_gdn_recurrent_kernel(
     float *s_state = q4e_gdn_smem;
     const uint32_t h = blockIdx.x;
     const uint32_t hk = h % n_head_k;
-    const uint32_t j = threadIdx.x;            /* one row of the transposed state */
+    /* Q4E_GDN_SPLIT adjacent lanes share one column j of S (row j of the
+     * transposed state); each owns a quarter of the 128-long inner products
+     * and the quarters meet in a shuffle.  One thread per column left the SM
+     * with four warps and a 128-deep dependent FMA chain per token: 10.8 ms
+     * for a 2048-token chunk.  The split reassociates the sums (a change of
+     * the same kind as the chunk width, see trap 4). */
+    const uint32_t j = threadIdx.x / Q4E_GDN_SPLIT;
+    const uint32_t sub = threadIdx.x % Q4E_GDN_SPLIT;
+    const uint32_t seg = head_dim / Q4E_GDN_SPLIT;          /* 32 */
     const float scale = rsqrtf((float)head_dim);
-    /* Rows are padded by one float.  Without the pad every thread in a warp
-     * reads s_state[j * 128 + i] at the same instant, and 128 words is a whole
-     * multiple of the 32 banks, so all 32 lanes land in one bank: every shared
-     * read of the state serializes 32 ways.  The odd stride staggers them. */
     const uint32_t row_stride = head_dim + 1u;
 
     float *m = state + (uint64_t)h * head_dim * head_dim;
-    for (uint32_t r = 0; r < head_dim; r++) s_state[r * row_stride + j] = m[r * head_dim + j];
+    for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
+        const uint32_t r = idx / head_dim, c = idx % head_dim;
+        s_state[r * row_stride + c] = m[idx];
+    }
     __syncthreads();
 
     __shared__ float s_k[128];
@@ -413,50 +421,58 @@ __global__ static void q4e_gdn_recurrent_kernel(
         const float *k_d = base + k_offset + (uint64_t)hk * head_dim;
         const float *v_d = base + v_offset + (uint64_t)h * head_dim;
         float kq_part = 0.0f;
-        if (j < head_dim) {
+        if (sub == 0u && j < head_dim) {
             const float kv = k_d[j];
             const float qv = q_d[j];
             s_k[j] = kv;
             s_q[j] = qv;
             kq_part = kv * qv;
         }
-        /* <k, q> is the same for every j, so reduce it once instead of having
-         * all head_dim threads recompute the whole dot product. */
         kq_part = q4e_block_sum(kq_part);
-        if (j == 0u) s_kq = kq_part;
+        if (threadIdx.x == 0u) s_kq = kq_part;
         __syncthreads();
 
         const uint64_t gi = (uint64_t)t * n_head_v + h;
         const float dec = __expf(decay[gi]);
         const float bt = beta[gi];
 
+        /* This lane's quarter of the row, walked from a rotated start so the
+         * four lanes of a column, and the eight columns of a warp, hit
+         * different banks. */
         float *row = s_state + (uint64_t)j * row_stride;
+        const uint32_t i0 = sub * seg;
         float sk = 0.0f, sq = 0.0f;
-        for (uint32_t i = 0; i < head_dim; i++) {
+        for (uint32_t n = 0; n < seg; n++) {
+            const uint32_t i = i0 + ((n + 8u * sub) & (seg - 1u));
             const float mv = row[i];
             sk = fmaf(mv, s_k[i], sk);
             sq = fmaf(mv, s_q[i], sq);
         }
+        sk += __shfl_xor_sync(0xffffffffu, sk, 1);
+        sk += __shfl_xor_sync(0xffffffffu, sk, 2);
+        sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+        sq += __shfl_xor_sync(0xffffffffu, sq, 2);
         const float delta = (v_d[j] - dec * sk) * bt;
 
-        /* out = <S_new[:,j], q> = decay * <S[:,j], q> + delta * <k, q>, which
-         * avoids a second read pass over the state. */
-        attn_out[((uint64_t)t * n_head_v + h) * head_dim + j] =
-            (dec * sq + delta * s_kq) * scale;
-
-        for (uint32_t i = 0; i < head_dim; i++) {
+        if (sub == 0u) {
+            attn_out[((uint64_t)t * n_head_v + h) * head_dim + j] =
+                (dec * sq + delta * s_kq) * scale;
+        }
+        for (uint32_t n = 0; n < seg; n++) {
+            const uint32_t i = i0 + ((n + 8u * sub) & (seg - 1u));
             row[i] = fmaf(row[i], dec, delta * s_k[i]);
         }
         __syncthreads();
-        /* Per-token state checkpoint for speculative rollback; see the conv
-         * kernel above.  Column j of every row, so the writes coalesce. */
         if (ckpt && t < ckpt_cap && t + 1u < n_tok) {
             float *ck = ckpt + ((uint64_t)t * n_head_v + h) * head_dim * head_dim;
-            for (uint32_t r = 0; r < head_dim; r++) ck[r * head_dim + j] = s_state[r * row_stride + j];
+            for (uint32_t r = sub; r < head_dim; r += Q4E_GDN_SPLIT) ck[r * head_dim + j] = s_state[r * row_stride + j];
         }
     }
 
-    for (uint32_t r = 0; r < head_dim; r++) m[r * head_dim + j] = s_state[r * row_stride + j];
+    for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
+        const uint32_t r = idx / head_dim, c = idx % head_dim;
+        m[idx] = s_state[r * row_stride + c];
+    }
 }
 
 /* Per-head RMSNorm of the delta-rule output, then the sigmoid output gate.
@@ -1135,7 +1151,7 @@ extern "C" int ds4_gpu_q4e_gdn_recurrent(
     }
     const uint32_t k_offset = n_head_k * head_dim;
     const uint32_t v_offset = 2u * n_head_k * head_dim;
-    q4e_gdn_recurrent_kernel<<<(unsigned)n_head_v, (unsigned)head_dim, shared,
+    q4e_gdn_recurrent_kernel<<<(unsigned)n_head_v, (unsigned)head_dim * Q4E_GDN_SPLIT, shared,
                                cuda_decode_stream()>>>(
             (float *)attn_out->ptr, (float *)state->ptr, (const float *)qkv->ptr,
             (const float *)decay->ptr, (const float *)beta->ptr,
