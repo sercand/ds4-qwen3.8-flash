@@ -46,33 +46,31 @@ NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=
 else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
-endif
-NVCC_BASE_FLAGS ?= -O3 -g -lineinfo --use_fast_math -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
-NVCCFLAGS ?= $(NVCC_BASE_FLAGS) $(NVCC_ARCH_FLAGS)
-
-# The vendored mmq prefill kernels are tensor-core bound, and an unpinned
-# build only puts compute_75 PTX in the fatbin: the driver then JITs
-# mma.m16n8k32.s8 into four m8n8k16 (the Turing fallback in
-# cuda/mmq/mma.cuh), which costs ~2x on Blackwell -- mul_mat_q measured
-# 1.74 s vs 1.12 s per 2048-token qwen4exp prefill chunk on GB10 (S5 C1).
-# So when CUDA_ARCH does not pin the build, give the mmq objects a cubin for
-# the build host's GPU as well and keep the compute_75 PTX as the portable
-# fallback, cubin included, so nothing changes for any other GPU (mmq's
-# host-side arch queries read __CUDA_ARCH_LIST__, so they still see 750
-# there).  The int8 MMA is exact either way: the fingerprint is identical.
-# Blackwell needs the family-specific target because BLACKWELL_MMA_AVAILABLE
-# emits block-scaled FP4 MMA, which plain sm_121 rejects.  Only the arch
-# flags differ, so an NVCCFLAGS override wants an MMQ_NVCCFLAGS one too.
-MMQ_ARCH_FLAGS := $(NVCC_ARCH_FLAGS)
-ifeq ($(strip $(CUDA_ARCH)),)
-MMQ_HOST_CC := $(shell $(CUDA_HOME)/bin/__nvcc_device_query 2>/dev/null | grep -xE '[0-9][0-9][0-9]?' | head -1)
-ifneq ($(filter 120 121,$(MMQ_HOST_CC)),)
-MMQ_ARCH_FLAGS := -gencode arch=compute_75,code=[sm_75,compute_75] -gencode arch=compute_$(MMQ_HOST_CC)a,code=sm_$(MMQ_HOST_CC)a
-else ifneq ($(strip $(MMQ_HOST_CC)),)
-MMQ_ARCH_FLAGS := -gencode arch=compute_75,code=[sm_75,compute_75] -gencode arch=compute_$(MMQ_HOST_CC),code=sm_$(MMQ_HOST_CC)
+else
+# Unpinned build: nvcc's own default is compute_75 alone, so on anything
+# newer the driver JITs Turing PTX for every kernel -- and both the ds4 and
+# the vendored kernels branch on __CUDA_ARCH__, so the JIT keeps their Turing
+# fallbacks.  cuda/mmq/mma.cuh then emits four mma.m8n8k16.s8 in place of one
+# mma.m16n8k32.s8 (measured 1.74 s vs 1.12 s of mul_mat_q per 2048-token
+# qwen4exp prefill chunk on GB10), and in ds4_cuda.cu the m16n8k32 and
+# ldmatrix helpers compile to stubs, which the host side detects by
+# ptxVersion/binaryVersion and answers by switching the Q8_0 and Q4_K
+# tensor-core tiers off.  So also build a cubin for the build host's GPU,
+# keeping the compute_75 cubin *and* PTX as the portable fallback: no other
+# GPU's behaviour changes, and the host-side arch queries still find 750 in
+# __CUDA_ARCH_LIST__.  Blackwell needs the family-specific target because
+# BLACKWELL_MMA_AVAILABLE emits block-scaled FP4 MMA, which plain sm_121
+# rejects.  MXF4 stays off: -DDS4_CUDA_HAVE_MXF4=1 selects different kernels
+# rather than a different arch, so it belongs to the pinned build only.  A
+# host with no GPU (or no device query) falls back to nvcc's default.
+NVCC_HOST_CC := $(shell $(CUDA_HOME)/bin/__nvcc_device_query 2>/dev/null | grep -xE '[0-9][0-9][0-9]?' | head -1)
+ifneq ($(filter 120 121,$(NVCC_HOST_CC)),)
+NVCC_ARCH_FLAGS := -gencode arch=compute_75,code=[sm_75,compute_75] -gencode arch=compute_$(NVCC_HOST_CC)a,code=sm_$(NVCC_HOST_CC)a
+else ifneq ($(strip $(NVCC_HOST_CC)),)
+NVCC_ARCH_FLAGS := -gencode arch=compute_75,code=[sm_75,compute_75] -gencode arch=compute_$(NVCC_HOST_CC),code=sm_$(NVCC_HOST_CC)
 endif
 endif
-MMQ_NVCCFLAGS ?= $(NVCC_BASE_FLAGS) $(MMQ_ARCH_FLAGS)
+NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
@@ -412,25 +410,25 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_qw
 # pulls in mmq.cuh which has heavy template instantiation -- each piece
 # compiles in its own TU and links in.
 cuda/mmq/ds4_ggml_stubs.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/mmid.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_mmq_d2r.o: cuda/mmq/ds4_mmq_d2r.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/quantize.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/mmq.cuh
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/mmid.o: cuda/mmq/mmid.cu cuda/mmq/mmid.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq/ds4_ggml_stubs.h cuda/mmq/quantize.cuh cuda/mmq/vecdotq.cuh cuda/mmq/unary.cuh
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h
-	$(NVCC) $(MMQ_NVCCFLAGS) -std=c++17 -c -o $@ $<
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -c -o $@ $<
 
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_glm53_vision_gpu.cuh ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
