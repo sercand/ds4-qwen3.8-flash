@@ -717,6 +717,24 @@ static int cuda_attention_score_buffer_fits(uint32_t n_comp) {
     return n_comp <= DS4_CUDA_ATTENTION_SCORE_CAP - DS4_CUDA_ATTENTION_RAW_SCORE_CAP;
 }
 
+/* Zeroed tail every cached weight span carries past its payload.
+ *
+ * mmq's K tile is MMQ_ITER_K = 256 weights wide while its loop bound counts
+ * whole type blocks, so a row whose K is not a multiple of 256 -- qwen4exp's
+ * K = 320 hyper-connection up and K = 640 down projections -- makes the last
+ * tile load up to seven 32-weight blocks past the row (238 bytes at Q8_0's 34
+ * bytes per block).  The activation side of those lanes is zero, so the extra
+ * products vanish for every row that reads into the next row's weights; the
+ * span's LAST row instead reads whatever follows the span, and uninitialised
+ * device bytes decode to inf/nan block scales, where 0 * inf poisons that
+ * whole output feature.  A KiB of zeros makes the read defined and
+ * contributes exactly nothing (a zero block scale is a zero dot product).
+ *
+ * The span builder (accelerator_prepare_model_tensor_spans in ds4.c) keeps a
+ * row-unaligned tensor last in its span, so this tail is what its final row
+ * reads. */
+#define CUDA_WEIGHT_SPAN_TAIL_PAD 1024u
+
 static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     if (model_map == g_model_host_base && g_model_device_base) return g_model_device_base + offset;
     return (const char *)model_map + offset;
@@ -803,12 +821,19 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
         }
     }
 
+    /* Same zeroed tail as the arena path: mmq over-reads the last row of a
+     * span whose K is not a multiple of 256 (see CUDA_WEIGHT_SPAN_TAIL_PAD). */
     void *dev = NULL;
-    err = cudaMalloc(&dev, (size_t)bytes);
+    err = cudaMalloc(&dev, (size_t)bytes + CUDA_WEIGHT_SPAN_TAIL_PAD);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
         fprintf(stderr, "ds4: CUDA model range alloc failed for %s (%.2f MiB): %s\n",
                 what ? what : "weights", (double)bytes / 1048576.0, cudaGetErrorString(err));
+        return NULL;
+    }
+    if (!cuda_ok(cudaMemset((char *)dev + bytes, 0, CUDA_WEIGHT_SPAN_TAIL_PAD),
+                 "zero weight span tail pad")) {
+        (void)cudaFree(dev);
         return NULL;
     }
 
@@ -2379,13 +2404,18 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     if (bytes == 0) return NULL;
     if (g_model_cache_full) return NULL;
     const uint64_t align = 256u;
-    const uint64_t aligned = (bytes + align - 1u) & ~(align - 1u);
+    const uint64_t aligned =
+        (bytes + CUDA_WEIGHT_SPAN_TAIL_PAD + align - 1u) & ~(align - 1u);
 
     for (cuda_model_arena &a : g_model_arenas) {
         const uint64_t used = (a.used + align - 1u) & ~(align - 1u);
         if (used <= a.bytes && aligned <= a.bytes - used) {
             char *ptr = a.device_ptr + used;
             a.used = used + aligned;
+            if (!cuda_ok(cudaMemset(ptr + bytes, 0, (size_t)(aligned - bytes)),
+                         "zero weight span tail pad")) {
+                return NULL;
+            }
             return ptr;
         }
     }
@@ -2412,6 +2442,10 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
         fprintf(stderr, "ds4: CUDA model arena allocated %.2f MiB (arenas %.2f GiB)\n",
                 (double)chunk / 1048576.0,
                 (double)arena_bytes / 1073741824.0);
+    }
+    if (!cuda_ok(cudaMemset((char *)dev + bytes, 0, (size_t)(aligned - bytes)),
+                 "zero weight span tail pad")) {
+        return NULL;
     }
     return (char *)dev;
 }

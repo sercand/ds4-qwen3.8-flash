@@ -3327,6 +3327,7 @@ static ds4_support_kind support_model_detect(
 typedef struct {
     uint64_t off;
     uint64_t end;
+    bool     seal;   /* nothing may be merged after this tensor */
 } accelerator_tensor_span;
 
 static int accelerator_tensor_span_cmp(const void *a, const void *b) {
@@ -3408,9 +3409,20 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             continue;
         }
 #endif
+        /* mmq's K tile is 256 weights wide, so it reads the last row of a
+         * block-quantized tensor whose row length is not a multiple of 256 --
+         * qwen4exp's K = 320 and K = 640 projections -- a few blocks past the
+         * row.  The device cache zero-pads only the tail of a span
+         * (cuda_model_arena_alloc), so such a tensor has to be the last one
+         * in its span: past it the read would land in the next tensor's
+         * bytes, where a fp16 block scale of inf or nan poisons a whole
+         * output feature. */
+        const gguf_type_info *tinfo = tensor_type(t->type);
         spans[nspan++] = (accelerator_tensor_span){
             .off = t->abs_offset,
             .end = t->abs_offset + t->bytes,
+            .seal = tinfo && tinfo->block_elems > 1 && t->ndim > 0 &&
+                    (t->dim[0] % 256u) != 0u,
         };
     }
     if (nspan == 0) {
@@ -3444,11 +3456,19 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     for (uint64_t i = 0; i < nspan;) {
         uint64_t off = spans[i].off;
         uint64_t end = spans[i].end;
+        bool seal = spans[i].seal;
+        /* A cached span is staged through the one shard that owns its start
+         * offset (cuda_model_stage_read), so it must not reach into the next
+         * file: the pread would run off the end of that shard and the whole
+         * span would fall back to a copy through the mapping. */
+        const uint32_t shard = m->n_shards > 1 ? model_shard_of(m, off, NULL) : 0;
         i++;
-        while (i < nspan &&
+        while (!seal && i < nspan &&
                spans[i].off <= end + 65536u &&
-               spans[i].end - off <= max_span) {
+               spans[i].end - off <= max_span &&
+               (m->n_shards <= 1 || model_shard_of(m, spans[i].off, NULL) == shard)) {
             if (spans[i].end > end) end = spans[i].end;
+            seal = spans[i].seal;
             i++;
         }
         char label[96];
