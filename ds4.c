@@ -66049,6 +66049,53 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
     return q4e_matmul(g->blk_out, m, l->attn_output, g->qsa_out, n_tok);
 }
 
+/* DS4_QWEN4EXP_ROUTE_DUMP=<dir>: one binary record per layer per forward with
+ * the router's selection, and with the logits it came from when
+ * DS4_QWEN4EXP_ROUTE_LOGITS names that layer.  Layout, little-endian: int32
+ * magic 0x52545031, il, n_tok, n_used, n_expert, has_logits; int32
+ * ids[n_tok * n_used]; then, when has_logits, f32 logits[n_tok * n_expert].
+ *
+ * This exists because the one recurring correctness question about this model
+ * is whether a numerical change flipped a routing tie (the chunk-width trap):
+ * two runs' records answer it directly -- which tokens picked a different
+ * expert set, and how far apart the tenth and eleventh logits were there.
+ * misc/qwen4exp-oracle/route_dump_cmp.py does that comparison.  Diagnostic
+ * only: it synchronizes and copies the whole router output back. */
+static void q4e_route_dump(ds4_q4e_graph *g, uint32_t il, uint32_t n_tok) {
+    static const char *dir = NULL;
+    static int checked = 0;
+    static int logit_layer = -1;
+    if (!checked) {
+        checked = 1;
+        dir = getenv("DS4_QWEN4EXP_ROUTE_DUMP");
+        const char *lw = getenv("DS4_QWEN4EXP_ROUTE_LOGITS");
+        logit_layer = (lw && lw[0]) ? atoi(lw) : -1;
+    }
+    if (!dir || !dir[0]) return;
+    static uint32_t seq = 0;
+    const int with_logits = ((int)il == logit_layer);
+    const uint64_t n_ids = (uint64_t)n_tok * DS4_N_EXPERT_USED;
+    const uint64_t n_lg = (uint64_t)n_tok * DS4_N_EXPERT;
+    int32_t *ids = xmalloc(n_ids * sizeof(int32_t));
+    float *lg = with_logits ? xmalloc(n_lg * sizeof(float)) : NULL;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/route_%05u_l%02u.bin", dir, seq++, il);
+    FILE *fp = fopen(path, "wb");
+    (void)ds4_gpu_synchronize();
+    if (fp && ds4_gpu_tensor_read(g->moe_ids, 0, ids, n_ids * sizeof(int32_t)) &&
+        (!with_logits || ds4_gpu_tensor_read(g->router, 0, lg, n_lg * sizeof(float)))) {
+        const int32_t hdr[6] = { 0x52545031, (int32_t)il, (int32_t)n_tok,
+                                 (int32_t)DS4_N_EXPERT_USED, (int32_t)DS4_N_EXPERT,
+                                 with_logits };
+        fwrite(hdr, sizeof(hdr), 1, fp);
+        fwrite(ids, sizeof(int32_t), n_ids, fp);
+        if (with_logits) fwrite(lg, sizeof(float), n_lg, fp);
+    }
+    if (fp) fclose(fp);
+    free(ids);
+    free(lg);
+}
+
 static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
                    const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
     double t = q4e_phase_begin();
@@ -66058,6 +66105,7 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
                                DS4_N_EXPERT, DS4_N_EXPERT_USED, n_tok)) return 0;
     q4e_trace("ffn_moe_weights_norm", (int)il, g->moe_w,
               (uint64_t)n_tok * DS4_N_EXPERT_USED);
+    q4e_route_dump(g, il, n_tok);
     q4e_phase_end(Q4E_PH_MOE_ROUTE, t);
 
     /* Gate and up read the same activation, so they run as one call that

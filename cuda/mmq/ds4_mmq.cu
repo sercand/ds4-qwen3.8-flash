@@ -1476,8 +1476,11 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
-    /* A map the caller built for this block (S5 C4); the fused direct path
-     * keeps its own scratch, so it takes precedence over sharing. */
+    /* A map the caller built for this block (S5 C4).  The fused-direct and
+     * gfx1151 branches below claim the map pointers first because they must
+     * live in their own scratch; a shared map handed in alongside either of
+     * those is therefore ignored, and the helper still runs (see the build
+     * guard).  No caller does that today. */
     const ds4_mmq_moe_map * const reuse =
         ds4_mmq_moe_map_checked(tag, shared_map, ne_get_rows, n_experts);
     ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
@@ -1581,7 +1584,11 @@ int ds4_mmq_moe_pair_impl(
     }
 
     cudaError_t err = cudaSuccess;
-    if (!reuse) {
+    /* Build unless the maps came in already filled.  Only the shared-map
+     * branch does that: the fused-direct and gfx1151 branches take
+     * precedence over it in the selection above but only hand out scratch,
+     * so they still need the helper run here. */
+    if (!reuse || direct_gateup_q8 || persistent_pair_maps) {
         ds4_mmq_nvtx_scope stage(
                 "ds4/prefill/moe/expert_map",
                 ds4_mmq_nvtx_payload((uint32_t)n_tokens, (uint32_t)n_experts),

@@ -664,11 +664,18 @@ __global__ static void __launch_bounds__(128u * Q4E_GDN_CSPLIT) q4e_gdn_chunk_ke
         /* A[t][u] = b_t e^{G_t - G_u} (k_u . k_t), strictly below the
          * diagonal.  One warp per entry: its 32 lanes take four keys each so
          * both rows are read as contiguous float4. */
-        for (uint32_t rr = warp; rr < n; rr += n_warp) {
+        for (uint32_t rr = warp; rr < C; rr += n_warp) {
             /* One warp per row, its own key row hoisted into registers: each
              * column then costs one shared read instead of two.  Rows are
              * handed out in low/high pairs (rr and C-1-rr) because row t has
-             * t columns, so a warp that takes both gets a constant C-1. */
+             * t columns, so a warp that takes both gets a constant C-1.
+             *
+             * The bound is C and not the run length: the pairing sends the
+             * second half of the rows to rr >= n_warp, so stopping at a short
+             * run's n left rows [32, 96-n) of a partial run unwritten -- the
+             * substitution then read stale shared memory for every run whose
+             * length fell in [33, 63].  Rows past n are skipped below, one
+             * predicate instead of a truncated loop. */
             const uint32_t t = ((rr / n_warp) % 2u == 0u) ? rr : (C - 1u - (rr - n_warp));
             if (t >= n) continue;
             const float4 kt = ((const float4 *)(s_K + t * D))[lane];
@@ -1532,9 +1539,11 @@ extern "C" int ds4_gpu_q4e_gdn_recurrent(
      * which is why the threshold sits far above any speculative verify (1 + K
      * rows, K <= 8) -- those are the only calls whose checkpoints are ever
      * read back, immediately, by q4e_spec_rollback -- and why decode, which
-     * is one row, never reaches it. */
+     * is one row, never reaches it.  The ckpt_cap term keeps that true even
+     * if the threshold knob is set below a verify batch's row count. */
     const uint32_t chunk_min = q4e_gdn_chunk_min_tok();
-    if (chunk_min && n_tok >= chunk_min && q4e_gdn_chunk_ready()) {
+    if (chunk_min && n_tok >= chunk_min && n_tok > 1u + ckpt_cap &&
+        q4e_gdn_chunk_ready()) {
         const uint32_t k_offset = n_head_k * head_dim;
         const uint32_t v_offset = 2u * n_head_k * head_dim;
         q4e_gdn_chunk_kernel<<<(unsigned)n_head_v, (unsigned)head_dim * Q4E_GDN_CSPLIT,
