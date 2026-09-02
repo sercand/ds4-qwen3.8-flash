@@ -55018,6 +55018,13 @@ static q4e_tree_node *q4e_tree_add(q4e_span_tree *t, q4e_tree_node *parent,
                                    const int32_t *tok, uint32_t start, uint32_t end,
                                    const q4e_page_table *table, double now) {
     if (end <= start || start != parent->end) return NULL;
+    /* Children branch by first token, and the whole walk relies on that being
+     * unique.  A caller that reaches here with a token a sibling already
+     * carries has lost track of the shared path (the tree changed under it);
+     * refuse rather than make the walk ambiguous. */
+    for (const q4e_tree_node *c = parent->child; c; c = c->next) {
+        if (c->tok[0] == tok[start]) return NULL;
+    }
     const uint32_t pg_lo = start >> DS4_Q4E_PAGE_SHIFT;
     const uint32_t pg_hi = q4e_pages_for(end);
     if (pg_hi > table->len) return NULL;
@@ -55267,7 +55274,8 @@ typedef struct {
      * copy has -1 and owns none of it. */
     q4e_tree_node  *node;
     uint32_t        matched_end;
-    int32_t         hint_pos;      /* -1 when the caller gave no boundary */
+    int32_t         hint_pos[DS4_CACHE_HINTS_MAX];
+    uint32_t        n_hints;
     int32_t         ctx_slot;
 
     /* Per-step inputs. */
@@ -55451,6 +55459,7 @@ typedef struct {
 typedef struct {
     bool     used;
     bool     ready;              /* tensors allocated (they outlive eviction) */
+    bool     speculative;        /* taken by admission rule 4, to fill an idle slot */
     uint32_t pos;                /* the position the state is *at* */
     q4e_tree_node *owner;        /* the node whose end this is */
     bool     logits_valid;       /* only a prompt-final position has them */
@@ -55573,6 +55582,7 @@ static void q4e_ckpt_release(q4e_cache *c, int32_t slot) {
     if (k->owner && k->owner->ckpt == slot) k->owner->ckpt = -1;
     k->owner = NULL;
     k->used = false;
+    k->speculative = false;
     k->logits_valid = false;
     k->pend_valid = false;
 }
@@ -55585,8 +55595,15 @@ static bool q4e_ckpt_any_free(q4e_cache *c) {
 }
 
 /* A slot for a checkpoint at the caller's frontier: a free one, else -- only
- * when the caller says this position is worth it (admission rules 1 to 3, not
- * a chunk boundary) -- the least useful used one. */
+ * when an admission rule actually asked for this position (rules 1 to 3, not
+ * a chunk boundary) -- the least useful used one.
+ *
+ * Rule 4's checkpoints yield first.  They were taken because a slot was going
+ * spare, and the marginal formula would otherwise keep them and evict the
+ * positions the rules asked for: a chunk boundary sits 2048 tokens above its
+ * neighbour, while a sequence end sits a few hundred above the prompt end
+ * that precedes it, so it prices lower even though it is the one every
+ * follow-up turn resumes from. */
 static int32_t q4e_ckpt_claim(q4e_cache *c, const ds4_q4e_graph *g,
                               bool allow_evict, double now) {
     for (uint32_t i = 0; i < c->ckpt_cap; i++) {
@@ -55601,17 +55618,21 @@ static int32_t q4e_ckpt_claim(q4e_cache *c, const ds4_q4e_graph *g,
         return (int32_t)i;
     }
     if (!allow_evict) return -1;
-    int32_t worst = -1;
-    double worst_u = 0.0;
-    for (uint32_t i = 0; i < c->ckpt_cap; i++) {
-        if (!c->ckpt[i].used) continue;
-        const double u = q4e_ckpt_utility(&c->ckpt[i], now);
-        if (worst < 0 || u < worst_u) { worst = (int32_t)i; worst_u = u; }
+    for (int pass = 0; pass < 2; pass++) {
+        int32_t worst = -1;
+        double worst_u = 0.0;
+        for (uint32_t i = 0; i < c->ckpt_cap; i++) {
+            if (!c->ckpt[i].used) continue;
+            if (pass == 0 && !c->ckpt[i].speculative) continue;
+            const double u = q4e_ckpt_utility(&c->ckpt[i], now);
+            if (worst < 0 || u < worst_u) { worst = (int32_t)i; worst_u = u; }
+        }
+        if (worst < 0) continue;
+        q4e_ckpt_release(c, worst);
+        c->ckpt_evictions++;
+        return worst;
     }
-    if (worst < 0) return -1;
-    q4e_ckpt_release(c, worst);
-    c->ckpt_evictions++;
-    return worst;
+    return -1;
 }
 
 /* Free `want` pages by dropping the least useful leaf spans.  Called with the
@@ -66648,15 +66669,18 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
         q4e_tree_node *n = q4e_tree_add(&c->tree, g->node, tok, g->node->end, q,
                                         &g->kv_table, now);
         if (!n) {
+            /* The span could not join the tree (see q4e_tree_add).  The
+             * context keeps its pages and the cache simply does not learn
+             * this path; nothing is wrong with the request. */
             pthread_mutex_unlock(&c->mu);
-            return 1;
+            return 0;
         }
         q4e_tree_mark_live(n, g->node, +1);
         g->node = n;
     }
     g->node->hit = now;
-    int32_t slot = g->node->ckpt;
-    if (slot < 0) slot = q4e_ckpt_claim(c, g, !chunk_only, now);
+    const bool refresh = g->node->ckpt >= 0;
+    int32_t slot = refresh ? g->node->ckpt : q4e_ckpt_claim(c, g, !chunk_only, now);
     if (slot >= 0) {
         q4e_ckpt *k = &c->ckpt[slot];
         if (q4e_ckpt_copy(g, k, true) != 0) {
@@ -66678,6 +66702,10 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
         k->owner = g->node;
         k->hit = now;
         k->used = true;
+        /* A position an admission rule asked for stops being speculative even
+         * if a chunk boundary got there first. */
+        if (!chunk_only) k->speculative = false;
+        else if (!refresh) k->speculative = true;
         g->node->ckpt = slot;
     }
     pthread_mutex_unlock(&c->mu);
@@ -66688,10 +66716,19 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
  * land: the sequence end always, the message boundary the server passed and
  * the branch point a diverging request just proved shared, and -- only while
  * checkpoint slots are going spare -- the next prefill chunk boundary. */
+static bool q4e_is_hint(const ds4_q4e_graph *g, uint32_t pos) {
+    for (uint32_t i = 0; i < g->n_hints; i++) {
+        if (g->hint_pos[i] == (int32_t)pos) return true;
+    }
+    return false;
+}
+
 static uint32_t q4e_next_admission(ds4_q4e_graph *g, uint32_t pos, uint32_t len) {
     uint32_t stop = len;
-    if (g->hint_pos > (int32_t)pos && (uint32_t)g->hint_pos < stop) {
-        stop = (uint32_t)g->hint_pos;
+    for (uint32_t i = 0; i < g->n_hints; i++) {
+        if (g->hint_pos[i] > (int32_t)pos && (uint32_t)g->hint_pos[i] < stop) {
+            stop = (uint32_t)g->hint_pos[i];
+        }
     }
     if (g->matched_end > pos && g->matched_end < stop) stop = g->matched_end;
     q4e_cache *c = g->cache;
@@ -66755,7 +66792,11 @@ static bool q4e_cache_path(ds4_session *s, ds4_session_path_info *out) {
     out->state_bytes = 0;
     if (g->node && g->node->ckpt >= 0 && g->node->end == g->pos) {
         const uint64_t f = sizeof(float);
-        out->state_bytes = (uint64_t)DS4_N_LAYER *
+        uint32_t gdn = 0;
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (g->gdn_conv[il]) gdn++;      /* the recurrent layers only */
+        }
+        out->state_bytes = (uint64_t)gdn *
                                ((uint64_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN +
                                 (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
                                 DS4_N_GDN_HEAD_DIM) * f +
@@ -66836,7 +66877,7 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     if (!cache) return 1;
     g->cache = cache;
     g->pool_slots = cache->pool_slots;
-    g->hint_pos = -1;
+    g->n_hints = 0;
     g->ctx_slot = q4e_ctx_claim(cache);
     if (g->ctx_slot < 0) {
         fprintf(stderr, "ds4: all %u qwen4exp execution contexts are in use "
@@ -69902,8 +69943,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         g->ngram_mem.n = 0;
         g->ngram_mem.next = 0;
         const uint32_t len = (uint32_t)prompt->len;
-        const int32_t hint = g->hint_pos;
-        g->hint_pos = -1;              /* the hint applies to this sync only */
+        int32_t hints[DS4_CACHE_HINTS_MAX];
+        const uint32_t n_hints = g->n_hints;
+        memcpy(hints, g->hint_pos, sizeof(hints));
+        g->n_hints = 0;                /* the hints apply to this sync only */
 
         q4e_plan pl;
         q4e_cache_plan(s, prompt, &pl);
@@ -69950,10 +69993,17 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->mtp_draft_valid = false;
             return 0;
         }
-        /* Admission rule 2: the boundary the client will branch from next
-         * turn.  Kept out of the plan because it says nothing about reuse --
-         * it only makes the prefill stop there on the way past. */
-        if (hint > (int32_t)start && (uint32_t)hint < len) g->hint_pos = hint;
+        /* Admission rule 2: the boundaries the client may branch from next
+         * turn.  Kept out of the plan because they say nothing about reuse --
+         * they only make the prefill stop there on the way past.  A boundary
+         * inside the first page saves under half a second of prefill and is
+         * not worth a 113 MB slot. */
+        for (uint32_t i = 0; i < n_hints; i++) {
+            if (hints[i] > (int32_t)start && (uint32_t)hints[i] < len &&
+                hints[i] >= (int32_t)DS4_Q4E_PAGE_TOKENS) {
+                g->hint_pos[g->n_hints++] = hints[i];
+            }
+        }
 
         for (uint32_t pos = start; pos < len; ) {
             /* Chunk to the next admission position, so a checkpoint can be
@@ -69994,7 +70044,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 /* Only the prompt's own end has logits worth keeping; and a
                  * stop that is only a chunk boundary must not evict a better
                  * checkpoint to get a slot. */
-                const bool chunk_only = pos != len && (int32_t)pos != g->hint_pos &&
+                const bool chunk_only = pos != len && !q4e_is_hint(g, pos) &&
                                         pos != g->matched_end;
                 if (q4e_cache_commit(s, prompt->v, pos, last, chunk_only) != 0) {
                     snprintf(err, errlen, "qwen4exp cache commit failed at %u", pos);
@@ -70004,7 +70054,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
         }
-        g->hint_pos = -1;
+        g->n_hints = 0;
         s->checkpoint.len = 0;
         for (int i = 0; i < prompt->len; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
         s->checkpoint_valid = true;
@@ -71082,12 +71132,19 @@ bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out) {
     return false;
 }
 
-void ds4_session_set_cache_boundary_hint(ds4_session *s, int position) {
+void ds4_session_set_cache_boundary_hints(ds4_session *s, const int *positions,
+                                          int count) {
     if (!s) return;
 #ifndef DS4_NO_GPU
-    if (ds4_model_is_qwen4exp()) s->q4e_graph.hint_pos = position;
+    if (!ds4_model_is_qwen4exp()) return;
+    ds4_q4e_graph *g = &s->q4e_graph;
+    g->n_hints = 0;
+    for (int i = 0; i < count && positions && g->n_hints < DS4_CACHE_HINTS_MAX; i++) {
+        if (positions[i] > 0) g->hint_pos[g->n_hints++] = positions[i];
+    }
 #else
-    (void)position;
+    (void)positions;
+    (void)count;
 #endif
 }
 

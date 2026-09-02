@@ -12888,15 +12888,22 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
-    /* The boundary this client will branch from next turn.  A recurrent family
-     * puts a checkpoint there, which is what makes the follow-up turn prefill
-     * only its own suffix; the disk cache uses the same position (gated by its
-     * minimum size) for its cold checkpoint. */
-    ds4_session_set_cache_boundary_hint(
-        slot->session,
+    /* The boundaries this client may branch from next turn.  A recurrent
+     * family puts a checkpoint at each: the end of the rendered scaffolding
+     * (the disk cache uses the same position, gated by its minimum size, for
+     * its cold checkpoint), the start of the current task turn -- where a
+     * second conversation sharing this system prompt and these tools rejoins
+     * -- and the trailing generation header, where this conversation's own
+     * follow-up rejoins once the client re-renders the answer. */
+    const int hints[] = {
         ds4_kvstore_chat_boundary_pos(prompt_for_sync,
                                       ds4_token_user(s->engine),
-                                      ds4_token_assistant(s->engine)));
+                                      ds4_token_assistant(s->engine)),
+        ds4_kvstore_last_marker_pos(prompt_for_sync, ds4_token_user(s->engine)),
+        ds4_kvstore_last_marker_pos(prompt_for_sync, ds4_token_assistant(s->engine)),
+    };
+    ds4_session_set_cache_boundary_hints(slot->session, hints,
+                                         (int)(sizeof(hints) / sizeof(hints[0])));
 
     int cold_store_len = 0;
     if (!multimodal && cached == 0 &&

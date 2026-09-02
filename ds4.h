@@ -515,12 +515,16 @@ typedef struct {
 } ds4_session_path_info;
 bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out);
 
-/* The position a client will branch from on its next turn -- the end of the
- * rendered chat scaffolding, which the server already computes.  qwen4exp
- * places a recurrent checkpoint there, so the next turn prefills only its own
- * suffix.  -1 (the default) means the caller has no boundary to offer; the
- * hint applies to the next sync only. */
-void ds4_session_set_cache_boundary_hint(ds4_session *s, int position);
+/* The positions a client may branch from on its next turn: the end of the
+ * rendered chat scaffolding (shared by every conversation with the same system
+ * prompt and tools) and the start of the last assistant turn (where a
+ * re-rendered answer rejoins).  Both are positions the server already
+ * computes.  qwen4exp places a recurrent checkpoint at each, so the next turn
+ * prefills only its own suffix.  At most DS4_CACHE_HINTS_MAX are kept, and
+ * they apply to the next sync only. */
+#define DS4_CACHE_HINTS_MAX 4
+void ds4_session_set_cache_boundary_hints(ds4_session *s, const int *positions,
+                                          int count);
 
 /* The request is over: checkpoint the frontier so a continuation, or the same
  * conversation's next turn after another one has run, resumes here. */
