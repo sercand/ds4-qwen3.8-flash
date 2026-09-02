@@ -950,6 +950,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const ds4_session_payload_file *pre_staged,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
@@ -1025,9 +1026,14 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return true;
     }
 
+    /* The caller may have staged the payload already, to keep the graph's
+     * reader and this file's writer under different locks; then this is a
+     * borrowed view and the caller frees it. */
     ds4_session_payload_file staged = {0};
-    if (ds4_session_stage_payload(session, &staged,
-                                  save_err, sizeof(save_err)) != 0) {
+    const bool staged_by_caller = pre_staged != NULL;
+    if (staged_by_caller) staged = *pre_staged;
+    else if (ds4_session_stage_payload(session, &staged,
+                                       save_err, sizeof(save_err)) != 0) {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache skipped tokens=%d reason=%s because KV payload staging failed: %s",
                 kv_log_name(kc),
@@ -1055,7 +1061,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)est_file_bytes / (1024.0 * 1024.0),
                 (double)est_required_bytes / (1024.0 * 1024.0),
                 (double)kc->budget_bytes / (1024.0 * 1024.0));
-        ds4_session_payload_file_free(&staged);
+        if (!staged_by_caller) ds4_session_payload_file_free(&staged);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -1082,7 +1088,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 "%s: kv cache failed to create %s: %s save=%.1f ms",
                 kv_log_name(kc), tmp, strerror(errno),
                 (kv_now_sec() - save_t0) * 1000.0);
-        ds4_session_payload_file_free(&staged);
+        if (!staged_by_caller) ds4_session_payload_file_free(&staged);
         free(tmp);
         free(text);
         free(path);
@@ -1167,7 +1173,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                 (double)(DS4_KVSTORE_FIXED_HEADER + 4ull + text_len + payload_bytes + trailer_bytes) / (1024.0 * 1024.0),
                 save_ms);
     }
-    ds4_session_payload_file_free(&staged);
+    if (!staged_by_caller) ds4_session_payload_file_free(&staged);
     free(tmp);
     free(text);
     free(path);
@@ -1186,7 +1192,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                              NULL, hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,

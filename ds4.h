@@ -240,8 +240,14 @@ typedef struct {
     uint64_t cap;
 } ds4_session_snapshot;
 
+/* A session payload taken out of the graph and held until the store writes
+ * it: either a temporary file (`path`) or a host buffer (`mem`), never both.
+ * Staging exists so the caller can release its exclusive hold on the model as
+ * soon as the graph has been read, and let the file write run on its own
+ * time -- see ds4_session_stage_payload. */
 typedef struct {
     char *path;
+    uint8_t *mem;
     uint64_t bytes;
 } ds4_session_payload_file;
 
@@ -495,6 +501,7 @@ typedef enum {
     DS4_REUSE_LIVE,         /* the live checkpoint, which the prompt extends */
     DS4_REUSE_CHECKPOINT,   /* a checkpoint below the frontier of this path */
     DS4_REUSE_TREE,         /* a checkpoint on another path of the prefix tree */
+    DS4_REUSE_DISK,         /* a path the disk tier read back into the tree */
 } ds4_reuse_source;
 
 typedef struct {
@@ -708,13 +715,13 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u
 
-/* False when this model family has no payload writer of its own and must not
- * be handed to the disk KV store: the payload layer would otherwise serialize
- * a graph the file's header does not describe.  Callers behave as if no disk
- * checkpoint could ever exist. */
-bool ds4_engine_supports_session_payload(ds4_engine *e);
-
 uint64_t ds4_session_payload_bytes(ds4_session *s);
+/* True when ds4_session_stage_payload keeps the payload in host memory, and
+ * the caller should therefore stage it itself -- under whatever lock the graph
+ * needs -- before asking the disk store to write it.  It is set for the family
+ * whose payload is hundreds of megabytes, where holding the model across the
+ * file write would stall every other session for the length of the write. */
+bool ds4_engine_stages_session_payload(ds4_engine *e);
 int ds4_session_stage_payload(ds4_session *s, ds4_session_payload_file *out,
                               char *err, size_t errlen);
 int ds4_session_write_staged_payload(const ds4_session_payload_file *payload,
