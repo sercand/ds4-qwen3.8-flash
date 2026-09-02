@@ -730,6 +730,17 @@ int ds4_kvstore_chat_boundary_pos(const ds4_tokens *prompt,
  * assistant marker: in a generation prompt that is the trailing generation
  * header, which is where this conversation's own next turn rejoins once the
  * client re-renders the answer. */
+int ds4_kvstore_prev_marker_pos(const ds4_tokens *prompt, int token_id) {
+    if (!prompt || token_id < 0) return -1;
+    int last = -1, prev = -1;
+    for (int i = 0; i < prompt->len; i++) {
+        if (prompt->v[i] != token_id) continue;
+        prev = last;
+        last = i;
+    }
+    return prev;
+}
+
 int ds4_kvstore_last_marker_pos(const ds4_tokens *prompt, int token_id) {
     if (!prompt || token_id < 0) return -1;
     int last = -1;
@@ -951,9 +962,11 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
                                         const ds4_session_payload_file *pre_staged,
+                                        bool *wrote_file,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
+    if (wrote_file) *wrote_file = false;
     if (!kc->enabled) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
     const int original_len = tokens->len;
@@ -1019,7 +1032,15 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
                                      quant_bits, ds4_session_ctx(session))) {
+        /* The file is already there and describes this prompt: the trailer is
+         * refreshed and the caller is told the store succeeded, but
+         * `wrote_file` stays false -- nothing reached the disk.  Said out loud
+         * because a caller that pre-staged its payload paid for it and gets
+         * nothing, which is worth seeing in a log. */
         kv_cache_rewrite_trailer(kc, path, text, hooks);
+        kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                "%s: kv cache kept tokens=%d reason=%s because a compatible file is already stored",
+                kv_log_name(kc), store_tokens.len, reason);
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
@@ -1163,6 +1184,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         }
         unlink(tmp);
     } else {
+        if (wrote_file) *wrote_file = true;
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
                 "%s: kv cache stored tokens=%d trimmed=%d reason=%s key=%s size=%.2f MiB save=%.1f ms",
                 kv_log_name(kc),
@@ -1192,7 +1214,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              NULL, hooks, err, err_len);
+                                              NULL, NULL, hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,

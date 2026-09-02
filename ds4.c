@@ -67118,7 +67118,9 @@ static bool q4e_alloc(ds4_gpu_tensor **dst, uint64_t bytes) {
  *   per recurrent layer: f32 conv window, then f32 state matrix
  *   f32 x h[15]                    the PLE block's dilated conv window
  *   f32 x h[16]                    the draft head's pending residual row
- *                                  (only when h[11], i.e. there is a head)
+ *                                  (present iff the writer had a draft head,
+ *                                   which h[11] records and the reader has
+ *                                   already required to match its own)
  *   per logical page, in order:    that page across every KV buffer
  *
  * The state section is exactly what one checkpoint slot holds (q4e_ckpt),
@@ -67185,6 +67187,25 @@ static uint64_t q4e_payload_bytes(ds4_session *s) {
            (uint64_t)q4e_pages_for(g->pos) * g->cache->page_bytes;
 }
 
+/* Skip a run of the payload instead of reading it.  The pages below the tree
+ * match are already in the pool, so their bytes in the file are dead weight --
+ * 594 MiB at a 22k path that shares 20k tokens with a resident conversation.
+ * A cache file and an fmemopen buffer are both seekable; a stream that is not
+ * falls back to reading the bytes away. */
+static int q4e_payload_skip(FILE *fp, uint64_t bytes, uint8_t *buf, size_t cap,
+                            uint64_t *remaining, char *err, size_t errlen) {
+    if (bytes == 0u) return 0;
+    if (remaining && *remaining < bytes) {
+        payload_set_err(err, errlen, "truncated session payload");
+        return 1;
+    }
+    if (bytes <= (uint64_t)INT64_MAX && fseeko(fp, (off_t)bytes, SEEK_CUR) == 0) {
+        if (remaining) *remaining -= bytes;
+        return 0;
+    }
+    return payload_skip_bytes(fp, bytes, buf, cap, remaining, err, errlen);
+}
+
 static int q4e_payload_span(FILE *fp, ds4_gpu_tensor *t, uint64_t off,
                             uint64_t bytes, bool write, uint8_t *buf, size_t cap,
                             uint64_t *remaining, char *err, size_t errlen) {
@@ -67241,7 +67262,10 @@ static int q4e_payload_state(FILE *fp, ds4_q4e_graph *g, bool write,
     if (q4e_payload_span(fp, g->ple_conv, 0,
                          (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM * f,
                          write, buf, cap, remaining, err, errlen) != 0) return 1;
-    if (!g->pend_res) return 0;      /* no draft head: the section is absent */
+    /* Present iff this context has a draft head, which is the h[11] the
+     * reader has already required to match its own -- so writer and reader
+     * always agree on whether these bytes are there. */
+    if (!g->pend_res) return 0;
     return q4e_payload_span(fp, g->pend_res, 0, (uint64_t)Q4E_HC_DIM * f,
                             write, buf, cap, remaining, err, errlen);
 }
@@ -67306,55 +67330,67 @@ static int q4e_payload_save(ds4_session *s, FILE *fp, char *err, size_t errlen) 
 /* Refuse a file this build cannot restore, naming the field that disagrees:
  * a header describing another geometry means a stale cache directory or a
  * server started with different options, not a corrupt file, and the operator
- * wants to know which. */
+ * wants to know which.
+ *
+ * 2 = this build can never read the file, so the caller may discard it.
+ * 1 = it cannot read it *as configured*.  Two of the geometry bits are
+ * operator toggles -- the indexer (DS4_QWEN4EXP_QSA_INDEXER) and the draft
+ * head (--mtp-model) -- and one run without one of them must not delete every
+ * file the runs with it wrote.  The file name keys on the rendered text, not
+ * on the toggles, so one key legitimately means two payload shapes; whichever
+ * is current overwrites the other at the next store. */
 static int q4e_payload_check(const uint32_t *h, const ds4_session *s,
                              const ds4_q4e_graph *g, char *err, size_t errlen) {
     if (h[0] != Q4E_PAYLOAD_MAGIC || h[1] != Q4E_PAYLOAD_VERSION) {
         payload_set_err(err, errlen, "unsupported qwen4exp payload version");
-        return 1;
+        return 2;
     }
-    const struct { uint32_t got, want; const char *what; } f[] = {
+    const struct { uint32_t got, want; bool toggle; const char *what; } f[] = {
         /* One page across every KV buffer.  Checked directly as well as
          * through the five numbers it is derived from, so a change to
          * q4e_page_bytes that they do not capture cannot silently shift the
-         * page section's stride. */
-        { h[2],  (uint32_t)g->cache->page_bytes, "page bytes" },
-        { h[4],  DS4_Q4E_PAGE_TOKENS,           "page size" },
-        { h[6],  Q4E_KV_DIM,                    "KV width" },
-        { h[7],  (uint32_t)DS4_N_LAYER,         "layer count" },
-        { h[8],  q4e_payload_attn_layers(),     "attention layers" },
-        { h[9],  q4e_payload_gdn_layers(g),     "recurrent layers" },
-        { h[10], g->cache->idx_ready ? 1u : 0u, "indexer caches" },
-        { h[11], g->mtp_k_cache ? 1u : 0u,      "draft head" },
-        { h[12], (uint32_t)DS4_N_VOCAB,         "vocabulary" },
-        { h[13], (uint32_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN, "conv window" },
+         * page section's stride.  It moves with the two toggles, so a
+         * mismatch here is reported as one. */
+        { h[2],  (uint32_t)g->cache->page_bytes, true,  "page bytes" },
+        { h[4],  DS4_Q4E_PAGE_TOKENS,           false, "page size" },
+        { h[6],  Q4E_KV_DIM,                    false, "KV width" },
+        { h[7],  (uint32_t)DS4_N_LAYER,         false, "layer count" },
+        { h[8],  q4e_payload_attn_layers(),     false, "attention layers" },
+        { h[9],  q4e_payload_gdn_layers(g),     false, "recurrent layers" },
+        { h[10], g->cache->idx_ready ? 1u : 0u, true,  "indexer caches" },
+        { h[11], g->mtp_k_cache ? 1u : 0u,      true,  "draft head" },
+        { h[12], (uint32_t)DS4_N_VOCAB,         false, "vocabulary" },
+        { h[13], (uint32_t)(DS4_N_GDN_CONV - 1u) * Q4E_GDN_IN, false, "conv window" },
         { h[14], (uint32_t)DS4_N_GDN_VALUE_HEAD * (uint32_t)DS4_N_GDN_HEAD_DIM *
-                 (uint32_t)DS4_N_GDN_HEAD_DIM, "state matrix" },
-        { h[15], (uint32_t)Q4E_PLE_HIST * Q4E_HC_DIM, "PLE window" },
-        { h[16], Q4E_HC_DIM,                    "hyper-connection width" },
+                 (uint32_t)DS4_N_GDN_HEAD_DIM, false, "state matrix" },
+        { h[15], (uint32_t)Q4E_PLE_HIST * Q4E_HC_DIM, false, "PLE window" },
+        { h[16], Q4E_HC_DIM,                    false, "hyper-connection width" },
     };
     for (size_t i = 0; i < sizeof(f) / sizeof(f[0]); i++) {
         if (f[i].got == f[i].want) continue;
         if (errlen) {
-            snprintf(err, errlen, "qwen4exp payload %s is %u, this model has %u",
-                     f[i].what, f[i].got, f[i].want);
+            snprintf(err, errlen, "qwen4exp payload %s is %u, this %s has %u",
+                     f[i].what, f[i].got,
+                     f[i].toggle ? "server" : "model", f[i].want);
         }
-        return 1;
+        return f[i].toggle ? 1 : 2;
     }
-    /* One position of generation room, the same rule ds4_session_sync uses. */
+    /* One position of generation room, the same rule ds4_session_sync uses.
+     * A path longer than this context is not the file's fault -- a smaller
+     * --ctx can be raised again -- so 1, not 2. */
     if (h[3] == 0u || h[3] >= (uint32_t)s->ctx_size) {
         payload_set_err(err, errlen, "qwen4exp payload does not fit this context");
-        return 1;
+        return h[3] == 0u ? 2 : 1;
     }
     if (h[5] != q4e_pages_for(h[3])) {
         payload_set_err(err, errlen, "qwen4exp payload page count does not match its length");
-        return 1;
+        return 2;
     }
     /* The pending draft row describes a position inside the path; a file that
      * says otherwise would have the draft head write KV outside it. */
     if (h[17] && h[18] >= h[3]) {
         payload_set_err(err, errlen, "qwen4exp payload pending draft row is outside the path");
-        return 1;
+        return 2;
     }
     return 0;
 }
@@ -67391,25 +67427,18 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
          * must survive that. */
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 2;
     }
-    if (q4e_payload_check(h, s, g, err, errlen) != 0) return 2;
+    const int check = q4e_payload_check(h, s, g, err, errlen);
+    if (check != 0) return check;
 
     const uint32_t tokens = h[3];
     const uint32_t pages = h[5];
-    /* Let go of the current path before reserving: its pages go back to the
-     * pool, which is where the reserve draws from. */
-    q4e_graph_reset(g);
+    q4e_cache *c = g->cache;
+
+    /* The tokens come first, because where this path meets the tree decides
+     * which pages have to be read at all. */
     s->checkpoint.len = 0;
     s->checkpoint_valid = false;
     s->mtp_draft_valid = false;
-    if (q4e_kv_reserve(g, tokens) != 0) {
-        payload_set_err(err, errlen, "qwen4exp KV page pool cannot hold the payload");
-        return 1;
-    }
-    if (g->kv_table.len < pages) {
-        payload_set_err(err, errlen, "qwen4exp payload needs more pages than the pool gave");
-        return 1;
-    }
-
     for (uint32_t i = 0; i < tokens; i++) {
         uint32_t tok = 0;
         if (payload_read_u32(fp, &tok, &remaining, err, errlen) != 0) return 1;
@@ -67418,10 +67447,81 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
     if (payload_read_bytes(fp, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float),
                            &remaining, err, errlen) != 0) return 1;
 
+    /* Take the tree's pages for the prefix it already holds, and fresh ones
+     * only above that.  A restored path usually shares a long prefix with a
+     * resident conversation -- that is what the prefix cache is for -- and
+     * reserving the whole span first would hold every shared page twice and
+     * read it from disk for nothing: 78 pages, 594 MiB, at a 22k path sharing
+     * 20k tokens.  The split gives the commit below a node whose end is
+     * exactly the match, so it adopts that path and contributes only the span
+     * above it, as a prefill through a known prefix does. */
+    uint32_t matched = 0;
+    uint32_t own_from = 0;      /* the first logical page this context must read */
+    const double now = now_sec();
+    pthread_mutex_lock(&c->mu);
+    q4e_tree_node *at = q4e_tree_walk(&c->tree, s->checkpoint.v, tokens, &matched);
+    if (matched > 0u && at && at != c->tree.root && at->end > matched) {
+        at = q4e_tree_split(&c->tree, at, matched);
+    }
+    if (!at || at == c->tree.root || at->end != matched) { at = NULL; matched = 0u; }
+    /* Pin the target path before letting go of the one this context is on:
+     * the growth below can evict, and an unpinned node with no live holder is
+     * exactly what page pressure would drop (see q4e_cache_resume). */
+    if (at) q4e_tree_mark_live(at, NULL, +1);
+    q4e_ctx_detach_locked(g);
+    int rc = 0;
+    if (at) {
+        rc = q4e_page_table_from_path(&c->tree.pool, &g->kv_table, at, matched);
+        /* The page the match lands inside is shared and holds this path's tail
+         * too, so it is not adopted: it is taken fresh and read from the file
+         * like every page above it.  One page, against the copy the resume
+         * path would have made. */
+        own_from = matched >> DS4_Q4E_PAGE_SHIFT;
+        while (rc == 0 && g->kv_table.len > own_from) {
+            q4e_page_unref(&c->tree.pool, g->kv_table.map[--g->kv_table.len]);
+        }
+    }
+    if (rc == 0 && pages > g->kv_table.len) {
+        rc = q4e_cache_free_pages(c, pages - g->kv_table.len, now);
+    }
+    if (rc == 0) {
+        uint32_t first = 0, n_new = 0;
+        rc = q4e_page_table_grow(&c->tree.pool, &g->kv_table, tokens, &first, &n_new);
+    }
+    if (rc == 0) {
+        g->matched_end = matched;
+        if (at) {
+            g->node = at;               /* already pinned above */
+            at->hit = now;
+        } else {
+            /* Nothing shared: this context stands on the root, exactly as
+             * after q4e_graph_reset, and the commit hangs its span there. */
+            g->node = c->tree.root;
+            q4e_tree_mark_live(g->node, NULL, +1);
+        }
+    } else if (at) {
+        q4e_tree_mark_live(at, NULL, -1);
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (rc != 0 || g->kv_table.len < pages) {
+        payload_set_err(err, errlen, "qwen4exp KV page pool cannot hold the payload");
+        return 1;
+    }
+    if (g->kv_table.len &&
+        !ds4_gpu_tensor_write(g->kv_pages, 0, g->kv_table.map,
+                              (uint64_t)g->kv_table.len * sizeof(int32_t))) {
+        payload_set_err(err, errlen, "failed to install the qwen4exp page table");
+        return 1;
+    }
+
     uint8_t *buf = xmalloc(DS4_SESSION_IO_CHUNK);
-    int rc = q4e_payload_state(fp, g, false, buf, DS4_SESSION_IO_CHUNK,
-                               &remaining, err, errlen);
-    for (uint32_t lp = 0; rc == 0 && lp < pages; lp++) {
+    rc = q4e_payload_state(fp, g, false, buf, DS4_SESSION_IO_CHUNK,
+                           &remaining, err, errlen);
+    if (rc == 0 && own_from > 0u) {
+        rc = q4e_payload_skip(fp, (uint64_t)own_from * c->page_bytes, buf,
+                              DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
+    }
+    for (uint32_t lp = own_from; rc == 0 && lp < pages; lp++) {
         rc = q4e_payload_page(fp, g, g->kv_table.map[lp], false, buf,
                               DS4_SESSION_IO_CHUNK, &remaining, err, errlen);
     }
@@ -67435,6 +67535,11 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
         payload_set_err(err, errlen, "failed to synchronize accelerator after qwen4exp restore");
         return 1;
     }
+    if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+        fprintf(stderr, "q4e disk: restored %u tokens, %u of %u pages adopted from "
+                        "the tree at %u, %u read\n",
+                tokens, own_from, pages, matched, pages - own_from);
+    }
 
     g->pos = tokens;
     g->pend_valid = false;
@@ -67444,18 +67549,6 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
         g->pend_pos0 = h[18];
     }
     s->checkpoint_valid = true;
-    /* Where the restored path meets what the tree already holds.  The commit
-     * needs it: without it, it would try to hang a second child carrying the
-     * same first token under the root, which q4e_tree_add refuses -- and on a
-     * server whose tree already has one conversation, that is every chat
-     * prompt.  With it the commit splits and adopts the shared path up to
-     * this position and contributes only the span above it, exactly as a
-     * cold prefill through a known prefix does. */
-    pthread_mutex_lock(&g->cache->mu);
-    uint32_t matched = 0;
-    (void)q4e_tree_walk(&g->cache->tree, s->checkpoint.v, tokens, &matched);
-    g->matched_end = matched;
-    pthread_mutex_unlock(&g->cache->mu);
     /* Admission: the path's end, with its logits.  This is what makes the
      * disk read a one-off -- from here the tree owns the span and the
      * checkpoint -- and a commit that cannot join costs reuse, not

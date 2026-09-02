@@ -141,6 +141,11 @@ int ds4_kvstore_chat_boundary_pos(const ds4_tokens *prompt,
                                   int user_token_id,
                                   int assistant_token_id);
 int ds4_kvstore_last_marker_pos(const ds4_tokens *prompt, int token_id);
+/* The marker before the last one.  A template whose turns all start with the
+ * same token has no role markers to tell apart, so the position a *different*
+ * conversation branches from is the start of the last turn before the
+ * generation header -- which is the second-to-last marker. */
+int ds4_kvstore_prev_marker_pos(const ds4_tokens *prompt, int token_id);
 int ds4_kvstore_chat_anchor_pos(const ds4_kvstore *kc,
                                 const ds4_tokens *prompt,
                                 int user_token_id,
@@ -170,7 +175,9 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
 
 /* `pre_staged` is a payload the caller already took out of the graph (see
  * ds4_session_stage_payload); NULL means this call stages it.  The caller
- * owns and frees what it passes. */
+ * owns and frees what it passes.  `*wrote_file` (optional) says whether a file
+ * actually reached the disk: the return value is true for a compatible file
+ * that was already there, which is a hit for the caller but not a write. */
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -181,6 +188,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
                                         const ds4_session_payload_file *pre_staged,
+                                        bool *wrote_file,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len);
