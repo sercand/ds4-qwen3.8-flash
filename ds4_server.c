@@ -9642,6 +9642,12 @@ struct server_slot {
     bool busy;
     bool prefill_waiting;
     bool decode_waiting;
+    /* Set from dispatch until this context's first grant of the model (or the
+     * job's end).  A running prefill yields to it: the setup a request does
+     * before its first grant -- the reuse report, the checkpoint resume -- is
+     * milliseconds, and making it wait a quantum each is most of a short
+     * request's first-token latency. */
+    bool awaiting_first_grant;
 
     bool decode_pending;
     bool decode_in_flight;
@@ -9685,6 +9691,9 @@ struct server {
     int decode_waiting;
     int active_generations;
     int decodes_since_prefill;
+    /* Threads inside or waiting for a short unscheduled engine call
+     * (server_inference_lock).  A prefill quantum yields to them. */
+    int engine_waiting;
     int mixed_prefill_quantum;
     int last_prefill_slot;
     int last_decode_slot;
@@ -9709,12 +9718,35 @@ struct server {
     int cache_log_every;
 };
 
+/* Short, unscheduled engine calls: the prompt-prefix probes, the reuse
+ * report, a rewind or a rewrite, the disk store, the sequence-end checkpoint
+ * commit, the /cache report.  Each is microseconds of host work or one device
+ * copy, so they get no turn in the executor's round -- but the executor has
+ * to know one is waiting, because the prefilling context re-acquires
+ * inference_mu the instant it releases it and would win that race every time.
+ * It did: a short chat's reuse report waited 49 s behind a 21.7k prefill, and
+ * the prefill quantum was doing exactly what it was told.
+ *
+ * So the counter, not a turn: a prefill quantum will not start while it is
+ * non-zero (server_model_enter_prefill).  A decode step does not check it --
+ * one step is tens of milliseconds, which is not worth a hand-off. */
 static void server_inference_lock(server *s) {
+    if (s->multi_ctx_mode) {
+        pthread_mutex_lock(&s->model_mu);
+        s->engine_waiting++;
+        pthread_cond_broadcast(&s->model_cv);
+        pthread_mutex_unlock(&s->model_mu);
+    }
     pthread_mutex_lock(&s->inference_mu);
 }
 
 static void server_inference_unlock(server *s) {
     pthread_mutex_unlock(&s->inference_mu);
+    if (!s->multi_ctx_mode) return;
+    pthread_mutex_lock(&s->model_mu);
+    if (s->engine_waiting > 0) s->engine_waiting--;
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
 }
 
 /* Jobs are stack-owned by the client thread.  A resident-slot worker signals
@@ -10739,7 +10771,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
     if (!s || !slot) return false;
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     pthread_mutex_lock(&s->kv_mu);
     bool ok = ds4_kvstore_store_live_prefix_text(&s->kv, s->engine,
                                                   slot->session,
@@ -10749,7 +10781,7 @@ static bool kv_cache_store_live_prefix_text(server *s, server_slot *slot,
                                                   cache_text_key,
                                                   &hooks, err, sizeof(err));
     pthread_mutex_unlock(&s->kv_mu);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
     return ok;
 }
 
@@ -10861,9 +10893,9 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     ds4_session_invalidate(slot->session);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
 }
 
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
@@ -10897,13 +10929,13 @@ static int kv_cache_try_load_text(server *s, server_slot *slot,
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     pthread_mutex_lock(&s->kv_mu);
     int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, slot->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     pthread_mutex_unlock(&s->kv_mu);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
@@ -10956,12 +10988,12 @@ static void server_cache_report_get(server *s, server_cache_report *out) {
     /* The families that report a reuse tier at all (qwen4exp) keep one cache
      * shared by every session, so slot 0's numbers are the engine's; the rest
      * report zeros. */
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     if (s->slot_count > 0) {
         ds4_session_cache_stats_get(s->slots[0].session, &out->engine);
         ds4_session_cache_path(s->slots[0].session, &out->path);
     }
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
 }
 
 static double server_cache_hit_rate(const server_cache_report *rep) {
@@ -11847,6 +11879,23 @@ static int server_next_decode_slot_locked(const server *s) {
     return -1;
 }
 
+/* model_mu held: is another context still doing the setup before its first
+ * grant?  A prefill quantum waits for it, because that setup is short and it
+ * is what stands between a new request and its first token.  Contexts already
+ * queued for a turn do not count -- they are the round-robin's business, and
+ * counting them would let two fresh requests block each other. */
+static bool server_startup_pending_locked(const server *s, int except_id) {
+    for (int i = 0; i < s->slot_count; i++) {
+        if (i == except_id) continue;
+        const server_slot *slot = &s->slots[i];
+        if (slot->awaiting_first_grant && !slot->prefill_waiting &&
+            !slot->decode_waiting) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* model_mu held: may a prefill quantum go before the decode steps that are
  * queued?  Only when none is queued -- which is also what keeps the GPU busy
  * while a generator does its host-side work, and what stops a generator that
@@ -11872,7 +11921,8 @@ static bool server_model_enter_prefill(server *s, server_slot *slot) {
     slot->prefill_waiting = true;
     pthread_cond_broadcast(&s->model_cv);
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
-           (s->model_busy || s->decode_pending > 0 ||
+           (s->model_busy || s->decode_pending > 0 || s->engine_waiting > 0 ||
+            server_startup_pending_locked(s, slot->id) ||
             !server_prefill_before_decode_locked(s) ||
             server_next_prefill_slot_locked(s) != slot->id)) {
         pthread_cond_wait(&s->model_cv, &s->model_mu);
@@ -11884,6 +11934,7 @@ static bool server_model_enter_prefill(server *s, server_slot *slot) {
         return false;
     }
     slot->prefill_waiting = false;
+    slot->awaiting_first_grant = false;
     s->last_prefill_slot = slot->id;
     s->decodes_since_prefill = 0;      /* this quantum closes the round */
     s->model_busy = true;
@@ -11919,6 +11970,7 @@ static bool server_model_enter_decode(server *s, server_slot *slot) {
         pthread_mutex_unlock(&s->model_mu);
         return false;
     }
+    slot->awaiting_first_grant = false;
     s->last_decode_slot = slot->id;
     s->decodes_since_prefill++;
     s->model_busy = true;
@@ -12012,12 +12064,12 @@ static int server_session_sync(server *s, server_slot *slot,
         return rc;
     }
 
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     /* The live checkpoint when the prompt extends it, or a state snapshot the
      * backend kept at the end of the previous prompt; the chunks start there
      * so a chunk shorter than the snapshot does not discard it. */
     int done = ds4_session_reusable_prefix(slot->session, prompt);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
     bool called = false;
 
     while (!g_stop_requested && !slot_job_cancelled(slot) &&
@@ -12456,11 +12508,11 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
 
     char err[160] = {0};
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     ds4_session_rewrite_result rr =
         ds4_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
     if (rr == DS4_SESSION_REWRITE_OK) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: tool checkpoint canonicalized ctx=%s common=%d live=%d canonical=%d",
@@ -12479,9 +12531,9 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                             rendered.ptr ? rendered.ptr : "",
                                             &effective, &path, NULL, false);
         if (loaded == 0) {
-            pthread_mutex_lock(&s->inference_mu);
+            server_inference_lock(s);
             ds4_session_invalidate(slot->session);
-            pthread_mutex_unlock(&s->inference_mu);
+            server_inference_unlock(s);
         }
 
         char sync_err[160] = {0};
@@ -12639,9 +12691,9 @@ static int server_eval_token(server *s, server_slot *slot, int token,
                                                            "client disconnected");
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         int rc = ds4_session_eval(slot->session, token, err, errlen);
-        pthread_mutex_unlock(&s->inference_mu);
+        server_inference_unlock(s);
         return rc;
     }
 
@@ -12762,10 +12814,10 @@ static void *decode_worker_main(void *arg) {
 
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         int rc = ds4_sessions_eval_batch(items, count,
                                          batch_err, sizeof(batch_err));
-        pthread_mutex_unlock(&s->inference_mu);
+        server_inference_unlock(s);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s",
@@ -12817,9 +12869,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     err[0] = '\0';
     const bool multimodal = j->req.image_count != 0;
     if (multimodal) {
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         ds4_session_invalidate(slot->session);
-        pthread_mutex_unlock(&s->inference_mu);
+        server_inference_unlock(s);
         request_live_state_clear(s, slot);
     }
     const int old_pos = ds4_session_pos(slot->session);
@@ -12897,9 +12949,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_engine_is_glm_dsa(s->engine), old_pos,
             j->req.prompt.len, common);
         if (rewind_to >= 0) {
-            pthread_mutex_lock(&s->inference_mu);
+            server_inference_lock(s);
             ds4_session_rewind(slot->session, rewind_to);
-            pthread_mutex_unlock(&s->inference_mu);
+            server_inference_unlock(s);
             cached = rewind_to;
             cache_source = "memory-rewind";
             cache_diag.rewind_to = rewind_to;
@@ -12941,9 +12993,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * a cold prefill while the engine went on to restore a snapshot. */
     ds4_session_reuse reuse = {0};
     if (cached == 0) {
-        pthread_mutex_lock(&s->inference_mu);
+        server_inference_lock(s);
         ds4_session_reuse_report(slot->session, prompt_for_sync, &reuse);
-        pthread_mutex_unlock(&s->inference_mu);
+        server_inference_unlock(s);
         if (reuse.reused_tokens > 0) {
             cached = reuse.reused_tokens;
             cache_source = cache_source_for_reuse(reuse.source);
@@ -13573,9 +13625,9 @@ decode_again:
                 finish = "stop";
                 text.len = stop_pos;
                 text.ptr[text.len] = '\0';
-                pthread_mutex_lock(&s->inference_mu);
+                server_inference_lock(s);
                 ds4_session_invalidate(slot->session);
-                pthread_mutex_unlock(&s->inference_mu);
+                server_inference_unlock(s);
                 stop_decode = true;
                 break;
             }
@@ -14071,12 +14123,15 @@ static void generate_job(server *s, server_slot *slot, job *j) {
      * this conversation's next turn resumes here even after another one has
      * used the context in between.  It copies 113 MB on the device, so it goes
      * under inference_mu like every other engine call. */
-    pthread_mutex_lock(&s->inference_mu);
+    server_inference_lock(s);
     ds4_session_cache_commit(slot->session);
-    pthread_mutex_unlock(&s->inference_mu);
+    server_inference_unlock(s);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
+    /* A request that never got a grant -- a 409, an early error -- must not
+     * leave a prefill quantum waiting for it. */
+    slot->awaiting_first_grant = false;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
 }
@@ -14202,6 +14257,10 @@ static void dispatch_jobs_locked(server *s) {
         chosen_slot->assigned = chosen;
         chosen_slot->work = chosen;
         chosen_slot->busy = true;
+        pthread_mutex_lock(&s->model_mu);
+        chosen_slot->awaiting_first_grant = true;
+        pthread_cond_broadcast(&s->model_cv);
+        pthread_mutex_unlock(&s->model_mu);
         pthread_cond_broadcast(&s->cv);
     }
 }
