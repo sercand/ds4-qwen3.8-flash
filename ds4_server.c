@@ -13880,8 +13880,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     ds4_session_set_cancel(slot->session, NULL, NULL);
     /* The sequence is over: let a recurrent family checkpoint the frontier, so
      * this conversation's next turn resumes here even after another one has
-     * used the context in between. */
+     * used the context in between.  It copies 113 MB on the device, so it goes
+     * under inference_mu like every other engine call. */
+    pthread_mutex_lock(&s->inference_mu);
     ds4_session_cache_commit(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
 
     pthread_mutex_lock(&s->model_mu);
     if (slot->running == j) slot->running = NULL;
@@ -14640,6 +14643,10 @@ static server_config parse_options(int argc, char **argv) {
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            /* One resident session, plus room for a second execution context
+             * once the executor drives one.  The engine's own ceiling is
+             * higher because the CLI and the tests hold two sessions. */
+            .exec_contexts = DS4_EXEC_CONTEXTS_DEFAULT,
         },
         .host = "127.0.0.1",
         .port = 8000,
@@ -14794,6 +14801,7 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--ssm-checkpoints")) {
             c.engine.ssm_checkpoints =
                 (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+            c.engine.ssm_checkpoints_set = true;
         } else if (!strcmp(arg, "--exec-contexts")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {

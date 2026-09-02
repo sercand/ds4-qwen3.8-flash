@@ -161,12 +161,16 @@ typedef struct {
      * budget from the context -- four resident conversations, capped at
      * 600000 positions (18 GB). */
     uint32_t kv_pool_tokens;
-    /* qwen4exp only: GDN checkpoints the prefix cache may hold, 113 MB each
-     * (0 picks the default, 40).  A checkpoint is what lets a request resume
-     * in the middle of a token sequence instead of prefilling it again. */
+    /* qwen4exp only: GDN checkpoints the prefix cache may hold, 113 MB each.
+     * A checkpoint is what lets a request resume in the middle of a token
+     * sequence instead of prefilling it again.  Read only when
+     * ssm_checkpoints_set, so 0 means "hold none" rather than "use the
+     * default"; unset derives a budget from the memory left after the model. */
     uint32_t ssm_checkpoints;
     /* qwen4exp only: execution contexts, each a live recurrent state and page
-     * table over the shared pool (0 picks the default, 2). */
+     * table over the shared pool.  0 allows DS4_EXEC_CONTEXTS_MAX, which is
+     * what the CLI and the tests need (they hold two sessions); the server
+     * asks for DS4_EXEC_CONTEXTS_DEFAULT. */
     uint32_t exec_contexts;
     bool warm_weights;
     bool quality;
@@ -180,6 +184,7 @@ typedef struct {
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
+    bool ssm_checkpoints_set;      /* qwen4exp: ssm_checkpoints was given, 0 included */
     bool inspect_only;
     /* Multi-GPU placement uses this to price per-layer KV storage. */
     int placement_ctx_hint;
@@ -523,6 +528,10 @@ bool ds4_session_cache_path(ds4_session *s, ds4_session_path_info *out);
  * prefills only its own suffix.  At most DS4_CACHE_HINTS_MAX are kept, and
  * they apply to the next sync only. */
 #define DS4_CACHE_HINTS_MAX 4
+/* qwen4exp execution contexts: the engine's ceiling, and what a server asks
+ * for when --exec-contexts is not given. */
+#define DS4_EXEC_CONTEXTS_MAX 8
+#define DS4_EXEC_CONTEXTS_DEFAULT 2
 void ds4_session_set_cache_boundary_hints(ds4_session *s, const int *positions,
                                           int count);
 

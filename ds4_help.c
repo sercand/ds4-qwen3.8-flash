@@ -178,8 +178,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N", "Graph prefill chunk size. Default: CUDA TP 2048; PRO long prompts 8192; others 4096.");
     if (tool == DS4_HELP_SERVER) {
-        opt(fp, c, "--kv-pool-tokens N", "Qwen3.8-Flash-Next: token positions in the shared paged KV pool, never below --ctx. Default: 4x--ctx, capped at 600000 (18 GB)");
-        opt(fp, c, "--ssm-checkpoints N", "Qwen3.8-Flash-Next: recurrent-state checkpoints the prefix cache may hold, 113 MB each. Default: 40");
+        opt(fp, c, "--kv-pool-tokens N", "Qwen3.8-Flash-Next: token positions in the shared paged KV pool, never below --ctx. Default: derived from free memory, at most 4x--ctx and 600000 (18 GB)");
+        opt(fp, c, "--ssm-checkpoints N", "Qwen3.8-Flash-Next: recurrent-state checkpoints the prefix cache may hold, 113 MB each; 0 holds none. Default: derived from free memory, at most 40");
         opt(fp, c, "--exec-contexts N", "Qwen3.8-Flash-Next: execution contexts sharing the KV pool, each a live recurrent state. Default: 2");
     }
     if (full) {
