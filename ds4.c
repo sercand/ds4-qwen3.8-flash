@@ -55473,6 +55473,14 @@ struct ds4_q4e_graph {
     uint32_t ctx_size;
     uint32_t tok_cap;
     uint32_t pos;              /* next position to write */
+    /* The position whose next-token distribution s->logits holds, or 0 for
+     * none.  A prefill chunk that is not the last runs no vocabulary head, so
+     * s->logits still holds whatever ran last -- another request's final row,
+     * if this context served one before.  Only logits_pos == pos means
+     * s->logits describes this frontier, which is what a checkpoint may be
+     * admitted with (q4e_cache_commit's with_logits) and what lets a resume
+     * answer at the prompt's end without running anything. */
+    uint32_t logits_pos;
     bool     ready;
 
     /* Persistent recurrent state.  The gated DeltaNet layers carry a conv
@@ -66950,6 +66958,7 @@ static void q4e_graph_reset(ds4_q4e_graph *g) {
         ds4_gpu_tensor_fill_f32(g->ple_conv, 0.0f, (uint64_t)Q4E_PLE_HIST * Q4E_HC_DIM);
     }
     g->pos = 0;
+    g->logits_pos = 0;
     g->pend_valid = false;
     /* The prefill that follows starts from position 0, so this context lets
      * go of its path entirely and stands on the root again.  The tree keeps
@@ -66993,8 +67002,12 @@ static void q4e_plan_locked(ds4_session *s, const ds4_tokens *prompt, q4e_plan *
     memset(out, 0, sizeof(*out));
     out->ckpt = -1;
     out->source = DS4_REUSE_COLD;
+    /* Standing exactly on the prompt means answering from the frontier's
+     * logits, and a cancelled prefill leaves a frontier without them (see
+     * ds4_session_cache_commit); extending the frontier does not care. */
     if (s->checkpoint_valid && (uint32_t)s->checkpoint.len == g->pos &&
-        ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+        ds4_tokens_starts_with(prompt, &s->checkpoint) &&
+        (g->pos < (uint32_t)prompt->len || g->logits_pos == g->pos)) {
         out->live = true;
         out->live_pos = g->pos;
     }
@@ -67112,6 +67125,7 @@ static int q4e_cache_resume(ds4_session *s, const ds4_tokens *prompt) {
         !ds4_gpu_tensor_write(g->kv_pages, 0, g->kv_table.map,
                               (uint64_t)g->kv_table.len * sizeof(int32_t))) return 1;
     g->pos = cpos;
+    g->logits_pos = k_logits ? cpos : 0;
     s->checkpoint.len = 0;
     for (uint32_t i = 0; i < cpos; i++) token_vec_push(&s->checkpoint, prompt->v[i]);
     g->pend_valid = false;
@@ -67758,6 +67772,7 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
     }
 
     g->pos = tokens;
+    g->logits_pos = tokens;      /* the file carried the path's final row */
     g->pend_valid = false;
     if (g->mtp_ready && h[17]) {
         g->pend_valid = true;
@@ -68064,6 +68079,7 @@ static void q4e_scratch_bind(ds4_q4e_graph *g, const ds4_q4e_graph *sc) {
     g->ctx_slot = -1;
     /* Per-request and per-generation state, host scratch, counters. */
     g->pos = 0;
+    g->logits_pos = 0;
     g->ready = false;
     g->qsa_sparse = false;
     g->is_draft = false;
@@ -68821,6 +68837,10 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
      * only the accepted prefix survives, in pages this sequence owns alone. */
     if (q4e_kv_reserve(g, pos0 + n_tok) != 0) return 1;
 
+    /* Whatever s->logits held describes a position this pass is about to
+     * leave behind; only the single-row read below puts a row back in it. */
+    g->logits_pos = 0;
+
     g_q4e_trace_ntok = n_tok;
     int32_t *ids = xmalloc((size_t)n_tok * sizeof(int32_t));
     int32_t *pos = xmalloc((size_t)n_tok * sizeof(int32_t));
@@ -68915,6 +68935,7 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
         if (!ds4_gpu_synchronize()) return 1;
         if (!ds4_gpu_tensor_read(g->logits, 0, s->logits,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float))) return 1;
+        g->logits_pos = pos0 + n_tok;
     } else {
         /* The verify batch: only the greedy pick of every row comes back now;
          * q4e_spec_step copies the one row it commits. */
@@ -69395,6 +69416,8 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         ds4_session_invalidate(s);
         return -1;
     }
+    /* K = 0 read its one row inside q4e_forward, which already recorded it. */
+    g->logits_pos = g->pos;
 
     /* The committed rows' residuals wait for the next step, whose sampled
      * token completes the last one -- and the shared scratch they are in is
@@ -72507,10 +72530,20 @@ void ds4_session_cache_commit(ds4_session *s) {
     if (!ds4_model_is_qwen4exp() || !s->checkpoint_valid) return;
     ds4_q4e_graph *g = &s->q4e_graph;
     if (!g->ready || (uint32_t)s->checkpoint.len != g->pos) return;
-    /* s->logits still holds the distribution after the last committed token,
-     * so this checkpoint can answer an exact re-send of prompt-plus-answer
-     * without running anything. */
-    (void)q4e_cache_commit(s, s->checkpoint.v, g->pos, true, false);
+    /* With the frontier's own logits this checkpoint answers an exact re-send
+     * of prompt-plus-answer without running anything.  Without them it is
+     * still worth admitting for its state -- but it must say so: this is also
+     * the cancellation path, and a request killed inside a prefill chunk that
+     * produced no logit row leaves the *previous* request's final row in
+     * s->logits.  Admitting that as this position's distribution would answer
+     * a later exact re-send from another conversation's row. */
+    const bool with_logits = g->logits_pos == g->pos;
+    if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+        fprintf(stderr, "q4e cache: sequence-end commit at %u %s\n", g->pos,
+                with_logits ? "with its logits"
+                            : "without logits (this frontier has none)");
+    }
+    (void)q4e_cache_commit(s, s->checkpoint.v, g->pos, with_logits, false);
 #endif
 }
 
