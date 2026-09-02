@@ -4,6 +4,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+/* qwen4exp paged-KV geometry, shared with the kernels. */
+#include "ds4_q4e_page.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -3160,20 +3163,20 @@ int ds4_gpu_q4e_add2( ds4_gpu_tensor *res, const ds4_gpu_tensor *a, const ds4_gp
 
 int ds4_gpu_q4e_qsa_q_norm_rope( ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, const ds4_gpu_tensor *qkv, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head, uint32_t n_rot, float rope_base, uint32_t n_tok, float eps);
 
-int ds4_gpu_q4e_qsa_store_kv( ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base, uint32_t cache_slots, uint32_t n_tok, float eps);
+int ds4_gpu_q4e_qsa_store_kv( ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base, uint32_t pool_slots, uint32_t n_tok, float eps);
 
-int ds4_gpu_q4e_qsa_attention( ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok);
+int ds4_gpu_q4e_qsa_attention( ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok);
 
 int ds4_gpu_q4e_qsa_gate(ds4_gpu_tensor *x, const ds4_gpu_tensor *gate, uint64_t n);
 int ds4_gpu_q4e_argmax_rows(ds4_gpu_tensor *out_idx, const ds4_gpu_tensor *logits, uint32_t n_vocab, uint32_t n_rows);
 int ds4_gpu_q4e_matmul_bf16_rows(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
-int ds4_gpu_q4e_idx_store_k(ds4_gpu_tensor *cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *pos, uint32_t n_tok);
-int ds4_gpu_q4e_idx_pool(ds4_gpu_tensor *pooled, const ds4_gpu_tensor *cache, const void *model_map, uint64_t model_size, uint64_t norm_offset, const ds4_gpu_tensor *pos, uint32_t n_tok, uint32_t n_rot, float rope_base, float eps);
+int ds4_gpu_q4e_idx_store_k(ds4_gpu_tensor *cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages, uint32_t n_tok);
+int ds4_gpu_q4e_idx_pool(ds4_gpu_tensor *pooled, const ds4_gpu_tensor *cache, const void *model_map, uint64_t model_size, uint64_t norm_offset, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages, uint32_t n_tok, uint32_t n_rot, float rope_base, float eps);
 int ds4_gpu_q4e_idx_q(ds4_gpu_tensor *qn, const ds4_gpu_tensor *q, const void *model_map, uint64_t model_size, uint64_t norm_offset, const ds4_gpu_tensor *pos, uint32_t n_head, uint32_t n_tok, uint32_t n_rot, float rope_base, float eps);
-int ds4_gpu_q4e_idx_score(ds4_gpu_tensor *score, const ds4_gpu_tensor *qn, const ds4_gpu_tensor *pooled, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pos_last, uint32_t n_head, uint32_t n_tok, uint32_t max_blocks);
+int ds4_gpu_q4e_idx_score(ds4_gpu_tensor *score, const ds4_gpu_tensor *qn, const ds4_gpu_tensor *pooled, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pos_last, const ds4_gpu_tensor *pages, uint32_t n_head, uint32_t n_tok, uint32_t max_blocks);
 int ds4_gpu_q4e_idx_topk(ds4_gpu_tensor *sel, ds4_gpu_tensor *cnt, const ds4_gpu_tensor *score, const ds4_gpu_tensor *pos_last, uint32_t n_tok, uint32_t max_blocks, uint32_t k);
 int ds4_gpu_q4e_idx_expand(ds4_gpu_tensor *tokens, ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *sel, const ds4_gpu_tensor *cnt, const ds4_gpu_tensor *pos, uint32_t n_tok, uint32_t k, uint32_t width);
-int ds4_gpu_q4e_qsa_attention_sparse(ds4_gpu_tensor *out, ds4_gpu_tensor *part, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *tokens, const ds4_gpu_tensor *n_sel, uint32_t width, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok);
+int ds4_gpu_q4e_qsa_attention_sparse(ds4_gpu_tensor *out, ds4_gpu_tensor *part, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *tokens, const ds4_gpu_tensor *n_sel, const ds4_gpu_tensor *pages, uint32_t width, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_tok);
 void *ds4_gpu_q4e_host_alloc(uint64_t bytes);
 void ds4_gpu_q4e_host_free(void *p);
 

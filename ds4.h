@@ -156,6 +156,10 @@ typedef struct {
      * the default, which holds one full context's working set; the hit rate
      * is bounded by n-gram repetition, so a much larger cache buys nothing. */
     uint64_t ple_cache_bytes;
+    /* qwen4exp only: the KV page pool, in token positions (rounded up to
+     * whole pages, never below the context size).  Zero sizes it to the
+     * context, which is all one sequence can own. */
+    uint32_t kv_pool_tokens;
     bool warm_weights;
     bool quality;
     bool glm_mtp;

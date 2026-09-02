@@ -38927,6 +38927,7 @@ struct ds4_engine {
     uint32_t ssd_streaming_cache_experts;
     uint64_t ssd_streaming_cache_bytes;
     uint64_t ple_cache_bytes;
+    uint32_t kv_pool_tokens;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
@@ -54658,6 +54659,138 @@ static uint32_t q4e_ngram_propose(const int *hist, uint32_t len, int first,
 }
 #endif /* DS4_NO_GPU */
 
+/* ---------------------------------------------------------------------------
+ * qwen4exp paged KV: the page pool, and one sequence's page table.
+ *
+ * A sequence's KV -- QSA K and V for the twelve attention layers, the
+ * indexer's raw and pooled keys, the draft head's K and V -- used to be one
+ * contiguous run of ctx_size rows per buffer, addressed by position.  It is
+ * now a pool of fixed pages of DS4_Q4E_PAGE_TOKENS positions
+ * (ds4_q4e_page.h carries the geometry and why 256), plus a table mapping the
+ * sequence's logical page i, covering positions [256 i, 256 i + 256), to a
+ * pool page.  Every KV-touching kernel takes that table and translates.
+ *
+ * Today one execution context owns the pool and appends pages in order, so
+ * this is only a change of address arithmetic.  The indirection is for the
+ * step after it, where a radix tree of token spans lets contexts share pages;
+ * the two rules that make sharing safe already hold.  A page is immutable
+ * once the frontier has moved past it: the only writes are at the frontier,
+ * and a rejected speculative suffix is rewritten in place at those same
+ * positions by the next step.  And a page is released only when the frontier
+ * retreats below it -- a snapshot restore or a reset -- by which point every
+ * snapshot above that point has been dropped.
+ *
+ * This block is deliberately outside the GPU guard: it is array bookkeeping
+ * with an off-by-one in every direction, so ds4_test exercises it.
+ * ------------------------------------------------------------------------ */
+typedef struct {
+    uint32_t n_pages;      /* pool capacity, in pages */
+    uint32_t n_free;
+    int32_t *free_ids;     /* free page ids; taken from the top */
+} q4e_page_pool;
+
+typedef struct {
+    int32_t *map;          /* logical page -> pool page id */
+    uint32_t len;          /* logical pages the sequence owns */
+    uint32_t cap;
+} q4e_page_table;
+
+/* Pages needed to cover positions [0, n_pos). */
+static uint32_t q4e_pages_for(uint32_t n_pos) {
+    return (n_pos + DS4_Q4E_PAGE_TOKENS - 1u) / DS4_Q4E_PAGE_TOKENS;
+}
+
+/* `reverse` hands pages out highest first instead of lowest first.  Lowest
+ * first puts a fresh sequence's pages where the contiguous cache used to be,
+ * which is the layout the prefetcher likes; reversed is the same arithmetic
+ * over deliberately non-contiguous pages, which is how the translation is
+ * checked against the contiguous prefill fingerprint (a kernel that assumed
+ * pages abut fails it). */
+static void q4e_page_pool_init(q4e_page_pool *pool, uint32_t n_pages, bool reverse) {
+    pool->free_ids = xmalloc((size_t)n_pages * sizeof(int32_t));
+    pool->n_pages = n_pages;
+    pool->n_free = n_pages;
+    for (uint32_t i = 0; i < n_pages; i++) {
+        pool->free_ids[i] = reverse ? (int32_t)i : (int32_t)(n_pages - 1u - i);
+    }
+}
+
+static void q4e_page_pool_free(q4e_page_pool *pool) {
+    free(pool->free_ids);
+    memset(pool, 0, sizeof(*pool));
+}
+
+static void q4e_page_table_free(q4e_page_table *t) {
+    free(t->map);
+    memset(t, 0, sizeof(*t));
+}
+
+/* Own pages for positions [0, n_pos).  The logical pages added are
+ * [*first_new, *first_new + *n_new), which is what the caller has to hand the
+ * kernels; returns 1 without touching the table if the pool is short. */
+static int q4e_page_table_grow(q4e_page_pool *pool, q4e_page_table *t, uint32_t n_pos,
+                               uint32_t *first_new, uint32_t *n_new) {
+    const uint32_t want = q4e_pages_for(n_pos);
+    *first_new = t->len;
+    *n_new = 0;
+    if (want <= t->len) return 0;
+    if (want - t->len > pool->n_free) return 1;
+    if (want > t->cap) {
+        t->map = xrealloc(t->map, (size_t)want * sizeof(int32_t));
+        t->cap = want;
+    }
+    while (t->len < want) t->map[t->len++] = pool->free_ids[--pool->n_free];
+    *n_new = t->len - *first_new;
+    return 0;
+}
+
+/* Release the pages that hold only positions >= n_pos.  The page holding
+ * n_pos - 1 stays: its tail is rewritten by whatever runs next, which is what
+ * a restore and a speculative rewrite both do. */
+static void q4e_page_table_trim(q4e_page_pool *pool, q4e_page_table *t, uint32_t n_pos) {
+    const uint32_t want = q4e_pages_for(n_pos);
+    while (t->len > want) pool->free_ids[pool->n_free++] = t->map[--t->len];
+}
+
+bool ds4_test_q4e_page_table(void) {
+    q4e_page_pool pool;
+    q4e_page_table t;
+    uint32_t first = 0, n = 0;
+    const uint32_t P = DS4_Q4E_PAGE_TOKENS;
+
+    if (q4e_pages_for(0) != 0 || q4e_pages_for(1) != 1 ||
+        q4e_pages_for(P) != 1 || q4e_pages_for(P + 1u) != 2) return false;
+
+    memset(&t, 0, sizeof(t));
+    q4e_page_pool_init(&pool, 4, false);
+    /* A page covers the whole first chunk of positions, and one more page
+     * arrives only when a position lands past it. */
+    if (q4e_page_table_grow(&pool, &t, P, &first, &n) != 0 ||
+        first != 0 || n != 1 || t.len != 1 || pool.n_free != 3) return false;
+    if (q4e_page_table_grow(&pool, &t, P, &first, &n) != 0 || n != 0 || t.len != 1) return false;
+    if (q4e_page_table_grow(&pool, &t, P + 1u, &first, &n) != 0 ||
+        first != 1 || n != 1 || t.len != 2) return false;
+    if (t.map[0] != 0 || t.map[1] != 1) return false;
+    /* Retreating inside a page keeps it; retreating below it gives it back,
+     * and the pool hands the same page out again. */
+    q4e_page_table_trim(&pool, &t, P + 1u);
+    if (t.len != 2) return false;
+    q4e_page_table_trim(&pool, &t, P);
+    if (t.len != 1 || pool.n_free != 3) return false;
+    if (q4e_page_table_grow(&pool, &t, 2u * P, &first, &n) != 0 ||
+        first != 1 || n != 1 || t.map[1] != 1) return false;
+    /* A full pool refuses to grow rather than handing out a page twice. */
+    if (q4e_page_table_grow(&pool, &t, 4u * P, &first, &n) != 0 || t.len != 4 ||
+        pool.n_free != 0) return false;
+    if (q4e_page_table_grow(&pool, &t, 4u * P + 1u, &first, &n) == 0 || t.len != 4) return false;
+    q4e_page_table_trim(&pool, &t, 0);
+    if (t.len != 0 || pool.n_free != 4) return false;
+
+    q4e_page_table_free(&t);
+    q4e_page_pool_free(&pool);
+    return true;
+}
+
 #ifndef DS4_NO_GPU
 /* Shorthands for the widths the graph keeps recomputing. */
 #define Q4E_HC_DIM   ((uint32_t)(DS4_N_EMBD * DS4_N_HC))
@@ -54681,12 +54814,21 @@ typedef struct {
 
     /* Persistent recurrent state.  The gated DeltaNet layers carry a conv
      * window and a 128x128 matrix per value head; the PLE block carries its
-     * own dilated conv window; the QSA layers carry an f16 KV cache. */
+     * own dilated conv window; the QSA layers carry an f16 KV cache, paged. */
     ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
-    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *k_cache[DS4_MAX_LAYER];   /* [pool_slots][kv_dim] f16 */
     ds4_gpu_tensor *v_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv;
+
+    /* Paged KV (see q4e_page_pool): the pool every KV buffer here is carved
+     * into, this execution context's page table, and that table as the
+     * kernels read it.  pool_slots is the pool in positions -- what every KV
+     * buffer is sized for. */
+    q4e_page_pool   kv_pool;
+    q4e_page_table  kv_table;
+    ds4_gpu_tensor *kv_pages;      /* int32 per logical page */
+    uint32_t        pool_slots;
 
     /* Per-step inputs. */
     ds4_gpu_tensor *tokens;
@@ -63486,6 +63628,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
     e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
     e->ple_cache_bytes = opt->ple_cache_bytes;
+    e->kv_pool_tokens = opt->kv_pool_tokens;
     e->ssd_streaming_full_layers = opt->ssd_streaming_full_layers;
     e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     if (e->power_percent > 100) e->power_percent = 100;
@@ -65470,11 +65613,37 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
         ds4_tokens_free(&sn->tokens);
         free(sn->logits);
     }
+    ds4_gpu_tensor_free(g->kv_pages);
+    q4e_page_table_free(&g->kv_table);
+    q4e_page_pool_free(&g->kv_pool);
     ds4_ple_stream_close(g->ple_stream);
     free(g->ple_row_ids);
     free(g->ple_row_data);
     free(g->argmax_host);
     memset(g, 0, sizeof(*g));
+}
+
+/* Own KV pages for positions [0, n_pos) and hand the kernels the new table
+ * entries.  Called before anything writes KV, so a page always exists by the
+ * time a kernel translates a position into it. */
+static int q4e_kv_reserve(ds4_q4e_graph *g, uint32_t n_pos) {
+    uint32_t first = 0, n_new = 0;
+    if (q4e_page_table_grow(&g->kv_pool, &g->kv_table, n_pos, &first, &n_new) != 0) {
+        fprintf(stderr, "ds4: qwen4exp KV page pool exhausted: %u pages for %u positions "
+                        "(raise --kv-pool-tokens)\n", g->kv_pool.n_pages, n_pos);
+        return 1;
+    }
+    if (n_new == 0u) return 0;
+    return ds4_gpu_tensor_write(g->kv_pages, (uint64_t)first * sizeof(int32_t),
+                                &g->kv_table.map[first],
+                                (uint64_t)n_new * sizeof(int32_t)) ? 0 : 1;
+}
+
+/* Give back the pages that hold only positions >= n_pos.  The device copy of
+ * the table needs no update: kernels only translate positions below the
+ * frontier, and the next reserve rewrites whatever entries it hands out. */
+static void q4e_kv_trim(ds4_q4e_graph *g, uint32_t n_pos) {
+    q4e_page_table_trim(&g->kv_pool, &g->kv_table, n_pos);
 }
 
 /* Drop every recurrent trace of the current sequence.  There is no partial
@@ -65496,7 +65665,9 @@ static void q4e_graph_reset(ds4_q4e_graph *g) {
     }
     g->pos = 0;
     g->pend_valid = false;
-    /* The prefill that follows rewrites the KV from position 0. */
+    /* The prefill that follows starts from position 0, so this sequence owns
+     * no pages any more; the pool takes them all back. */
+    q4e_kv_trim(g, 0);
     for (uint32_t k = 0; k < Q4E_SNAP_MAX; k++) {
         if (g->snap[k].valid) g->snap_evictions++;
         g->snap[k].valid = false;
@@ -65589,6 +65760,9 @@ static int q4e_snapshot_restore(ds4_session *s, struct q4e_snapshot *sn) {
     ds4_q4e_graph *g = &s->q4e_graph;
     if (q4e_snapshot_copy(g, sn, false) != 0) return 1;
     g->pos = sn->pos;
+    /* The frontier retreats to sn->pos, so the pages above it go back to the
+     * pool: with the longer snapshots dropped below, nothing refers to them. */
+    q4e_kv_trim(g, sn->pos);
     s->checkpoint.len = 0;
     for (int i = 0; i < sn->tokens.len; i++) token_vec_push(&s->checkpoint, sn->tokens.v[i]);
     if (sn->logits_valid) memcpy(s->logits, sn->logits, (size_t)DS4_N_VOCAB * sizeof(float));
@@ -65698,9 +65872,33 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     const uint64_t gdn_state_bytes = (uint64_t)DS4_N_GDN_VALUE_HEAD * DS4_N_GDN_HEAD_DIM *
                                      DS4_N_GDN_HEAD_DIM * f;
 
+    /* The KV page pool.  Every KV buffer below is the pool, not one context's
+     * worth of positions, so they are all sized to it.  --kv-pool-tokens (or
+     * DS4_QWEN4EXP_KV_POOL_TOKENS) sets it in positions and cannot go below
+     * this session's context, which is all a single sequence can own; the
+     * default is exactly that context.  A0's 600000-position pool belongs to
+     * the shared pool of the radix tree, where several conversations draw
+     * from one -- with one sequence per context it would only reserve 18 GB
+     * of pages nothing can use. */
+    {
+        uint32_t pool_tokens = e->kv_pool_tokens;
+        const char *env = getenv("DS4_QWEN4EXP_KV_POOL_TOKENS");
+        if (env && env[0]) {
+            const long v = strtol(env, NULL, 10);
+            if (v > 0) pool_tokens = (uint32_t)v;
+        }
+        if (pool_tokens < ctx_size) pool_tokens = ctx_size;
+        const uint32_t pool_pages = q4e_pages_for(pool_tokens);
+        g->pool_slots = pool_pages * DS4_Q4E_PAGE_TOKENS;
+        q4e_page_pool_init(&g->kv_pool, pool_pages,
+                           getenv("DS4_QWEN4EXP_KV_POOL_REVERSE") != NULL);
+        /* One sequence cannot own more logical pages than its context. */
+        ok = q4e_alloc(&g->kv_pages, (uint64_t)q4e_pages_for(ctx_size) * sizeof(int32_t));
+    }
+
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
         if (ds4_qwen4exp_layer_is_full_attn(il)) {
-            const uint64_t slots = (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t);
+            const uint64_t slots = (uint64_t)g->pool_slots * Q4E_KV_DIM * sizeof(uint16_t);
             ok = q4e_alloc(&g->k_cache[il], slots) && q4e_alloc(&g->v_cache[il], slots);
         } else {
             ok = q4e_alloc(&g->gdn_conv[il], gdn_conv_bytes) &&
@@ -65797,8 +65995,12 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
         const uint32_t qb = T < Q4E_IDX_QB ? T : Q4E_IDX_QB;
         for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
             if (!ds4_qwen4exp_layer_is_full_attn(il)) continue;
-            ok = q4e_alloc(&g->idx_k_cache[il], (uint64_t)ctx_size * 128u * sizeof(uint16_t)) &&
-                 q4e_alloc(&g->idx_pooled[il], (uint64_t)max_blocks * 128u * sizeof(uint16_t));
+            /* Paged like the QSA cache: raw keys per position, pooled keys
+             * per 4-position block, so a page's pooled slice is its own
+             * quarter of the pool's block rows. */
+            ok = q4e_alloc(&g->idx_k_cache[il], (uint64_t)g->pool_slots * 128u * sizeof(uint16_t)) &&
+                 q4e_alloc(&g->idx_pooled[il],
+                           (uint64_t)(g->pool_slots / 4u) * 128u * sizeof(uint16_t));
         }
         if (ok) {
             ok = q4e_alloc(&g->idx_k, (uint64_t)T * 128u * f) &&
@@ -65822,8 +66024,8 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
           && q4e_alloc(&g->mtp_embed, (uint64_t)T * DS4_N_EMBD * f)
           && q4e_alloc(&g->mtp_tokens, (uint64_t)T * sizeof(int32_t))
           && q4e_alloc(&g->mtp_positions, (uint64_t)T * sizeof(int32_t))
-          && q4e_alloc(&g->mtp_k_cache, (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t))
-          && q4e_alloc(&g->mtp_v_cache, (uint64_t)ctx_size * Q4E_KV_DIM * sizeof(uint16_t))
+          && q4e_alloc(&g->mtp_k_cache, (uint64_t)g->pool_slots * Q4E_KV_DIM * sizeof(uint16_t))
+          && q4e_alloc(&g->mtp_v_cache, (uint64_t)g->pool_slots * Q4E_KV_DIM * sizeof(uint16_t))
           && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
         if (ok) g->mtp_ready = true;
     }
@@ -66081,8 +66283,8 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
     if (!q4e_matmul(g->qsa_v, m, l->qsa_v, g->mixed, n_tok)) return 0;
     if (!ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], g->qsa_k, g->qsa_v,
                                   m->map, m->size, l->qsa_k_norm->abs_offset,
-                                  g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD_KV,
-                                  DS4_N_ROT, DS4_ROPE_FREQ_BASE, g->ctx_size,
+                                  g->positions, g->kv_pages, DS4_N_HEAD_DIM, DS4_N_HEAD_KV,
+                                  DS4_N_ROT, DS4_ROPE_FREQ_BASE, g->pool_slots,
                                   n_tok, DS4_RMS_EPS)) return 0;
     /* QSA indexer: keep the raw and pooled indexer keys current for every
      * forward; select blocks only once the context holds more complete
@@ -66093,11 +66295,12 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
     if (idx_on) {
         const uint32_t pos0 = g->pos;
         if (!q4e_matmul(g->idx_k, m, l->idx_k, g->mixed, n_tok)) return 0;
-        if (!ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], g->idx_k, g->positions, n_tok)) return 0;
+        if (!ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], g->idx_k, g->positions,
+                                     g->kv_pages, n_tok)) return 0;
         (void)pos0;
         if (!ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
-                                  l->idx_k_norm->abs_offset, g->positions, n_tok, DS4_N_ROT,
-                                  DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
+                                  l->idx_k_norm->abs_offset, g->positions, g->kv_pages,
+                                  n_tok, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
     }
     if (idx_on && g->qsa_sparse) {
         /* Block counts come from the positions on the device (see the
@@ -66125,14 +66328,16 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
                                                         (uint64_t)nb * Q4E_Q_DIM * sizeof(float));
             int ok = qn_v && pos_v && q_v && out_v &&
                      ds4_gpu_q4e_idx_score(g->idx_score, qn_v, g->idx_pooled[il], pos_v, pos_last,
-                                           DS4_N_INDEXER_HEAD, nb, g->idx_max_blocks) &&
+                                           g->kv_pages, DS4_N_INDEXER_HEAD, nb,
+                                           g->idx_max_blocks) &&
                      ds4_gpu_q4e_idx_topk(g->idx_sel, g->idx_cnt, g->idx_score, pos_last, nb,
                                           g->idx_max_blocks, kb) &&
                      ds4_gpu_q4e_idx_expand(g->idx_tokens, g->idx_nsel, g->idx_sel, g->idx_cnt, pos_v,
                                             nb, kb, Q4E_IDX_WIDTH) &&
                      ds4_gpu_q4e_qsa_attention_sparse(out_v, g->idx_part, g->k_cache[il], g->v_cache[il],
-                                                      q_v, g->idx_tokens, g->idx_nsel, Q4E_IDX_WIDTH,
-                                                      DS4_N_HEAD_DIM, DS4_N_HEAD, DS4_N_HEAD_KV, nb);
+                                                      q_v, g->idx_tokens, g->idx_nsel, g->kv_pages,
+                                                      Q4E_IDX_WIDTH, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                                      DS4_N_HEAD_KV, nb);
             ds4_gpu_tensor_free(qn_v);
             ds4_gpu_tensor_free(pos_v);
             ds4_gpu_tensor_free(q_v);
@@ -66141,7 +66346,7 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
         }
         ds4_gpu_tensor_free(pos_last);
     } else if (!ds4_gpu_q4e_qsa_attention(g->qsa_out, g->k_cache[il], g->v_cache[il], g->qsa_q,
-                                          g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                          g->positions, g->kv_pages, DS4_N_HEAD_DIM, DS4_N_HEAD,
                                           DS4_N_HEAD_KV, n_tok)) {
         return 0;
     }
@@ -66363,6 +66568,10 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     if (n_tok == 0 || n_tok > g->tok_cap) return 1;
     if (pos0 + n_tok > g->ctx_size) return 1;
     if (logit_rows > n_tok || logit_rows > g->logit_rows) return 1;
+    /* Pages for the rows about to be written, including a speculative
+     * suffix: the verify pass writes KV at every one of its positions and
+     * only the accepted prefix survives, in pages this sequence owns alone. */
+    if (q4e_kv_reserve(g, pos0 + n_tok) != 0) return 1;
 
     g_q4e_trace_ntok = n_tok;
     int32_t *ids = xmalloc((size_t)n_tok * sizeof(int32_t));
@@ -66494,6 +66703,15 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     const ds4_model *mm = &e->mtp_model;
     const ds4_q4e_mtp_weights *mw = &e->q4e_mtp_weights;
     if (!g->mtp_ready || n == 0 || n > g->tok_cap) return 1;
+    /* The draft's KV shares the target's page table -- one page covers the
+     * same positions in every KV buffer -- and its chain runs ahead of the
+     * target's frontier, so it reserves for its own rows. */
+    uint32_t hi = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (positions[i] < 0 || (uint32_t)positions[i] >= g->ctx_size) return 1;
+        if ((uint32_t)positions[i] > hi) hi = (uint32_t)positions[i];
+    }
+    if (q4e_kv_reserve(g, hi + 1u) != 0) return 1;
 
     /* The draft's view of the graph: its own residual, inputs, KV and logits,
      * every scratch buffer shared with the target. */

@@ -6,6 +6,7 @@
 #include <math.h>
 
 bool ds4_test_dspark_cache_window_crop(void);
+bool ds4_test_q4e_page_table(void);
 
 static ds4_engine *test_engine_fast;
 static ds4_engine *test_engine_quality;
@@ -865,6 +866,10 @@ static void test_metal_store_raw_kv_batch_wrap(void) {
 
 static void test_dspark_cache_window_crop(void) {
     TEST_ASSERT(ds4_test_dspark_cache_window_crop());
+}
+
+static void test_q4e_page_table(void) {
+    TEST_ASSERT(ds4_test_q4e_page_table());
 }
 
 static void test_metal_q8_0_decode_pair_exact_case(
@@ -4728,6 +4733,7 @@ static void test_metal_kernel_group(void) {
     test_metal_pack_slot_rows_f32();
     test_metal_store_raw_kv_batch_wrap();
     test_dspark_cache_window_crop();
+    test_q4e_page_table();
     test_metal_q8_0_decode_pair_exact();
 #if defined(__APPLE__)
     test_metal_f16_compressor_pair_state_store_exact();

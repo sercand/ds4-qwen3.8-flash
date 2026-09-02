@@ -14746,6 +14746,14 @@ static server_config parse_options(int argc, char **argv) {
                            "ds4-server: --simulate-used-memory must be a positive GiB value, e.g. 64GB");
                 exit(2);
             }
+        } else if (!strcmp(arg, "--kv-pool-tokens")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --kv-pool-tokens must be positive");
+                exit(2);
+            }
+            c.engine.kv_pool_tokens = (uint32_t)v;
         } else if (!strcmp(arg, "--prefill-chunk")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
