@@ -16,6 +16,24 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 QUALITY_CFLAGS ?= -O3 $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -std=c11
 
 LDLIBS ?= -lm -pthread
+
+# liburing, for the PLE row reader's io_uring backend (ds4_ple_stream.c).  The
+# reader keeps its blocking-pread thread pool and falls back to it when the
+# library is absent, so this is a performance dependency, not a hard one:
+# without it the ring backend is compiled out and DS4_PLE_STREAM_IO=uring is
+# refused rather than silently ignored.  Install liburing-dev to enable it, or
+# point LIBURING_CFLAGS/LIBURING_LIBS at an unpacked copy.
+LIBURING_CFLAGS ?= $(shell pkg-config --cflags liburing 2>/dev/null)
+LIBURING_LIBS ?= $(shell pkg-config --libs liburing 2>/dev/null || \
+	{ printf '%s\n' '#include <liburing.h>' | $(CC) -E -x c - >/dev/null 2>&1 && echo -luring; })
+ifneq ($(strip $(LIBURING_LIBS)),)
+PLE_IO_CFLAGS := $(LIBURING_CFLAGS) -DDS4_HAVE_LIBURING=1
+PLE_IO_LIBS := $(LIBURING_LIBS)
+else
+PLE_IO_CFLAGS :=
+PLE_IO_LIBS :=
+endif
+LDLIBS += $(PLE_IO_LIBS)
 METAL_SRCS := $(wildcard metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
 DS4_TEST_MODEL ?= ds4flash.gguf
@@ -87,12 +105,15 @@ MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o 
 EXL3_OBJS := cuda/exl3/ds4_exl3.o
 CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS) $(EXL3_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
-CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
+# $(PLE_IO_LIBS) is liburing for ds4_ple_stream.o; these link lines do not go
+# through LDLIBS, so it has to be named here too or the ring backend's symbols
+# come up undefined.
+CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas $(PLE_IO_LIBS)
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
-ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas
+ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt -lrocblas $(PLE_IO_LIBS)
 ROCM_MMQ_Y ?= 64
 ROCM_MMQ_FLAGS := $(ROCM_CFLAGS) -std=c++17 -DGGML_USE_HIP -DDS4_HIP_MMQ_Y=$(ROCM_MMQ_Y) $(MMQ_INCLUDES)
 ROCM_MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.rocm.o cuda/mmq/ds4_mmq.rocm.o cuda/mmq/quantize.rocm.o cuda/mmq/mmid.rocm.o cuda/mmq/mmvq.rocm.o cuda/mmq/d2r_stubs.rocm.o
@@ -295,7 +316,7 @@ ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
 ds4_ple_stream.o: ds4_ple_stream.c ds4_ple_stream.h
-	$(CC) $(CFLAGS) -c -o $@ ds4_ple_stream.c
+	$(CC) $(CFLAGS) $(PLE_IO_CFLAGS) -c -o $@ ds4_ple_stream.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -535,6 +556,12 @@ tests/test_qwen4exp_ple.o: tests/test_qwen4exp_ple.c ds4.h ds4_ple_stream.h
 tests/test_qwen4exp_ple: tests/test_qwen4exp_ple.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_ple_io.o: tests/test_ple_io.c ds4_ple_stream.h
+	$(CC) $(CFLAGS) $(PLE_IO_CFLAGS) -I. -c -o $@ $<
+
+tests/test_ple_io: tests/test_ple_io.o ds4_ple_stream.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_gguf_split.o: tests/test_gguf_split.c ds4.h
 	$(CC) $(CFLAGS) -I. -DDS4_TEST_HOOKS -c -o $@ $<
 
@@ -628,8 +655,9 @@ endif
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_gguf_split mxfp4-dot-test \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	$(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_ple_io $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --self-test-extractors
+	./tests/test_ple_io
 	./ds4_agent_test
 	./tests/test_gguf_split
 	./ds4_test

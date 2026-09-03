@@ -68140,6 +68140,10 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     }
     e->q4e_scratch = g;
     const uint64_t free_after = ds4_gpu_tier_free_vram(0);
+    /* Which reader came up matters for CPU accounting, and the ring can fall
+     * back on its own, so say it rather than leaving it to be inferred. */
+    fprintf(stderr, "ds4: qwen4exp PLE reader: %s, %.0f MiB row cache\n",
+            ds4_ple_stream_backend(g->ple_stream), (double)e->ple_cache_bytes / 1048576.0);
     fprintf(stderr, "ds4: qwen4exp shared prefill scratch: %u-row chunk, %.2f GB, "
                     "borrowed by every execution context; %.2f GB per context "
                     "for its own recurrent state\n",

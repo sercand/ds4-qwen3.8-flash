@@ -16,6 +16,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#if DS4_HAVE_LIBURING
+#include <liburing.h>
+#endif
+
 /* ---------------------------------------------------------------------------
  * Hash and decode.  Both are exact ports of the reference and are verified
  * against llama.cpp's ple_embd tensor by tests/test_qwen4exp_ple.c.
@@ -206,6 +210,16 @@ typedef struct ple_worker {
     int       rc;
 } ple_worker;
 
+/* One outstanding ring read.  A read can come back short of the block it asked
+ * for, so a slot tracks how much of its row has actually landed. */
+struct ple_ring_slot {
+    uint32_t miss;    /* which entry of the miss list this serves */
+    uint64_t start;   /* aligned file offset being read */
+    size_t   skew;    /* where the row begins inside the block */
+    size_t   len;     /* bytes the read asked for */
+    size_t   done;    /* bytes received so far */
+};
+
 struct ds4_ple_stream {
     ds4_ple_params params;
     int      fd;
@@ -270,6 +284,29 @@ struct ds4_ple_stream {
     uint32_t         pf_n, pf_cap;
     bool             pf_ready, pf_busy;
 
+    /* io_uring backend.  The pool above reaches the device's IOPS ceiling only
+     * by having a thread blocked per outstanding read: 64 readers cost ~2.6
+     * cores of kernel time for a prefill chunk's gather and still sit below
+     * the ceiling, and 192 cost 3.5 cores to reach it.  A ring reaches the
+     * same ceiling from one thread at ~1 core, because registered buffers skip
+     * the per-read page pinning and one enter call submits the whole batch.
+     * That CPU is what this is for -- the gather is already off the critical
+     * path -- so it matters on a box that also runs CPU-only work.
+     *
+     * One ring per stream is safe: every fetch is serialized by fetch_mu.  The
+     * pool stays as the fallback for when the ring cannot be set up. */
+    bool     ring_ok;       /* whether the ring came up */
+    uint32_t ring_qd;       /* reads in flight */
+    size_t   ring_stride;   /* bytes per slot's bounce buffer */
+#if DS4_HAVE_LIBURING
+    struct io_uring ring;
+    uint8_t        *ring_bounce;   /* ring_qd * ring_stride, registered */
+    struct iovec   *ring_iov;
+    struct ple_ring_slot *ring_slot;
+    uint32_t       *ring_free;     /* stack of idle slot indices */
+    uint32_t       *ring_pend;     /* stack of slots waiting for an sqe */
+#endif
+
     /* Direct reads keep the 26.8 GiB table out of the page cache, which would
      * otherwise compete with the resident weights for the same memory. */
     bool     direct;
@@ -279,6 +316,11 @@ struct ds4_ple_stream {
 };
 
 static void ple_pool_stop(ds4_ple_stream *s);
+static uint32_t ple_worker_count(void);
+#if DS4_HAVE_LIBURING
+static int  ple_ring_open(ds4_ple_stream *s, char *err, size_t errlen);
+static void ple_ring_close(ds4_ple_stream *s);
+#endif
 
 static double ple_now(void) {
     struct timespec ts;
@@ -442,12 +484,47 @@ int ds4_ple_stream_open(ds4_ple_stream **out,
     }
 #endif
 
+    /* Backend choice.  The ring is the default wherever liburing is present,
+     * because it costs a quarter of the CPU for the same reads; DS4_PLE_STREAM_IO
+     * takes "pool" to force the thread pool back, or "uring" to make a ring that
+     * will not start an error instead of a silent downgrade. */
+    const char *io = getenv("DS4_PLE_STREAM_IO");
+    const bool insist = io && strcmp(io, "uring") == 0;
+    const bool want_uring = !(io && strcmp(io, "pool") == 0);
+#if DS4_HAVE_LIBURING
+    if (want_uring) {
+        char rerr[192] = {0};
+        if (ple_ring_open(s, rerr, sizeof(rerr)) != 0) {
+            if (insist) {
+                ple_fail(err, errlen, "PLE io_uring backend unavailable: %s", rerr);
+                ds4_ple_stream_close(s);
+                return 1;
+            }
+            fprintf(stderr, "ds4: PLE io_uring backend unavailable (%s); "
+                            "falling back to %u reader threads\n",
+                    rerr, ple_worker_count());
+        }
+    }
+#else
+    (void)want_uring;
+    if (insist) {
+        ple_fail(err, errlen,
+                 "DS4_PLE_STREAM_IO=uring, but this build has no liburing "
+                 "(install liburing-dev and rebuild)");
+        ds4_ple_stream_close(s);
+        return 1;
+    }
+#endif
+
     *out = s;
     return 0;
 }
 
 void ds4_ple_stream_close(ds4_ple_stream *s) {
     if (!s) return;
+#if DS4_HAVE_LIBURING
+    ple_ring_close(s);
+#endif
     if (s->pf_ready) {
         pthread_mutex_lock(&s->pf_mu);
         s->shutdown = true;
@@ -475,19 +552,42 @@ void ds4_ple_stream_close(ds4_ple_stream *s) {
 
 /* Reads one row through `w`'s private bounce buffer and charges the time to
  * `w`, so several of these can run concurrently on the pool. */
+/* Where a row's read lands: the aligned block to ask the device for, the row's
+ * offset inside it, and how many bytes that is.  Both backends go through this
+ * so their idea of the file cannot drift apart. */
+static void ple_row_geometry(const ds4_ple_stream *s, uint64_t row,
+                             uint64_t *start, size_t *skew, size_t *len) {
+    const uint64_t off = s->file_offset + row * s->row_bytes;
+    if (!s->direct) {
+        *start = off;
+        *skew  = 0;
+        *len   = s->row_bytes;
+        return;
+    }
+    const uint64_t a = s->direct_align;
+    *start = off / a * a;
+    *skew  = (size_t)(off - *start);
+    *len   = (size_t)(((*skew + s->row_bytes) + a - 1) / a * a);
+}
+
+#if DS4_HAVE_LIBURING
+/* The widest block a single row can need: it may straddle two of them. */
+static size_t ple_bounce_stride(const ds4_ple_stream *s) {
+    if (!s->direct) return s->row_bytes;
+    const uint64_t a = s->direct_align;
+    return (size_t)(((a - 1) + s->row_bytes + a - 1) / a * a);
+}
+#endif
+
 static int ple_read_row(ds4_ple_stream *s, ple_worker *w, uint64_t row,
                         uint8_t *dst, char *err, size_t errlen) {
-    const uint64_t off = s->file_offset + row * s->row_bytes;
     const double t0 = ple_now();
 
-    uint64_t start = off;
-    size_t len = s->row_bytes;
-    size_t skew = 0;
+    uint64_t start;
+    size_t len, skew;
+    ple_row_geometry(s, row, &start, &skew, &len);
     if (s->direct) {
         const uint64_t a = s->direct_align;
-        start = off / a * a;
-        skew = (size_t)(off - start);
-        len = (size_t)(((skew + s->row_bytes) + a - 1) / a * a);
         if (w->bounce_cap < len) {
             free(w->bounce);
             w->bounce = NULL;
@@ -567,8 +667,11 @@ static uint32_t ple_worker_count(void) {
         const long v = strtol(env, NULL, 10);
         if (v >= 1 && v <= 256) return (uint32_t)v;
     }
-    /* A 2048-token prefill chunk misses ~20k rows of 4 KiB direct reads;
-     * 64 in flight reach the device's IOPS (100 ms vs 290 ms at 16). */
+    /* A 2048-token prefill chunk misses ~20k rows of 4 KiB direct reads.  64
+     * in flight is where this stops paying: it takes 92 ms against 223 ms at
+     * 16, and the 54 ms that 256 threads reach costs 3.5 cores of kernel time
+     * to get.  Past 64 the ring is the way to buy depth -- see ple_ring_batch
+     * -- so this stays where the CPU cost is still defensible for a fallback. */
     return 64;
 }
 
@@ -614,10 +717,244 @@ static void ple_pool_stop(ds4_ple_stream *s) {
     s->n_workers = 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * io_uring backend.
+ *
+ * Same contract as the pool -- fill miss_dst[i] with row miss_row[i] -- from a
+ * single thread.  The reads are what they always were; what changes is the cost
+ * of issuing them.  A registered file and registered bounce buffers mean the
+ * kernel neither looks up the descriptor nor pins pages per read, and one
+ * enter call carries a whole batch, so the same queue depth costs about a
+ * quarter of the CPU that a thread-per-read pool needs for it.
+ * ------------------------------------------------------------------------ */
+
+#if DS4_HAVE_LIBURING
+
+static uint32_t ple_ring_depth(void) {
+    const char *env = getenv("DS4_PLE_STREAM_QD");
+    if (env && *env) {
+        const long v = strtol(env, NULL, 10);
+        if (v >= 1 && v <= 4096) return (uint32_t)v;
+    }
+    /* Measured on GB10: the device's random-read ceiling is ~640k IOPS and it
+     * needs somewhere above 200 reads in flight to get there.  256 reaches it
+     * and costs 2 MiB of bounce buffers at a 4 KiB alignment. */
+    return 256;
+}
+
+static void ple_ring_close(ds4_ple_stream *s) {
+    if (s->ring_ok) io_uring_queue_exit(&s->ring);
+    free(s->ring_bounce);
+    free(s->ring_iov);
+    free(s->ring_slot);
+    free(s->ring_free);
+    free(s->ring_pend);
+    s->ring_bounce = NULL;
+    s->ring_iov    = NULL;
+    s->ring_slot   = NULL;
+    s->ring_free   = NULL;
+    s->ring_pend   = NULL;
+    s->ring_ok     = false;
+}
+
+/* Brings up the ring with its registered fd and buffers.  Every failure path
+ * leaves the stream usable on the pool, so the caller can either warn or
+ * insist depending on how the backend was chosen. */
+static int ple_ring_open(ds4_ple_stream *s, char *err, size_t errlen) {
+    const uint32_t qd = ple_ring_depth();
+    const size_t stride = ple_bounce_stride(s);
+    /* O_DIRECT wants the buffer aligned too; 4 KiB covers every device this
+     * runs on and statx reports far less is actually required. */
+    const size_t buf_align = s->direct && s->direct_align > 4096
+                               ? (size_t)s->direct_align : 4096u;
+
+    int rc = io_uring_queue_init(qd, &s->ring, 0);
+    if (rc < 0) {
+        ple_fail(err, errlen, "io_uring_queue_init: %s", strerror(-rc));
+        return 1;
+    }
+    s->ring_ok = true;   /* from here on ple_ring_close owns the ring */
+
+    if (posix_memalign((void **)&s->ring_bounce, buf_align, (size_t)qd * stride) != 0) {
+        s->ring_bounce = NULL;
+        ple_fail(err, errlen, "cannot allocate %llu KiB of PLE ring buffers",
+                 (unsigned long long)(((uint64_t)qd * stride) >> 10));
+        ple_ring_close(s);
+        return 1;
+    }
+    s->ring_iov  = calloc(qd, sizeof(*s->ring_iov));
+    s->ring_slot = calloc(qd, sizeof(*s->ring_slot));
+    s->ring_free = malloc((size_t)qd * sizeof(*s->ring_free));
+    s->ring_pend = malloc((size_t)qd * sizeof(*s->ring_pend));
+    if (!s->ring_iov || !s->ring_slot || !s->ring_free || !s->ring_pend) {
+        ple_fail(err, errlen, "cannot allocate the PLE ring slot tables");
+        ple_ring_close(s);
+        return 1;
+    }
+    for (uint32_t i = 0; i < qd; i++) {
+        s->ring_iov[i].iov_base = s->ring_bounce + (size_t)i * stride;
+        s->ring_iov[i].iov_len  = stride;
+    }
+    if ((rc = io_uring_register_buffers(&s->ring, s->ring_iov, qd)) < 0) {
+        ple_fail(err, errlen, "io_uring_register_buffers: %s", strerror(-rc));
+        ple_ring_close(s);
+        return 1;
+    }
+    if ((rc = io_uring_register_files(&s->ring, &s->fd, 1)) < 0) {
+        ple_fail(err, errlen, "io_uring_register_files: %s", strerror(-rc));
+        ple_ring_close(s);
+        return 1;
+    }
+    s->ring_qd     = qd;
+    s->ring_stride = stride;
+    return 0;
+}
+
+/* Runs the whole miss list through the ring, ring_qd reads in flight, copying
+ * each row out of its bounce block as that block lands. */
+static int ple_ring_batch(ds4_ple_stream *s, char *err, size_t errlen) {
+    const uint32_t n  = s->batch_n;
+    const uint32_t qd = s->ring_qd;
+    const double t0 = ple_now();
+    uint64_t bytes = 0, reads = 0;
+    uint32_t issued = 0, completed = 0, inflight = 0;
+    uint32_t nfree = qd, npend = 0;
+    int rc = 0;
+
+    /* Slots start idle; `pend` holds slots waiting for an sqe, which is either
+     * a fresh miss or the remainder of a read that came back short. */
+    for (uint32_t i = 0; i < qd; i++) s->ring_free[i] = i;
+
+    /* An error stops the batch here rather than reading the rest of a list
+     * whose result is already being thrown away; the drain below then waits
+     * for whatever is still outstanding. */
+    while (completed < n && !rc) {
+        /* Hand idle slots the next misses. */
+        while (issued < n && nfree > 0) {
+            const uint32_t si = s->ring_free[--nfree];
+            struct ple_ring_slot *sl = &s->ring_slot[si];
+            sl->miss = issued++;
+            sl->done = 0;
+            ple_row_geometry(s, s->miss_row[sl->miss], &sl->start, &sl->skew, &sl->len);
+            s->ring_pend[npend++] = si;
+        }
+
+        /* Submit as many of them as the queue will take. */
+        uint32_t submitted = 0;
+        while (npend > 0) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&s->ring);
+            if (!sqe) break;                    /* queue full; drain first */
+            const uint32_t si = s->ring_pend[--npend];
+            struct ple_ring_slot *sl = &s->ring_slot[si];
+            uint8_t *slot_buf = s->ring_bounce + (size_t)si * s->ring_stride;
+            io_uring_prep_read_fixed(sqe, 0, slot_buf + sl->done,
+                                     (unsigned)(sl->len - sl->done),
+                                     sl->start + sl->done, (int)si);
+            sqe->flags |= IOSQE_FIXED_FILE;
+            io_uring_sqe_set_data64(sqe, si);
+            inflight++;
+            submitted++;
+        }
+        if (submitted == 0 && inflight == 0) {
+            ple_fail(err, errlen, "PLE ring made no progress: %u of %u rows", completed, n);
+            rc = 1;
+            break;
+        }
+
+        int got = io_uring_submit_and_wait(&s->ring, inflight ? 1u : 0u);
+        if (got < 0) {
+            if (got == -EINTR || got == -EAGAIN) continue;
+            ple_fail(err, errlen, "io_uring_submit_and_wait: %s", strerror(-got));
+            rc = 1;
+            break;
+        }
+
+        /* Reap everything that has landed, then advance the queue once. */
+        unsigned head, seen = 0;
+        struct io_uring_cqe *cqe;
+        io_uring_for_each_cqe(&s->ring, head, cqe) {
+            seen++;
+            const uint32_t si = (uint32_t)io_uring_cqe_get_data64(cqe);
+            struct ple_ring_slot *sl = &s->ring_slot[si];
+            const int res = cqe->res;
+            inflight--;
+            reads++;
+            if (res < 0) {
+                if (!rc) {
+                    ple_fail(err, errlen, "PLE row read failed: %s", strerror(-res));
+                    rc = 1;
+                }
+                s->ring_free[nfree++] = si;
+                continue;
+            }
+            bytes += (uint64_t)res;
+            sl->done += (size_t)res;
+            /* The block asked for is always at least the row, so covering the
+             * row is the only completion test needed. */
+            const size_t need = sl->skew + s->row_bytes;
+            if (sl->done >= need) {
+                /* A read that stops short of the block but past the row is the
+                 * file's last partial block, not an error. */
+                memcpy(s->miss_dst[sl->miss],
+                       s->ring_bounce + (size_t)si * s->ring_stride + sl->skew,
+                       s->row_bytes);
+                completed++;
+                s->ring_free[nfree++] = si;
+            } else if (res == 0) {
+                if (!rc) {
+                    ple_fail(err, errlen, "PLE row read hit end of file");
+                    rc = 1;
+                }
+                s->ring_free[nfree++] = si;
+            } else {
+                s->ring_pend[npend++] = si;   /* short read: ask for the rest */
+            }
+        }
+        if (seen) io_uring_cq_advance(&s->ring, seen);
+    }
+
+    /* An error can leave the loop with reads still outstanding, and those write
+     * into the bounce buffers and, through miss_dst, into cache slots that the
+     * unwind is about to hand back.  So wait for them.  If even that fails the
+     * ring's state is no longer known, and dropping it puts the next fetch on
+     * the pool rather than on a queue we cannot account for. */
+    while (inflight > 0) {
+        struct io_uring_cqe *cqe = NULL;
+        const int w = io_uring_wait_cqe(&s->ring, &cqe);
+        if (w < 0) {
+            if (w == -EINTR) continue;
+            ple_ring_close(s);
+            fprintf(stderr, "ds4: PLE ring left %u read(s) unaccounted (%s); "
+                            "falling back to the reader pool\n",
+                    inflight, strerror(-w));
+            return 1;
+        }
+        io_uring_cqe_seen(&s->ring, cqe);
+        inflight--;
+        reads++;
+    }
+
+    /* Unlike the pool, which sums each reader's own latency, this is the
+     * batch's wall time: with one thread issuing them the two are the same
+     * measurement only when the queue depth is one. */
+    s->stats.reads      += reads;
+    s->stats.read_bytes += bytes;
+    s->stats.read_seconds += ple_now() - t0;
+    return rc;
+}
+
+#endif /* DS4_HAVE_LIBURING */
+
 /* Issues `s->batch_n` reads across the pool and waits for all of them. */
 static int ple_run_batch(ds4_ple_stream *s, char *err, size_t errlen) {
     const uint32_t n = s->batch_n;
     if (n == 0) return 0;
+
+#if DS4_HAVE_LIBURING
+    /* When the ring came up the pool is never started, so its threads never
+     * exist rather than sitting idle. */
+    if (s->ring_ok) return ple_ring_batch(s, err, errlen);
+#endif
 
     ple_pool_start(s);
     if (s->n_workers == 0) {
@@ -805,6 +1142,11 @@ unwind:
         ple_index_remove(s, s->slot_row[slot]);
     }
     return 1;
+}
+
+const char *ds4_ple_stream_backend(const ds4_ple_stream *s) {
+    if (!s) return "none";
+    return s->ring_ok ? "uring" : "pool";
 }
 
 void ds4_ple_stream_get_stats(const ds4_ple_stream *s, ds4_ple_stats *out) {

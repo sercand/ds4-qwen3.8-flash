@@ -20,6 +20,7 @@
 /tests/test_qwen4exp_gdn
 /tests/test_qwen4exp_graph
 /tests/test_qwen4exp_ple
+/tests/test_ple_io
 /tests/test_qwen4exp_tokenizer
 /tests/test_gguf_split
 /tests/test_gpu_lookup_cache_strict

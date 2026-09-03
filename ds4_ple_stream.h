@@ -19,7 +19,16 @@
  * which is the wrong index and the wrong granularity here.
  *
  * The rows for a step are known before the step's first layer runs, so callers
- * should start the gather early and only wait just before the PLE layer. */
+ * should start the gather early and only wait just before the PLE layer.
+ *
+ * There are two I/O backends behind the same fetch call.  io_uring is the
+ * default where liburing was available at build time; otherwise, or with
+ * DS4_PLE_STREAM_IO=pool, a pool of threads doing blocking preads.  Both reach
+ * the device's random-read ceiling, but the ring reaches it from one thread at
+ * roughly a quarter of the CPU, which is what matters on a machine that runs
+ * other work beside the model.  Knobs: DS4_PLE_STREAM_IO (uring|pool, where
+ * "uring" refuses to fall back silently), DS4_PLE_STREAM_QD (reads in flight,
+ * default 256) and DS4_PLE_STREAM_WORKERS (pool threads, default 64). */
 
 enum {
     DS4_PLE_MAX_NGRAM = 4,
@@ -99,6 +108,11 @@ int ds4_ple_stream_fetch(ds4_ple_stream *s, const uint64_t *rows, uint32_t n,
  * hits.  Returns without waiting; a prefetch still running is finished first.
  * A no-op without a cache.  `rows` is copied. */
 int ds4_ple_stream_prefetch(ds4_ple_stream *s, const uint64_t *rows, uint32_t n);
+
+/* Which I/O backend the last fetch actually used: "uring" or "pool".  The
+ * choice can fall back at runtime, so callers and tests must ask rather than
+ * assume the one they requested. */
+const char *ds4_ple_stream_backend(const ds4_ple_stream *s);
 
 void ds4_ple_stream_get_stats(const ds4_ple_stream *s, ds4_ple_stats *out);
 uint64_t ds4_ple_stream_cache_rows(const ds4_ple_stream *s);
