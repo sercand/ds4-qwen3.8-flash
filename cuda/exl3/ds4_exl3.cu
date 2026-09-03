@@ -110,13 +110,13 @@ static exl3_stream_ctx *exl3_ctx(cudaStream_t stream, uint64_t had_halfs) {
                     (unsigned long long)c->had_halfs, (unsigned long long)had_halfs);
             return NULL;
         }
-        /* Growth waits for the stream: a running launch may still read it. */
-        if (exl3_fail(cudaStreamSynchronize(stream), "scratch growth sync")) return NULL;
-        if (c->had) (void)cudaFree(c->had);
-        c->had = NULL;
-        c->had_halfs = 0;
+        /* The old scratch is kept, not freed: a decode graph captured earlier
+         * on this stream still names it, and would replay into freed memory.
+         * A few tens of MB over a session; the buffers are small. */
         uint64_t want = had_halfs < (8u << 20) ? (8u << 20) : had_halfs;   /* 16 MiB floor */
-        if (exl3_fail(cudaMalloc((void **)&c->had, want * sizeof(half)), "activation scratch")) return NULL;
+        half *had = NULL;
+        if (exl3_fail(cudaMalloc((void **)&had, want * sizeof(half)), "activation scratch")) return NULL;
+        c->had = had;
         c->had_halfs = want;
     }
     return c;

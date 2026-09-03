@@ -1269,7 +1269,12 @@ extern "C" int ds4_gpu_q4e_matmul_f16(
     const uint64_t weight_bytes = out_dim * in_dim * 2u;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) return 0;
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
+        fprintf(stderr, "ds4: qwen4exp f16 matmul %llux%llu on %u rows: buffers too small (x %llu, out %llu)\n",
+                (unsigned long long)in_dim, (unsigned long long)out_dim, n_tok,
+                (unsigned long long)x->bytes, (unsigned long long)out->bytes);
+        return 0;
+    }
     const int tier = ds4_tensor_device_idx(out);
     const __half *w = (const __half *)cuda_resolve_weight_ptr(
             model_map, weight_offset, weight_bytes, tier, "q4e_f16");
@@ -1338,7 +1343,12 @@ extern "C" int ds4_gpu_q4e_matmul_exl3(
         const ds4_gpu_tensor *x, uint32_t n_tok) {
     if (!out || !x || !model_map || n_tok == 0u) return 0;
     if (x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) return 0;
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) {
+        fprintf(stderr, "ds4: qwen4exp exl3 matmul %llux%llu on %u rows: buffers too small (x %llu, out %llu)\n",
+                (unsigned long long)in_dim, (unsigned long long)out_dim, n_tok,
+                (unsigned long long)x->bytes, (unsigned long long)out->bytes);
+        return 0;
+    }
     const uint8_t *tiles, *suh, *svh;
     if (!q4e_exl3_ptrs(model_map, model_size, weight_offset, bytes, bits, in_dim, out_dim, 1u,
                        out, "qwen4exp exl3 dense", &tiles, &suh, &svh)) return 0;
