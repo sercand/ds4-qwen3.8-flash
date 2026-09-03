@@ -7,6 +7,8 @@
 #include <math.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -195,8 +197,6 @@ void ds4_ple_dequant_row(const ds4_ple_params *p, const uint8_t *src, uint32_t h
 typedef struct ple_worker {
     struct ds4_ple_stream *s;
     pthread_t th;
-    uint32_t  index;      /* stride offset into the miss list */
-    uint64_t  epoch;      /* last batch this worker ran */
     uint8_t  *bounce;
     size_t    bounce_cap;
     uint64_t  reads;
@@ -237,19 +237,38 @@ struct ds4_ple_stream {
     uint32_t  *pend_slot;
     uint32_t   miss_cap;
 
-    /* Miss read pool.  Idle workers block on cv_work; a batch bumps `epoch`
-     * and broadcasts, and the submitting thread runs stride 0 itself so a
-     * small batch never pays a wakeup. */
+    /* Miss read pool.  A batch posts the semaphore once per worker it wants
+     * -- as many as there are misses, so a decode step's handful of rows
+     * wakes a handful of threads, not all of them -- and every reader,
+     * the submitting thread included, takes miss indices from `next` until
+     * the list is drained.  Cold rows cost one device round trip each, so
+     * what matters is how many are in flight at once. */
     ple_worker      *workers;
     uint32_t         n_workers;   /* including the submitting thread */
     pthread_mutex_t  mu;
-    pthread_cond_t   cv_work;
     pthread_cond_t   cv_done;
-    uint64_t         epoch;
+    sem_t            sem_work;
+    atomic_uint      next;
     uint32_t         batch_n;
     uint32_t         batch_left;
     bool             pool_ready;
     bool             shutdown;
+
+    /* Fetches are serialized: the miss batch above is per stream, and the
+     * prefetch thread fetches on behalf of a later chunk while the caller may
+     * fetch (or another context may decode) at the same time. */
+    pthread_mutex_t  fetch_mu;
+
+    /* Prefetch: rows a coming prefill chunk will ask for are fetched into the
+     * cache by a thread of their own while the current chunk runs on the GPU,
+     * so the real fetch then hits.  The output of that fetch is discarded. */
+    pthread_t        pf_th;
+    pthread_mutex_t  pf_mu;
+    pthread_cond_t   pf_cv;
+    uint64_t        *pf_rows;
+    uint8_t         *pf_out;
+    uint32_t         pf_n, pf_cap;
+    bool             pf_ready, pf_busy;
 
     /* Direct reads keep the 26.8 GiB table out of the page cache, which would
      * otherwise compete with the resident weights for the same memory. */
@@ -371,6 +390,11 @@ int ds4_ple_stream_open(ds4_ple_stream **out,
 
     ds4_ple_stream *s = calloc(1, sizeof(*s));
     if (!s) { ple_fail(err, errlen, "out of memory"); return 1; }
+    if (pthread_mutex_init(&s->fetch_mu, NULL) != 0) {
+        ple_fail(err, errlen, "cannot init the PLE fetch lock");
+        free(s);
+        return 1;
+    }
     s->params = *params;
     s->fd = fd;
     s->file_offset = file_offset;
@@ -424,7 +448,19 @@ int ds4_ple_stream_open(ds4_ple_stream **out,
 
 void ds4_ple_stream_close(ds4_ple_stream *s) {
     if (!s) return;
+    if (s->pf_ready) {
+        pthread_mutex_lock(&s->pf_mu);
+        s->shutdown = true;
+        pthread_cond_broadcast(&s->pf_cv);
+        pthread_mutex_unlock(&s->pf_mu);
+        pthread_join(s->pf_th, NULL);
+        pthread_cond_destroy(&s->pf_cv);
+        pthread_mutex_destroy(&s->pf_mu);
+        free(s->pf_rows);
+        free(s->pf_out);
+    }
     ple_pool_stop(s);
+    pthread_mutex_destroy(&s->fetch_mu);
     if (s->direct && s->fd >= 0) close(s->fd);
     free(s->arena);
     free(s->slot_row);
@@ -491,10 +527,14 @@ static int ple_read_row(ds4_ple_stream *s, ple_worker *w, uint64_t row,
 }
 
 /* Runs this worker's stride of the current batch. */
-static void ple_run_stride(ds4_ple_stream *s, ple_worker *w) {
+/* Every reader takes the next miss until the list is drained: a slow read
+ * holds up one row, not a fixed stride of them. */
+static void ple_run_shared(ds4_ple_stream *s, ple_worker *w) {
     w->rc = 0;
     w->err[0] = '\0';
-    for (uint32_t i = w->index; i < s->batch_n; i += s->n_workers) {
+    for (;;) {
+        const uint32_t i = atomic_fetch_add(&s->next, 1u);
+        if (i >= s->batch_n) return;
         if (ple_read_row(s, w, s->miss_row[i], s->miss_dst[i],
                          w->err, sizeof(w->err)) != 0) {
             w->rc = 1;
@@ -506,28 +546,20 @@ static void ple_run_stride(ds4_ple_stream *s, ple_worker *w) {
 static void *ple_worker_main(void *arg) {
     ple_worker *w = (ple_worker *)arg;
     ds4_ple_stream *s = w->s;
-
-    pthread_mutex_lock(&s->mu);
     for (;;) {
-        while (!s->shutdown && s->epoch == w->epoch) {
-            pthread_cond_wait(&s->cv_work, &s->mu);
-        }
+        while (sem_wait(&s->sem_work) != 0) { /* EINTR */ }
         if (s->shutdown) break;
-        w->epoch = s->epoch;
-        pthread_mutex_unlock(&s->mu);
-
-        ple_run_stride(s, w);
-
+        ple_run_shared(s, w);
         pthread_mutex_lock(&s->mu);
         if (--s->batch_left == 0) pthread_cond_signal(&s->cv_done);
+        pthread_mutex_unlock(&s->mu);
     }
-    pthread_mutex_unlock(&s->mu);
     return NULL;
 }
 
-/* Below this many misses the wakeup round trip costs more than the reads it
- * would overlap, so the submitting thread just does them all. */
-#define PLE_POOL_MIN_MISSES 8
+/* Below this many misses a wakeup costs more than the read it would overlap,
+ * so the submitting thread does them alone. */
+#define PLE_POOL_MIN_MISSES 4
 
 static uint32_t ple_worker_count(void) {
     const char *env = getenv("DS4_PLE_STREAM_WORKERS");
@@ -535,7 +567,9 @@ static uint32_t ple_worker_count(void) {
         const long v = strtol(env, NULL, 10);
         if (v >= 1 && v <= 256) return (uint32_t)v;
     }
-    return 16;
+    /* A 2048-token prefill chunk misses ~20k rows of 4 KiB direct reads;
+     * 64 in flight reach the device's IOPS (100 ms vs 290 ms at 16). */
+    return 64;
 }
 
 /* Lazily started so a run that never misses pays nothing.  Failing to start a
@@ -551,15 +585,12 @@ static void ple_pool_start(ds4_ple_stream *s) {
 
     /* Slot 0 is the submitting thread's record: it owns a bounce buffer and
      * stats like the others, but no pthread. */
-    for (uint32_t i = 0; i < want; i++) {
-        s->workers[i].s = s;
-        s->workers[i].index = i;
-    }
+    for (uint32_t i = 0; i < want; i++) s->workers[i].s = s;
     s->n_workers = 1;
 
     if (pthread_mutex_init(&s->mu, NULL) != 0) return;
-    if (pthread_cond_init(&s->cv_work, NULL) != 0) return;
     if (pthread_cond_init(&s->cv_done, NULL) != 0) return;
+    if (sem_init(&s->sem_work, 0, 0) != 0) return;
 
     for (uint32_t i = 1; i < want; i++) {
         if (pthread_create(&s->workers[i].th, NULL, ple_worker_main, &s->workers[i]) != 0) break;
@@ -570,13 +601,11 @@ static void ple_pool_start(ds4_ple_stream *s) {
 static void ple_pool_stop(ds4_ple_stream *s) {
     if (!s->pool_ready || !s->workers) return;
     if (s->n_workers > 1) {
-        pthread_mutex_lock(&s->mu);
         s->shutdown = true;
-        pthread_cond_broadcast(&s->cv_work);
-        pthread_mutex_unlock(&s->mu);
+        for (uint32_t i = 1; i < s->n_workers; i++) sem_post(&s->sem_work);
         for (uint32_t i = 1; i < s->n_workers; i++) pthread_join(s->workers[i].th, NULL);
         pthread_cond_destroy(&s->cv_done);
-        pthread_cond_destroy(&s->cv_work);
+        sem_destroy(&s->sem_work);
         pthread_mutex_destroy(&s->mu);
     }
     for (uint32_t i = 0; i < s->n_workers; i++) free(s->workers[i].bounce);
@@ -596,26 +625,25 @@ static int ple_run_batch(ds4_ple_stream *s, char *err, size_t errlen) {
         return 1;
     }
 
-    const bool parallel = s->n_workers > 1 && n >= PLE_POOL_MIN_MISSES;
-    const uint32_t saved = s->n_workers;
-    if (!parallel) s->n_workers = 1;   /* stride 1: worker 0 takes everything */
-
-    if (parallel) {
+    atomic_store(&s->next, 0u);
+    uint32_t wake = 0;   /* readers besides this thread */
+    if (s->n_workers > 1 && n >= PLE_POOL_MIN_MISSES) {
+        wake = (n < s->n_workers ? n : s->n_workers) - 1u;
+    }
+    if (wake) {
         pthread_mutex_lock(&s->mu);
-        s->batch_left = s->n_workers - 1;   /* worker 0 is this thread */
-        s->epoch++;
-        pthread_cond_broadcast(&s->cv_work);
+        s->batch_left = wake;
         pthread_mutex_unlock(&s->mu);
+        for (uint32_t i = 0; i < wake; i++) sem_post(&s->sem_work);
     }
 
-    ple_run_stride(s, &s->workers[0]);
+    ple_run_shared(s, &s->workers[0]);
 
-    if (parallel) {
+    if (wake) {
         pthread_mutex_lock(&s->mu);
         while (s->batch_left != 0) pthread_cond_wait(&s->cv_done, &s->mu);
         pthread_mutex_unlock(&s->mu);
     }
-    s->n_workers = saved;
 
     /* Merge the per-worker stats and surface the first error. */
     int rc = 0;
@@ -632,10 +660,64 @@ static int ple_run_batch(ds4_ple_stream *s, char *err, size_t errlen) {
     return rc;
 }
 
+static int ple_fetch_locked(ds4_ple_stream *s, const uint64_t *rows, uint32_t n,
+                            uint8_t *out, char *err, size_t errlen);
+
 int ds4_ple_stream_fetch(ds4_ple_stream *s, const uint64_t *rows, uint32_t n,
                          uint8_t *out, char *err, size_t errlen) {
     if (!s || (!rows && n)) return 1;
     if (n == 0) return 0;
+    pthread_mutex_lock(&s->fetch_mu);
+    const int rc = ple_fetch_locked(s, rows, n, out, err, errlen);
+    pthread_mutex_unlock(&s->fetch_mu);
+    return rc;
+}
+
+static void *ple_prefetch_main(void *arg) {
+    ds4_ple_stream *s = arg;
+    pthread_mutex_lock(&s->pf_mu);
+    for (;;) {
+        while (!s->shutdown && !s->pf_busy) pthread_cond_wait(&s->pf_cv, &s->pf_mu);
+        if (s->shutdown) break;
+        pthread_mutex_unlock(&s->pf_mu);
+        char err[256];
+        (void)ds4_ple_stream_fetch(s, s->pf_rows, s->pf_n, s->pf_out, err, sizeof(err));
+        pthread_mutex_lock(&s->pf_mu);
+        s->pf_busy = false;
+        pthread_cond_broadcast(&s->pf_cv);
+    }
+    pthread_mutex_unlock(&s->pf_mu);
+    return NULL;
+}
+
+int ds4_ple_stream_prefetch(ds4_ple_stream *s, const uint64_t *rows, uint32_t n) {
+    if (!s || !rows || n == 0 || s->n_slots == 0) return 0;   /* nothing to warm without a cache */
+    if (!s->pf_ready) {
+        if (pthread_mutex_init(&s->pf_mu, NULL) != 0) return 1;
+        if (pthread_cond_init(&s->pf_cv, NULL) != 0) return 1;
+        if (pthread_create(&s->pf_th, NULL, ple_prefetch_main, s) != 0) return 1;
+        s->pf_ready = true;
+    }
+    pthread_mutex_lock(&s->pf_mu);
+    while (s->pf_busy) pthread_cond_wait(&s->pf_cv, &s->pf_mu);
+    if (s->pf_cap < n) {
+        uint64_t *r = realloc(s->pf_rows, (size_t)n * sizeof(*r));
+        uint8_t  *o = realloc(s->pf_out, (size_t)n * s->row_bytes);
+        if (r) s->pf_rows = r;
+        if (o) s->pf_out = o;
+        if (!r || !o) { pthread_mutex_unlock(&s->pf_mu); return 1; }
+        s->pf_cap = n;
+    }
+    memcpy(s->pf_rows, rows, (size_t)n * sizeof(*rows));
+    s->pf_n = n;
+    s->pf_busy = true;
+    pthread_cond_signal(&s->pf_cv);
+    pthread_mutex_unlock(&s->pf_mu);
+    return 0;
+}
+
+static int ple_fetch_locked(ds4_ple_stream *s, const uint64_t *rows, uint32_t n,
+                            uint8_t *out, char *err, size_t errlen) {
 
     if (s->miss_cap < n) {
         uint64_t  *mr = realloc(s->miss_row,  (size_t)n * sizeof(*mr));

@@ -55642,6 +55642,7 @@ struct ds4_q4e_graph {
     ds4_ple_params  ple_params;   /* row codec, hash constants, host bias pointer */
     uint64_t        ple_bias_offset;  /* per_layer_token_embd.bias in the model map, EXL3 rows only */
     uint64_t       *ple_row_ids;
+    uint64_t       *ple_pf_ids;    /* the next chunk's rows, for the prefetch */
     uint8_t        *ple_row_data;
 
     /* Speculative decoding.  A verify step runs 1 + K tokens through the
@@ -67011,6 +67012,7 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
     }
     q4e_page_table_free(&g->kv_table);
     free(g->ple_row_ids);
+    free(g->ple_pf_ids);
     free(g->ple_row_data);
     free(g->argmax_host);
     /* Captured decode islands bake in the addresses this context just gave
@@ -68188,6 +68190,7 @@ static void q4e_scratch_bind(ds4_q4e_graph *g, const ds4_q4e_graph *sc) {
     g->pend_pos0 = 0;
     g->argmax_host = NULL;
     g->ple_row_ids = NULL;
+    g->ple_pf_ids = NULL;
     g->ple_row_data = NULL;
     g->mtp_dump_fp = NULL;
     g->spec_steps = 0;
@@ -68248,6 +68251,7 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
         qwen4exp_ple_params(&g->ple_params, &e->model, e->weights.ple_table, e->weights.ple_bias);
         g->ple_bias_offset = e->weights.ple_bias ? e->weights.ple_bias->abs_offset : 0u;
         g->ple_row_ids = xmalloc((size_t)T * DS4_N_PLE_HEAD * sizeof(uint64_t));
+        g->ple_pf_ids = xmalloc((size_t)T * DS4_N_PLE_HEAD * sizeof(uint64_t));
         g->ple_row_data = xmalloc((size_t)T * DS4_N_PLE_HEAD *
                                   (size_t)ds4_ple_row_bytes(&g->ple_params));
     }
@@ -68990,6 +68994,19 @@ static int q4e_ple_gather(ds4_q4e_graph *g, const int *history,
     }
     return ds4_gpu_tensor_write(g->ple_rows, 0, g->ple_row_data,
                                 (uint64_t)n_rows * row_bytes) ? 0 : 1;
+}
+
+/* Warm the row cache with the next prefill chunk's rows while this chunk runs
+ * on the GPU: a 2048-token chunk misses ~20k rows, 100-300 ms of direct
+ * reads that would otherwise sit on the critical path (the reads themselves
+ * are what llama.cpp PR 28136 moved off its mmap; ds4 already reads directly,
+ * this hides them).  Rows past the actual next chunk are harmless. */
+static void q4e_ple_prefetch(ds4_q4e_graph *g, const int *history,
+                             uint32_t pos0, uint32_t n_tok) {
+    if (n_tok == 0 || n_tok > g->tok_cap) return;
+    ds4_ple_row_ids(&g->ple_params, history, pos0, n_tok, g->ple_pf_ids);
+    (void)ds4_ple_stream_prefetch(g->ple_stream, g->ple_pf_ids,
+                                  n_tok * g->ple_params.n_heads);
 }
 
 /* Run the target on history[pos0, pos0 + n_tok).  `logit_rows` is how many
@@ -71571,6 +71588,11 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "qwen4exp prefill failed at %u", pos);
                 ds4_session_invalidate(s);
                 return 1;
+            }
+            if (!last) {
+                const uint32_t rest = len - (pos + take);
+                q4e_ple_prefetch(g, prompt->v, pos + take,
+                                 rest < g->tok_cap ? rest : g->tok_cap);
             }
             if (q4e_mtp_after_prefill_chunk(s, prompt->v, pos, take) != 0) {
                 snprintf(err, errlen, "qwen4exp MTP prefill failed at %u", pos);

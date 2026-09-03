@@ -90,9 +90,15 @@ int ds4_ple_stream_open(ds4_ple_stream **out,
                         char *err, size_t errlen);
 void ds4_ple_stream_close(ds4_ple_stream *s);
 
-/* Copy the raw quant bytes of `n` rows into out[n * row_bytes]. */
+/* Copy the raw quant bytes of `n` rows into out[n * row_bytes].  Thread-safe;
+ * fetches are serialized. */
 int ds4_ple_stream_fetch(ds4_ple_stream *s, const uint64_t *rows, uint32_t n,
                          uint8_t *out, char *err, size_t errlen);
+
+/* Warm the cache with `rows` on a background thread, so a later fetch of them
+ * hits.  Returns without waiting; a prefetch still running is finished first.
+ * A no-op without a cache.  `rows` is copied. */
+int ds4_ple_stream_prefetch(ds4_ple_stream *s, const uint64_t *rows, uint32_t n);
 
 void ds4_ple_stream_get_stats(const ds4_ple_stream *s, ds4_ple_stats *out);
 uint64_t ds4_ple_stream_cache_rows(const ds4_ple_stream *s);
