@@ -68461,6 +68461,20 @@ static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor 
     return q4e_matmul_at(out, m->map, m->size, w, x, n_tok);
 }
 
+/* Two projections of the same input and shape -- a gate and its up.  EXL3
+ * tensors share one launch; anything else is two matmuls. */
+static int q4e_matmul_pair(ds4_gpu_tensor *out, ds4_gpu_tensor *out2, const ds4_model *m,
+                           const ds4_tensor *w, const ds4_tensor *w2,
+                           const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (tensor_type_is_exl3(w->type) && w2->type == w->type && w2->bytes == w->bytes &&
+        w->ndim == 2 && w2->ndim == 2 && w2->dim[0] == w->dim[0] && w2->dim[1] == w->dim[1]) {
+        return ds4_gpu_q4e_matmul_exl3_pair(out, out2, m->map, m->size, w->abs_offset, w2->abs_offset,
+                                            w->bytes, exl3_type_bits(w->type), w->dim[0], w->dim[1],
+                                            x, n_tok);
+    }
+    return q4e_matmul(out, m, w, x, n_tok) && q4e_matmul(out2, m, w2, x, n_tok);
+}
+
 /* Token embedding rows into f32: Q8_0 in the GGUF, the checkpoint's bf16 in
  * the EXL3 repack. */
 static int q4e_embed(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens,
@@ -68806,8 +68820,8 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
 static int q4e_moe_shared(ds4_q4e_graph *g, const ds4_model *m,
                           const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
     double t = q4e_phase_begin();
-    if (!q4e_matmul(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, n_tok)) return 0;
-    if (!q4e_matmul(g->sh_up, m, l->ffn_up_shexp, g->mixed, n_tok)) return 0;
+    if (!q4e_matmul_pair(g->sh_gate, g->sh_up, m, l->ffn_gate_shexp, l->ffn_up_shexp,
+                         g->mixed, n_tok)) return 0;
     if (!ds4_gpu_q4e_swiglu(g->sh_mid, g->sh_gate, g->sh_up,
                             (uint64_t)n_tok * DS4_N_FF_EXP)) return 0;
     q4e_trace("ffn_shexp_gate", (int)il, g->sh_gate, (uint64_t)n_tok * DS4_N_FF_EXP);

@@ -28,12 +28,24 @@ int ds4_exl3_gemm(const float *x, const void *tiles, const void *suh, const void
 
 /* Expert fan-out over a stacked tensor ([E] tiles, [E] suh, [E] svh): slot j
  * multiplies its input by expert ids[j] into y[j][m][n].  The input is x
- * broadcast to every slot when x_per_slot is 0, else x[j][m][k]. */
+ * broadcast to every slot when x_per_slot is 0, else x[j][m][k].  ids may be
+ * NULL for the identity (slot j is matrix j). */
 int ds4_exl3_mgemm(const float *x, int x_per_slot,
                    const void *tiles, const void *suh, const void *svh,
                    const int32_t *ids, uint32_t n_slots,
                    float *y, uint32_t m, uint32_t k, uint32_t n, uint32_t bits,
                    cudaStream_t stream);
+
+/* The same fan-out over two stacked tensors of one shape in a single launch:
+ * the slots run once over (tiles, suh, svh) into y and once over (tiles2,
+ * suh2, svh2) into y2, from the same inputs and ids -- a gate and an up
+ * projection that read the same activation. */
+int ds4_exl3_mgemm_pair(const float *x, int x_per_slot,
+                        const void *tiles, const void *suh, const void *svh, float *y,
+                        const void *tiles2, const void *suh2, const void *svh2, float *y2,
+                        const int32_t *ids, uint32_t n_slots,
+                        uint32_t m, uint32_t k, uint32_t n, uint32_t bits,
+                        cudaStream_t stream);
 
 /* The routed-expert block of one layer as a single fused launch (exllamav3's
  * exl3_moe): slot_out[slot][hidden] = down(silu(gate(x)) * up(x)) through the

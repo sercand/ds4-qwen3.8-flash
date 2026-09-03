@@ -1217,41 +1217,91 @@ extern "C" int ds4_gpu_q4e_matmul_bf16_rows(
 
 /* fp16 weights: the EXL3 repack keeps the checkpoint's unquantized tensors
  * (hyper-connection mix, router, PLE projections, GDN alpha/beta, injection
- * logits) as fp16.  Up to 16 rows: a warp per output row reading half2 pairs
- * once and dotting them with every row's f32 activation, the bf16 kernel
- * above with the other 16-bit type.  Above 16 rows (prefill) cuBLAS. */
+ * logits) as fp16.  Up to 16 rows: a warp per output row and K-split, each
+ * lane reading eight weights (16 bytes) at a time and dotting them with every
+ * row's f32 activation.  The split exists for the narrow outputs -- the
+ * hyper-connection down projections are 10240 inputs into 320 outputs and
+ * the injection logits 10240 into 4, both twice a layer -- which on a warp
+ * per row alone left most of the GPU idle; partials are split-major and a
+ * second pass adds them, so at one split the kernel writes the final layout.
+ * Above 16 rows (prefill) cuBLAS. */
 template <int NT>
 __global__ static void q4e_matmul_f16_rows_kernel(
         float *out, const __half *w, const float *x,
-        uint32_t in_dim, uint32_t out_dim) {
+        uint32_t in_dim, uint32_t out_dim, uint32_t chunk) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
     if (row >= out_dim) return;
-    const __half2 *wr = (const __half2 *)(w + (uint64_t)row * in_dim);
+    const uint32_t i0 = blockIdx.y * chunk;
+    const uint32_t i1 = min(i0 + chunk, in_dim);
+    const __half *wr = w + (uint64_t)row * in_dim;
     float acc[NT];
 #pragma unroll
     for (int t = 0; t < NT; t++) acc[t] = 0.0f;
-    for (uint32_t i = lane; i < in_dim / 2u; i += 32u) {
-        const float2 wv = __half22float2(wr[i]);
+    for (uint32_t i = i0 + lane * 8u; i < i1; i += 256u) {
+        const uint4 raw = *(const uint4 *)(wr + i);
+        const __half2 *h2 = (const __half2 *)&raw;
+        float wv[8];
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            const float2 f = __half22float2(h2[j]);
+            wv[2 * j] = f.x;
+            wv[2 * j + 1] = f.y;
+        }
 #pragma unroll
         for (int t = 0; t < NT; t++) {
-            const float2 xv = *(const float2 *)(x + (uint64_t)t * in_dim + 2u * i);
-            acc[t] = fmaf(wv.x, xv.x, acc[t]);
-            acc[t] = fmaf(wv.y, xv.y, acc[t]);
+            const float4 *xp = (const float4 *)(x + (uint64_t)t * in_dim + i);
+            const float4 xa = xp[0], xb = xp[1];
+            acc[t] = fmaf(wv[0], xa.x, acc[t]);
+            acc[t] = fmaf(wv[1], xa.y, acc[t]);
+            acc[t] = fmaf(wv[2], xa.z, acc[t]);
+            acc[t] = fmaf(wv[3], xa.w, acc[t]);
+            acc[t] = fmaf(wv[4], xb.x, acc[t]);
+            acc[t] = fmaf(wv[5], xb.y, acc[t]);
+            acc[t] = fmaf(wv[6], xb.z, acc[t]);
+            acc[t] = fmaf(wv[7], xb.w, acc[t]);
         }
     }
+    float *dst = out + (uint64_t)blockIdx.y * NT * out_dim;
 #pragma unroll
     for (int t = 0; t < NT; t++) {
         const float v = warp_sum_f32(acc[t]);
-        if (lane == 0u) out[(uint64_t)t * out_dim + row] = v;
+        if (lane == 0u) dst[(uint64_t)t * out_dim + row] = v;
     }
 }
 
+__global__ static void q4e_matvec_f32_combine_kernel(
+        float *out, const float *partial, uint32_t out_dim, uint32_t n_split);
+
+/* Splits until the warps number about a thousand, as long as each keeps at
+ * least one full 256-wide pass; every partial row set then fits the 2048 x
+ * 16 floats reserved below.  Static, not cuda_tmp scratch: that buffer is
+ * regrown by the surrounding matmuls, and a grow would free it from under
+ * the graph that captured this launch (see ds4_gpu_q4e_matvec_f32). */
+#define Q4E_F16_PARTIAL_FLOATS (2048u * 16u)
 template <int NT>
 static int q4e_matmul_f16_rows_launch(float *out, const __half *w, const float *x,
                                       uint32_t in_dim, uint32_t out_dim) {
-    q4e_matmul_f16_rows_kernel<NT><<<(out_dim + 7u) / 8u, 256, 0, cuda_decode_stream()>>>(
-            out, w, x, in_dim, out_dim);
+    uint32_t n_split = 1u;
+    while (out_dim * (uint64_t)n_split < 1024u && in_dim / (n_split * 2u) >= 256u) n_split *= 2u;
+    const uint32_t chunk = ((in_dim + n_split - 1u) / n_split + 255u) & ~255u;
+    float *dst = out;
+    if (n_split > 1u) {
+        static float *g_partial = NULL;
+        if (!g_partial &&
+            cudaMalloc((void **)&g_partial, Q4E_F16_PARTIAL_FLOATS * sizeof(float)) != cudaSuccess) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        dst = g_partial;
+    }
+    q4e_matmul_f16_rows_kernel<NT><<<dim3((out_dim + 7u) / 8u, n_split), 256, 0, cuda_decode_stream()>>>(
+            dst, w, x, in_dim, out_dim, chunk);
+    if (n_split > 1u) {
+        const uint32_t n = NT * out_dim;
+        q4e_matvec_f32_combine_kernel<<<(n + 127u) / 128u, 128, 0, cuda_decode_stream()>>>(
+                out, dst, n, n_split);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp f16 rows matmul");
 }
 
@@ -1265,7 +1315,8 @@ extern "C" int ds4_gpu_q4e_matmul_f16(
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x, uint32_t n_tok) {
     if (!out || !x || !model_map || n_tok == 0u) return 0;
-    if ((in_dim & 1u) != 0u || in_dim == 0u || out_dim == 0u || out_dim > UINT32_MAX) return 0;
+    /* Eight halfs per lane: 16-byte weight and float4 activation loads. */
+    if ((in_dim & 7u) != 0u || in_dim == 0u || out_dim == 0u || out_dim > UINT32_MAX) return 0;
     const uint64_t weight_bytes = out_dim * in_dim * 2u;
     if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
     if (x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
@@ -1402,15 +1453,21 @@ __global__ static void q4e_moe_rows_per_slot_kernel(
 /* Routed EXL3 experts as an mgemm fan-out: one slot per (token, expert) with
  * the same input row, outputs [n_tok * n_used][out_dim] -- the layout the
  * swiglu and down stages already expect.  `x_rows` is the per-slot input
- * when the caller has one (down), else the per-token input to replicate. */
-static int q4e_moe_exl3(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, bool x_per_slot,
-                        const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size,
-                        uint64_t weight_offset, uint64_t bytes, uint32_t bits,
+ * when the caller has one (down), else the per-token input to replicate.
+ * With `out2` the second tensor (`weight_offset2`) runs in the same launch on
+ * the same slots -- gate and up, which at one token are otherwise two
+ * cooperative launches over half the GPU each. */
+static int q4e_moe_exl3(ds4_gpu_tensor *out, ds4_gpu_tensor *out2, const ds4_gpu_tensor *x,
+                        bool x_per_slot, const ds4_gpu_tensor *ids,
+                        const void *model_map, uint64_t model_size,
+                        uint64_t weight_offset, uint64_t weight_offset2, uint64_t bytes, uint32_t bits,
                         uint32_t out_dim, uint32_t in_dim, uint32_t n_tok,
                         uint32_t n_expert, uint32_t n_used, const char *label) {
-    const uint8_t *tiles, *suh, *svh;
+    const uint8_t *tiles, *suh, *svh, *tiles2 = NULL, *suh2 = NULL, *svh2 = NULL;
     if (!q4e_exl3_ptrs(model_map, model_size, weight_offset, bytes, bits, in_dim, out_dim,
                        n_expert, out, label, &tiles, &suh, &svh)) return 0;
+    if (out2 && !q4e_exl3_ptrs(model_map, model_size, weight_offset2, bytes, bits, in_dim, out_dim,
+                               n_expert, out2, label, &tiles2, &suh2, &svh2)) return 0;
     const uint32_t n_slots = n_tok * n_used;
     const float *xin = (const float *)x->ptr;
     int per_slot = x_per_slot ? 1 : 0;
@@ -1425,8 +1482,41 @@ static int q4e_moe_exl3(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, bool x_per
         xin = rep;
         per_slot = 1;
     }
+    if (out2) {
+        return ds4_exl3_mgemm_pair(xin, per_slot, tiles, suh, svh, (float *)out->ptr,
+                                   tiles2, suh2, svh2, (float *)out2->ptr,
+                                   (const int32_t *)ids->ptr, n_slots, 1u, in_dim, out_dim, bits,
+                                   cuda_decode_stream());
+    }
     return ds4_exl3_mgemm(xin, per_slot, tiles, suh, svh, (const int32_t *)ids->ptr, n_slots,
                           (float *)out->ptr, 1u, in_dim, out_dim, bits, cuda_decode_stream());
+}
+
+/* Two dense EXL3 tensors of one shape on the same input in one launch (the
+ * shared expert's gate and up): the expert fan-out with a single expert per
+ * tensor.  Past the reconstruct threshold each goes its own way. */
+extern "C" int ds4_gpu_q4e_matmul_exl3_pair(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *out2, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t weight_offset2, uint64_t bytes, uint32_t bits,
+        uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (n_tok > Q4E_EXL3_RECONSTRUCT_ROWS) {
+        return ds4_gpu_q4e_matmul_exl3(out, model_map, model_size, weight_offset, bytes, bits,
+                                       in_dim, out_dim, x, n_tok) &&
+               ds4_gpu_q4e_matmul_exl3(out2, model_map, model_size, weight_offset2, bytes, bits,
+                                       in_dim, out_dim, x, n_tok);
+    }
+    if (!out || !out2 || !x || !model_map || n_tok == 0u) return 0;
+    if (x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
+        out2->bytes < (uint64_t)n_tok * out_dim * sizeof(float)) return 0;
+    const uint8_t *tiles, *suh, *svh, *tiles2, *suh2, *svh2;
+    if (!q4e_exl3_ptrs(model_map, model_size, weight_offset, bytes, bits, in_dim, out_dim, 1u,
+                       out, "qwen4exp exl3 dense pair", &tiles, &suh, &svh) ||
+        !q4e_exl3_ptrs(model_map, model_size, weight_offset2, bytes, bits, in_dim, out_dim, 1u,
+                       out2, "qwen4exp exl3 dense pair", &tiles2, &suh2, &svh2)) return 0;
+    return ds4_exl3_mgemm_pair((const float *)x->ptr, 0, tiles, suh, svh, (float *)out->ptr,
+                               tiles2, suh2, svh2, (float *)out2->ptr, NULL, 1u,
+                               n_tok, (uint32_t)in_dim, (uint32_t)out_dim, bits, cuda_decode_stream());
 }
 
 /* The routed block of a prefill chunk as exllamav3 runs it: one fused launch
@@ -3531,8 +3621,9 @@ extern "C" int ds4_gpu_q4e_moe_down(
         const uint32_t bits = weight_type - 68u + 4u;
         const uint64_t bytes = (uint64_t)n_expert *
             ((uint64_t)in_dim * out_dim * bits / 8u + 2u * ((uint64_t)in_dim + out_dim));
-        return q4e_moe_exl3(out, x, true, ids, model_map, model_size, weight_offset, bytes, bits,
-                            out_dim, in_dim, n_tok, n_expert, n_used, "qwen4exp exl3 moe down");
+        return q4e_moe_exl3(out, NULL, x, true, ids, model_map, model_size, weight_offset, 0u,
+                            bytes, bits, out_dim, in_dim, n_tok, n_expert, n_used,
+                            "qwen4exp exl3 moe down");
     }
     const uint32_t block_bytes = (weight_type == 7u) ? 24u : (weight_type == 8u) ? 34u : 0u;
     if (block_bytes == 0u) {
@@ -3656,10 +3747,9 @@ extern "C" int ds4_gpu_q4e_moe_gate_up(
         const uint32_t bits = weight_type - 68u + 4u;
         const uint64_t bytes = (uint64_t)n_expert *
             ((uint64_t)in_dim * out_dim * bits / 8u + 2u * ((uint64_t)in_dim + out_dim));
-        return q4e_moe_exl3(gate, x, false, ids, model_map, model_size, gate_offset, bytes, bits,
-                            out_dim, in_dim, n_tok, n_expert, n_used, "qwen4exp exl3 moe gate") &&
-               q4e_moe_exl3(up, x, false, ids, model_map, model_size, up_offset, bytes, bits,
-                            out_dim, in_dim, n_tok, n_expert, n_used, "qwen4exp exl3 moe up");
+        return q4e_moe_exl3(gate, up, x, false, ids, model_map, model_size, gate_offset, up_offset,
+                            bytes, bits, out_dim, in_dim, n_tok, n_expert, n_used,
+                            "qwen4exp exl3 moe gate/up");
     }
 
     uint64_t block_elems = 0, block_bytes = 0;

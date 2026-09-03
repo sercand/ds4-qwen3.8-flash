@@ -3135,6 +3135,7 @@ int ds4_gpu_q4e_matmul_f16( ds4_gpu_tensor *out, const void *model_map, uint64_t
 /* EXL3 trellis weights (cuda/exl3).  `bytes` is the whole payload -- tiles
  * followed by the suh/svh scale vectors -- and `bits` the K of the tensor. */
 int ds4_gpu_q4e_matmul_exl3( ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t bytes, uint32_t bits, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_q4e_matmul_exl3_pair( ds4_gpu_tensor *out, ds4_gpu_tensor *out2, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t weight_offset2, uint64_t bytes, uint32_t bits, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
 
 int ds4_gpu_q4e_hc_init( ds4_gpu_tensor *res, const ds4_gpu_tensor *embed, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 /* res = embed broadcast over the streams + h ([n_tok, n_hc * n_embd]). */

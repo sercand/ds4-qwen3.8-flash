@@ -43,7 +43,12 @@ called by `ds4_qwen4exp_gpu.cuh`.
   `svh_base + q * n`, selected per slot by `int32` ids (ds4's router output).
   The pointer-table arguments, the expert-range filtering, the weighted
   reduction into slot 0 and the per-matrix width lists are removed; ds4 does
-  the routing-weight combine in its own kernel.
+  the routing-weight combine in its own kernel.  A second stacked tensor
+  (`B_base2`, `suh_base2`, `svh_base2`, `C2`, `split`) lets one launch run the
+  slots over a gate and an up projection that share their input.
+- Launch geometry (`ds4_exl3.cu`) is tuned for GB10 rather than autotuned:
+  the dense GEMM runs four blocks per output tile column (8..48), the mgemm
+  one block group per slot.
 - `exl3_moe_kernel` (the fused routed-expert prefill block) takes the same
   treatment: fp32 `hidden_state` gathered by `had_fh_r_128_inner`, the nine
   pointer tables replaced by three stacked tensors, the routing as int32

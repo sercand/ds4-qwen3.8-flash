@@ -205,9 +205,17 @@ extern "C" int ds4_exl3_gemm(const float *x, const void *tiles, const void *suh,
     const int shape = exl3_select_shape((int)m, (int)k, (int)n, (int)bits, false, 1, 1);
     if (!shape) return 0;
     fp_exl3_gemm_kernel kernel = g_gemm[bits - DS4_EXL3_MIN_BITS][shape];
-    const int max_slices = (int)(k / g_tile_k[shape]) * (int)(n / g_tile_n[shape]);
-    int num_blocks = max_slices < g_max_blocks ? max_slices : g_max_blocks;
-    if (num_blocks < 1) num_blocks = 1;
+    /* Blocks sharing an output tile column hand their partial sums down a
+     * lock chain, so past about four blocks per column the chain costs more
+     * than the extra streams earn: the indexer's 2560 x 128 K = 4 tensor ran
+     * three times slower on 48 blocks than on 8, the 2560 x 640 shared
+     * expert 15% slower than on 20.  Measured on GB10 (48 SMs, one block
+     * each); the wide tensors still take every SM. */
+    const int tiles_k = (int)(k / g_tile_k[shape]), tiles_n = (int)(n / g_tile_n[shape]);
+    int num_blocks = 4 * tiles_n;
+    if (num_blocks < 8) num_blocks = 8;
+    if (num_blocks > g_max_blocks) num_blocks = g_max_blocks;
+    if (num_blocks > tiles_k * tiles_n) num_blocks = tiles_k * tiles_n;
 
     const half *suh_h = (const half *)suh;
     const half *svh_h = (const half *)svh;
@@ -221,53 +229,77 @@ extern "C" int ds4_exl3_gemm(const float *x, const void *tiles, const void *suh,
                                                   args, SMEM_MAX, stream), "gemm launch");
 }
 
+/* `n_slots` slots over the first tensor, then the same slots again over the
+ * second when it is given (tiles2 != NULL): 2 * n_slots launch slots. */
+static int exl3_mgemm_launch(const float *x, int x_per_slot,
+                             const void *tiles, const void *suh, const void *svh, float *y,
+                             const void *tiles2, const void *suh2, const void *svh2, float *y2,
+                             const int32_t *ids, uint32_t n_slots,
+                             uint32_t m, uint32_t k, uint32_t n, uint32_t bits,
+                             cudaStream_t stream) {
+    if (!x || !tiles || !suh || !svh || !y || m == 0 || n_slots == 0) return 0;
+    if (tiles2 && (!suh2 || !svh2 || !y2)) return 0;
+    if (!exl3_check_shape(k, n, bits, "mgemm")) return 0;
+    const uint32_t total = tiles2 ? 2u * n_slots : n_slots;
+    /* One transformed slab per slot: an undersized scratch is silent
+     * out-of-bounds corruption (exllamav3's comment: "found the hard way"). */
+    exl3_stream_ctx *c = exl3_ctx(stream, (uint64_t)total * m * k);
+    if (!c) return 0;
+
+    const int bszm_in = x_per_slot ? (int)total : 1;
+    const int bszm_out = (int)total;
+    const int shape = exl3_select_shape((int)m, (int)k, (int)n, (int)bits, true, bszm_in, bszm_out);
+    if (!shape) return 0;
+    fp_exl3_mgemm_kernel kernel = g_mgemm[bits - DS4_EXL3_MIN_BITS][shape];
+
+    /* Geometry: every slot gets its own block group when the co-resident
+     * budget allows, so a decode launch streams all its experts at once
+     * instead of in rounds.  On GB10 (48 blocks) the ten routed experts of
+     * a token ran 23% faster on 10 groups of 4 than on exllamav3's 6 groups
+     * of 8, and the two shared-expert projections as 2 groups of 24 take
+     * half the time of two dense launches. */
+    const int n_tiles = (int)(k / g_tile_k[shape]) * (int)(n / g_tile_n[shape]);
+    int concurrency = (int)total;
+    if (concurrency > g_max_blocks) concurrency = g_max_blocks;
+    if (concurrency > MAX_BARRIERS) concurrency = MAX_BARRIERS;
+    int per_group = g_max_blocks / concurrency;
+    if (per_group > n_tiles) per_group = n_tiles;
+    if (per_group < 1) per_group = 1;
+
+    const size_t stride = (size_t)k * n * bits / 8u / sizeof(uint16_t);
+    const uint16_t *B = (const uint16_t *)tiles, *B2 = (const uint16_t *)tiles2;
+    const half *suh_h = (const half *)suh, *suh2_h = (const half *)suh2;
+    const half *svh_h = (const half *)svh, *svh2_h = (const half *)svh2;
+    half *had = c->had;
+    int *locks = c->locks;
+    int size_m = (int)m, size_k = (int)k, size_n = (int)n, split = (int)n_slots;
+    void *args[] = { (void *)&x, (void *)&B, (void *)&stride, (void *)&y, (void *)&size_m,
+                     (void *)&size_k, (void *)&size_n, (void *)&locks, (void *)&suh_h, (void *)&had,
+                     (void *)&svh_h, (void *)&ids, (void *)&bszm_in, (void *)&bszm_out,
+                     (void *)&B2, (void *)&suh2_h, (void *)&svh2_h, (void *)&y2, (void *)&split };
+    return !exl3_fail(cudaLaunchCooperativeKernel((const void *)kernel, dim3(per_group, 1, concurrency),
+                                                  dim3(g_block_dim[shape]), args, SMEM_MAX, stream),
+                      "mgemm launch");
+}
+
 extern "C" int ds4_exl3_mgemm(const float *x, int x_per_slot,
                               const void *tiles, const void *suh, const void *svh,
                               const int32_t *ids, uint32_t n_slots,
                               float *y, uint32_t m, uint32_t k, uint32_t n, uint32_t bits,
                               cudaStream_t stream) {
-    if (!x || !tiles || !suh || !svh || !ids || !y || m == 0 || n_slots == 0) return 0;
-    if (!exl3_check_shape(k, n, bits, "mgemm")) return 0;
-    /* One transformed slab per slot: an undersized scratch is silent
-     * out-of-bounds corruption (exllamav3's comment: "found the hard way"). */
-    exl3_stream_ctx *c = exl3_ctx(stream, (uint64_t)n_slots * m * k);
-    if (!c) return 0;
+    return exl3_mgemm_launch(x, x_per_slot, tiles, suh, svh, y, NULL, NULL, NULL, NULL,
+                             ids, n_slots, m, k, n, bits, stream);
+}
 
-    const int bszm_in = x_per_slot ? (int)n_slots : 1;
-    const int bszm_out = (int)n_slots;
-    const int shape = exl3_select_shape((int)m, (int)k, (int)n, (int)bits, true, bszm_in, bszm_out);
-    if (!shape) return 0;
-    fp_exl3_mgemm_kernel kernel = g_mgemm[bits - DS4_EXL3_MIN_BITS][shape];
-
-    /* Geometry as exl3_mgemm_gr: blocks per slot from the tile count, then as
-     * many slot groups side by side as fit the co-resident block budget. */
-    const int tiles_n = (int)(k / g_tile_k[shape]) * (int)(n / g_tile_n[shape]);
-    int per_group = tiles_n / (g_max_blocks > 128 ? 20 : 24);
-    if (per_group < 1) per_group = 1;
-    if (per_group > g_max_blocks) per_group = g_max_blocks;
-    if (per_group * (int)n_slots > g_max_blocks) {
-        per_group = g_max_blocks / (int)n_slots;
-        if (per_group < 1) per_group = 1;
-    }
-    if (tiles_n / per_group > 48 && per_group * 2 <= g_max_blocks) per_group *= 2;
-    int concurrency = g_max_blocks / per_group;
-    if (concurrency > (int)n_slots) concurrency = (int)n_slots;
-    if (concurrency > MAX_BARRIERS) concurrency = MAX_BARRIERS;
-    if (concurrency < 1) concurrency = 1;
-
-    const size_t stride = (size_t)k * n * bits / 8u / sizeof(uint16_t);
-    const uint16_t *B = (const uint16_t *)tiles;
-    const half *suh_h = (const half *)suh;
-    const half *svh_h = (const half *)svh;
-    half *had = c->had;
-    int *locks = c->locks;
-    int size_m = (int)m, size_k = (int)k, size_n = (int)n;
-    void *args[] = { (void *)&x, (void *)&B, (void *)&stride, (void *)&y, (void *)&size_m,
-                     (void *)&size_k, (void *)&size_n, (void *)&locks, (void *)&suh_h, (void *)&had,
-                     (void *)&svh_h, (void *)&ids, (void *)&bszm_in, (void *)&bszm_out };
-    return !exl3_fail(cudaLaunchCooperativeKernel((const void *)kernel, dim3(per_group, 1, concurrency),
-                                                  dim3(g_block_dim[shape]), args, SMEM_MAX, stream),
-                      "mgemm launch");
+extern "C" int ds4_exl3_mgemm_pair(const float *x, int x_per_slot,
+                                   const void *tiles, const void *suh, const void *svh, float *y,
+                                   const void *tiles2, const void *suh2, const void *svh2, float *y2,
+                                   const int32_t *ids, uint32_t n_slots,
+                                   uint32_t m, uint32_t k, uint32_t n, uint32_t bits,
+                                   cudaStream_t stream) {
+    if (!tiles2) return 0;
+    return exl3_mgemm_launch(x, x_per_slot, tiles, suh, svh, y, tiles2, suh2, svh2, y2,
+                             ids, n_slots, m, k, n, bits, stream);
 }
 
 extern "C" int ds4_exl3_reconstruct(const void *tiles, const void *suh, const void *svh,

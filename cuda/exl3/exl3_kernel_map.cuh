@@ -28,7 +28,11 @@
 
 // ds4: stacked expert tensors -- matrix q is B_base + q * B_stride (uint16
 // units), suh_base + q * size_k, svh_base + q * size_n -- selected per slot by
-// int32 ids.  See VENDOR.md.
+// int32 ids.  Two stacked tensors of the same shape can share one launch:
+// slots [0, split) address the first and write C, slots [split, bszm) address
+// the second with ids[slot - split], the same input row, and write C2 (the
+// routed gate and up projections read the same activation).  With
+// B_base2 == nullptr every slot uses the first tensor.  See VENDOR.md.
 #define EXL3_MGEMM_ARGS \
     const float* __restrict__  A, \
     const uint16_t* __restrict__ B_base, \
@@ -43,7 +47,12 @@
     const half* __restrict__ svh_base, \
     const int32_t* __restrict__ B_indices, \
     const int bszm_in, \
-    const int bszm_out
+    const int bszm_out, \
+    const uint16_t* __restrict__ B_base2, \
+    const half* __restrict__ suh_base2, \
+    const half* __restrict__ svh_base2, \
+    void* __restrict__ C2, \
+    const int split
 
 typedef void (*fp_exl3_gemm_kernel) (EXL3_GEMM_ARGS);
 typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);

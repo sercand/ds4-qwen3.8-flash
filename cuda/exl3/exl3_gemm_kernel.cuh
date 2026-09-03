@@ -61,7 +61,10 @@ void exl3_gemm_kernel(EXL3_GEMM_ARGS)
 
 // Expert fan-out: slot j runs A (or A[j] when bszm_in > 1) through matrix
 // ids[j] of a stacked expert tensor into C[j].  blockIdx.z picks which slots a
-// block group serves; the groups synchronize among themselves only.
+// block group serves; the groups synchronize among themselves only.  Slots at
+// or past `split` are the second tensor's (see EXL3_MGEMM_ARGS): slot j there
+// is row j - split of the first tensor's ids, input and output, so C and C2
+// come out in the same [split][m][n] layout.
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
@@ -72,17 +75,27 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
     for (int i = 0; i < bszm; i += gridDim.z)
     {
         int j = i + blockIdx.z;
+        int jj = j;                 // slot within its tensor
         const uint16_t* B = nullptr;
         const half* suh = nullptr;
         const half* svh = nullptr;
+        void* C_out = C;
         if (j < bszm)
         {
-            int mat_index = B_indices ? (int) B_indices[j] : j;
+            const uint16_t* Bb = B_base;
+            const half* suhb = suh_base;
+            const half* svhb = svh_base;
+            if (B_base2 && j >= split)
+            {
+                jj = j - split;
+                Bb = B_base2; suhb = suh_base2; svhb = svh_base2; C_out = C2;
+            }
+            int mat_index = B_indices ? (int) B_indices[jj] : jj;
             if (mat_index >= 0)
             {
-                B = B_base + (size_t) mat_index * B_stride;
-                suh = suh_base + (size_t) mat_index * size_k;
-                svh = svh_base + (size_t) mat_index * size_n;
+                B = Bb + (size_t) mat_index * B_stride;
+                suh = suhb + (size_t) mat_index * size_k;
+                svh = svhb + (size_t) mat_index * size_n;
             }
         }
 
@@ -94,7 +107,7 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
             int warps_grid = gridDim.x * blockDim.x / 32;
             int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
 
-            const float* A_ = bszm_in == 1 ? A : A + (size_t) j * size_m * size_k;
+            const float* A_ = bszm_in == 1 ? A : A + (size_t) jj * size_m * size_k;
             half* A_had_ = A_had + (size_t) j * size_m * size_k;
 
             for(; this_warp < total_warps; this_warp += warps_grid)
@@ -114,8 +127,8 @@ void exl3_mgemm_kernel(EXL3_MGEMM_ARGS)
         int size_m_ = size_m;
         half* A_ = A_had + (size_t) j * size_m * size_k;
         void* C_;
-        if constexpr (c_fp32) C_ = (void*) (((float*) C) + (size_t) j * size_m * size_n);
-        else                  C_ = (void*) (((half*) C) + (size_t) j * size_m * size_n);
+        if constexpr (c_fp32) C_ = (void*) (((float*) C_out) + (size_t) jj * size_m * size_n);
+        else                  C_ = (void*) (((half*) C_out) + (size_t) jj * size_m * size_n);
         void* C_base = C_;
 
         while (size_m_ > 0)
