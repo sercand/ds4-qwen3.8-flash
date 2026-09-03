@@ -39,6 +39,11 @@ int ds4_exl3_mgemm(const float *x, int x_per_slot,
  * k halfs) ahead of CUDA graph capture, inside which it cannot grow. */
 int ds4_exl3_reserve(cudaStream_t stream, uint64_t had_halfs);
 
+/* Give `stream` a lock buffer and a scratch as large as any stream has needed
+ * so far.  Call before capturing a graph on it; a no-op when no EXL3 launch
+ * has happened yet (the model is not EXL3). */
+int ds4_exl3_prepare_stream(cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

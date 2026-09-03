@@ -22,6 +22,7 @@
 #include <algorithm>
 
 #include "cuda/mmq/ds4_mmq.h"
+#include "cuda/exl3/ds4_exl3.h"
 #include "cuda/mmq/ds4_repack.h"
 
 #ifndef M_PI
@@ -1114,8 +1115,14 @@ extern "C" int ds4_gpu_decode_graph_begin(const ds4_decode_graph_key *key) {
         }
     }
     /* cuBLAS rides the legacy NULL stream, which cannot be captured:
-     * point the handle at the capture stream for the duration. */
+     * point the handle at the capture stream for the duration.  The EXL3
+     * kernels' per-stream lock buffer and scratch likewise have to exist
+     * before capture, since nothing can be allocated inside one. */
     (void)cublasSetStream(cuda_cublas_for_tier(0), g_decode_graph_stream);
+    if (!ds4_exl3_prepare_stream(g_decode_graph_stream)) {
+        cuda_decode_graph_entry_kill(e);
+        return -1;
+    }
     if (!cuda_ok(cudaStreamBeginCapture(g_decode_graph_stream,
                                         cudaStreamCaptureModeGlobal),
                  "decode graph begin capture")) {

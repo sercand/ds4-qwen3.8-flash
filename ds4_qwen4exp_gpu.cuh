@@ -16,7 +16,6 @@
  */
 #include "ds4_q4e_page.h"
 #include "ds4_ple_stream.h"
-#include "cuda/exl3/ds4_exl3.h"
 
 /* Block-wide reductions over at most 32 warps.  ds4_cuda.cu already has the
  * warp-level pair; these lift them to a whole block, which the grouped norms

@@ -126,6 +126,13 @@ extern "C" int ds4_exl3_reserve(cudaStream_t stream, uint64_t had_halfs) {
     return exl3_ctx(stream, had_halfs) != NULL;
 }
 
+extern "C" int ds4_exl3_prepare_stream(cudaStream_t stream) {
+    if (g_n_ctx == 0) return 1;
+    uint64_t halfs = 0;
+    for (int i = 0; i < g_n_ctx; i++) if (g_ctx[i].had_halfs > halfs) halfs = g_ctx[i].had_halfs;
+    return exl3_ctx(stream, halfs) != NULL;
+}
+
 /* exllamav3's shape heuristic for Blackwell (select_gemm_shape, CC_BLACKWELL
  * branch), with the shape's tile constraints checked. */
 static int exl3_select_shape(int size_m, int size_k, int size_n, int K, bool multi,

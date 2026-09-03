@@ -66864,6 +66864,20 @@ static void q4e_trace(const char *name, int il, const ds4_gpu_tensor *t, uint64_
     float *host = xmalloc(n * sizeof(float));
     ds4_gpu_synchronize();
     if (ds4_gpu_tensor_read(t, 0, host, n * sizeof(float))) {
+        /* DS4_QWEN4EXP_TRACE_DUMP=<dir> also writes each traced tensor as raw
+         * f32 (<dir>/<id>.bin, first occurrence wins) for an elementwise diff
+         * against another engine's dump; the norms below only bound a drift. */
+        const char *dump_dir = getenv("DS4_QWEN4EXP_TRACE_DUMP");
+        if (dump_dir && dump_dir[0]) {
+            char path[512];
+            if (il >= 0) snprintf(path, sizeof(path), "%s/%s-%d.bin", dump_dir, name, il);
+            else         snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, name);
+            FILE *fp = fopen(path, "wxb");
+            if (fp) {
+                fwrite(host, sizeof(float), n, fp);
+                fclose(fp);
+            }
+        }
         double sum = 0.0, l1 = 0.0, l2 = 0.0;
         for (uint64_t i = 0; i < n; i++) {
             sum += host[i];
