@@ -46,6 +46,7 @@ NVCC_ARCH_FLAGS := -gencode arch=compute_121a,code=sm_121a -DDS4_CUDA_HAVE_MXF4=
 else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
+EXL3_ARCH_FLAGS := $(NVCC_ARCH_FLAGS)
 else
 # Unpinned build: nvcc's own default is compute_75 alone, so on anything
 # newer the driver JITs Turing PTX for every kernel -- and both the ds4 and
@@ -63,19 +64,28 @@ else
 # rejects.  MXF4 stays off: -DDS4_CUDA_HAVE_MXF4=1 selects different kernels
 # rather than a different arch, so it belongs to the pinned build only.  A
 # host with no GPU (or no device query) falls back to nvcc's default.
+# The vendored EXL3 kernels (cuda/exl3) are fp16 tensor-core code -- mma.m16n8k16,
+# cp.async, cooperative groups -- with no Turing form at all, so that TU gets
+# the host GPU's cubin alone (sm_80 when there is no host GPU to ask).
 NVCC_HOST_CC := $(shell $(CUDA_HOME)/bin/__nvcc_device_query 2>/dev/null | grep -xE '[0-9][0-9][0-9]?' | head -1)
+EXL3_ARCH_FLAGS := -arch=sm_80
 ifneq ($(filter 120 121,$(NVCC_HOST_CC)),)
 NVCC_ARCH_FLAGS := -gencode arch=compute_75,code=[sm_75,compute_75] -gencode arch=compute_$(NVCC_HOST_CC)a,code=sm_$(NVCC_HOST_CC)a
+EXL3_ARCH_FLAGS := -gencode arch=compute_$(NVCC_HOST_CC)a,code=sm_$(NVCC_HOST_CC)a
 else ifneq ($(strip $(NVCC_HOST_CC)),)
 NVCC_ARCH_FLAGS := -gencode arch=compute_75,code=[sm_75,compute_75] -gencode arch=compute_$(NVCC_HOST_CC),code=sm_$(NVCC_HOST_CC)
+EXL3_ARCH_FLAGS := -gencode arch=compute_$(NVCC_HOST_CC),code=sm_$(NVCC_HOST_CC)
 endif
 endif
-NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCC_BASE_FLAGS := -O3 -g -lineinfo --use_fast_math -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
+NVCCFLAGS ?= $(NVCC_BASE_FLAGS) $(NVCC_ARCH_FLAGS)
 
 # Vendored llama.cpp mmq prefill tier (cuda/mmq/, see cuda/mmq/VENDOR.md).
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o cuda/mmq/ds4_repack.o
-CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS)
+# Vendored exllamav3 EXL3 trellis kernels (cuda/exl3/, see cuda/exl3/VENDOR.md).
+EXL3_OBJS := cuda/exl3/ds4_exl3.o
+CORE_OBJS = ds4.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_cuda.o ds4_layer_pack.o $(MMQ_OBJS) $(EXL3_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_ple_stream.o ds4_layer_pack.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
@@ -386,7 +396,7 @@ ifeq ($(UNAME_S),Darwin)
 $(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_metal.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 else
-$(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_cuda.o $(MMQ_OBJS)
+$(GLM53_KDA_TEST): tests/test_glm53_kda.o ds4_cuda.o $(MMQ_OBJS) $(EXL3_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 endif
 
@@ -403,8 +413,13 @@ $(GLM53_KDA_ROCM_TEST): tests/test_glm53_kda_rocm.o ds4_rocm.o
 test-glm53-kda-rocm: $(GLM53_KDA_ROCM_TEST)
 	./$(GLM53_KDA_ROCM_TEST)
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_qwen4exp_gpu.cuh ds4_q4e_page.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_qwen4exp_gpu.cuh ds4_q4e_page.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/exl3/ds4_exl3.h ds4_ple_stream.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+
+# EXL3 GEMM kernels: cooperative-launch templates over K = 4, 5, 6 and four
+# tile shapes, in their own TU like the mmq pieces.
+cuda/exl3/ds4_exl3.o: cuda/exl3/ds4_exl3.cu cuda/exl3/ds4_exl3.h cuda/exl3/exl3_gemm_kernel.cuh cuda/exl3/exl3_gemm_inner.cuh cuda/exl3/exl3_dq.cuh cuda/exl3/codebook.cuh cuda/exl3/hadamard_inner.cuh cuda/exl3/exl3_kernel_map.cuh cuda/exl3/exl3_devctx.cuh cuda/exl3/ptx.cuh cuda/exl3/util.cuh cuda/exl3/compat.cuh
+	$(NVCC) $(NVCC_BASE_FLAGS) $(EXL3_ARCH_FLAGS) -std=c++17 -c -o $@ $<
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
 # pulls in mmq.cuh which has heavy template instantiation -- each piece
@@ -472,7 +487,7 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS) $(EXL3_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
@@ -500,6 +515,12 @@ tests/test_qwen4exp_graph.o: tests/test_qwen4exp_graph.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/test_qwen4exp_graph: tests/test_qwen4exp_graph.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_qwen4exp_exl3.o: tests/test_qwen4exp_exl3.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_exl3: tests/test_qwen4exp_exl3.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 tests/test_qwen4exp_tokenizer.o: tests/test_qwen4exp_tokenizer.c ds4.h
@@ -530,25 +551,25 @@ ifneq ($(UNAME_S),Darwin)
 tests/test_gpu_xdev.o: tests/test_gpu_xdev.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_xdev: tests/test_gpu_xdev.o ds4_cuda.o $(MMQ_OBJS) $(EXL3_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_qwen4exp_gdn.o: tests/test_qwen4exp_gdn.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_qwen4exp_gdn: tests/test_qwen4exp_gdn.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_qwen4exp_gdn: tests/test_qwen4exp_gdn.o ds4_cuda.o $(MMQ_OBJS) $(EXL3_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_model_cache.o: tests/test_gpu_model_cache.c ds4_gpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o $(MMQ_OBJS) $(EXL3_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_lookup_cache_strict.o: tests/test_gpu_lookup_cache_strict.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o $(MMQ_OBJS)
+tests/test_gpu_lookup_cache_strict: tests/test_gpu_lookup_cache_strict.o ds4_cuda.o $(MMQ_OBJS) $(EXL3_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_cuda_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h ds4_q4e_page.h
@@ -625,6 +646,12 @@ DS4_QWEN4EXP_MODEL ?=
 test-qwen4exp: tests/test_qwen4exp_ple tests/test_qwen4exp_graph
 	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_ple
 	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_graph
+
+# The EXL3 repack of the same model against exllamav3's dump of the
+# checkpoint (misc/qwen4exp-oracle/exl3_dump.py).  See tests/test_qwen4exp_exl3.c.
+DS4_QWEN4EXP_EXL3_MODEL ?=
+test-qwen4exp-exl3: tests/test_qwen4exp_exl3
+	DS4_QWEN4EXP_EXL3_MODEL="$(DS4_QWEN4EXP_EXL3_MODEL)" ./tests/test_qwen4exp_exl3
 
 dspark-acceptance: ds4
 	DS4_DSPARK_MODEL="$(DS4_DSPARK_MODEL)" \

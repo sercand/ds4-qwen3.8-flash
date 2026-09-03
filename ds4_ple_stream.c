@@ -4,6 +4,7 @@
 #include "ds4_ple_stream.h"
 
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -19,6 +20,9 @@
  * ------------------------------------------------------------------------ */
 
 uint32_t ds4_ple_row_bytes(const ds4_ple_params *p) {
+    if (p->row_type == DS4_PLE_ROW_EXL3_K6) {
+        return 2u + p->head_dim * DS4_PLE_EXL3_BITS / 8u;
+    }
     return (p->head_dim / DS4_PLE_BLOCK_ELEMS) * DS4_PLE_BLOCK_BYTES;
 }
 
@@ -91,7 +95,72 @@ static float ple_half_to_float(uint16_t h) {
     return f;
 }
 
-void ds4_ple_dequant_row(const ds4_ple_params *p, const uint8_t *src, float *dst) {
+static uint16_t ple_float_to_half(float f) {
+    /* Round-to-nearest-even f32 -> f16, subnormals included: the decoded
+     * rows hold values below 2^-14, and __float2half_rn keeps them. */
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    const uint32_t sign = (bits >> 16) & 0x8000u;
+    const uint32_t absb = bits & 0x7FFFFFFFu;
+    if (absb >= 0x7F800000u) return (uint16_t)(sign | 0x7C00u | ((absb & 0x7FFFFFu) ? 0x200u : 0u));
+    if (absb >= 0x477FF000u) return (uint16_t)(sign | 0x7C00u);
+    if (absb < 0x33000000u) return (uint16_t)sign;
+    const uint32_t exp = absb >> 23;
+    const uint32_t mant = absb & 0x7FFFFFu;
+    if (absb < 0x38800000u) {
+        /* Subnormal: the significand with its hidden bit, scaled to 2^-24 units. */
+        const uint32_t m = mant | 0x800000u;
+        const uint32_t shift = 126u - exp;
+        uint32_t hm = m >> shift;
+        const uint32_t rem = m & ((1u << shift) - 1u);
+        const uint32_t half = 1u << (shift - 1u);
+        if (rem > half || (rem == half && (hm & 1u))) hm++;
+        return (uint16_t)(sign | hm);
+    }
+    uint32_t h = sign | ((exp - 112u) << 10) | (mant >> 13);
+    const uint32_t rem = mant & 0x1FFFu;
+    if (rem > 0x1000u || (rem == 0x1000u && (h & 1u))) h++;
+    return (uint16_t)h;
+}
+
+/* The EXL3 row: bit m of weight i sits at ring position ((i - m/K) mod 160)*K
+ * + m%K, a 6-bit tail-biting trellis; the 16-bit state decodes through the
+ * mul1 codebook (x * 0x83DCD12D, byte sum + 1024 read as fp16, affine), then
+ * the row scale and the head bias.  Port of exllamav3's ngram_dequant_kernel,
+ * with the same fp16 rounding of the codebook value. */
+static void ple_dequant_row_exl3(const ds4_ple_params *p, const uint8_t *src,
+                                 uint32_t head, float *dst) {
+    const uint32_t K = DS4_PLE_EXL3_BITS;
+    const uint32_t n = p->head_dim;
+    uint16_t words[1 + 160 * DS4_PLE_EXL3_BITS / 16];
+    memcpy(words, src, 2u + n * K / 8u);
+    const float scale = ple_half_to_float(words[0]);
+    const float k_inv = ple_half_to_float(0x1eee);
+    const float k_bias = ple_half_to_float(0xc931);
+    const uint16_t *bias = p->head_bias ? p->head_bias + (size_t)head * n : NULL;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t state = 0;
+        for (uint32_t m = 0; m < 16; m++) {
+            int32_t pos = (int32_t)i - (int32_t)(m / K);
+            if (pos < 0) pos += (int32_t)n;
+            const uint32_t sb = (uint32_t)pos * K + m % K;
+            state |= (uint32_t)((words[1 + (sb >> 4)] >> (sb & 15)) & 1u) << m;
+        }
+        const uint32_t prod = state * 0x83DCD12Du;
+        const float h = 1024.0f + (float)((prod & 0xFFu) + ((prod >> 8) & 0xFFu) +
+                                          ((prod >> 16) & 0xFFu) + ((prod >> 24) & 0xFFu));
+        const float cb = ple_half_to_float(ple_float_to_half(h * k_inv + k_bias));
+        const float b = bias ? ple_half_to_float(bias[i]) : 0.0f;
+        /* One fused multiply-add, as nvcc contracts the kernel's expression. */
+        dst[i] = ple_half_to_float(ple_float_to_half(fmaf(cb, scale, b)));
+    }
+}
+
+void ds4_ple_dequant_row(const ds4_ple_params *p, const uint8_t *src, uint32_t head, float *dst) {
+    if (p->row_type == DS4_PLE_ROW_EXL3_K6) {
+        ple_dequant_row_exl3(p, src, head, dst);
+        return;
+    }
     const uint32_t blocks = p->head_dim / DS4_PLE_BLOCK_ELEMS;
     for (uint32_t b = 0; b < blocks; b++) {
         const uint8_t *blk = src + (size_t)b * DS4_PLE_BLOCK_BYTES;
@@ -292,6 +361,11 @@ int ds4_ple_stream_open(ds4_ple_stream **out,
     if (params->head_dim == 0 || (params->head_dim % DS4_PLE_BLOCK_ELEMS) != 0) {
         ple_fail(err, errlen, "PLE head dim %u is not a multiple of %d",
                  params->head_dim, DS4_PLE_BLOCK_ELEMS);
+        return 1;
+    }
+    if (params->row_type == DS4_PLE_ROW_EXL3_K6 &&
+        (params->head_dim != 160 || !params->head_bias)) {
+        ple_fail(err, errlen, "PLE EXL3 rows need head_dim 160 and a head bias table");
         return 1;
     }
 

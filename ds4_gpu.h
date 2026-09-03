@@ -3128,6 +3128,14 @@ int ds4_gpu_q4e_matvec_f32(
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
         const ds4_gpu_tensor *x);
 
+/* fp16 weights (the EXL3 repack keeps the checkpoint's unquantized tensors as
+ * fp16): a fused kernel up to 16 rows, cuBLAS above. */
+int ds4_gpu_q4e_matmul_f16( ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+
+/* EXL3 trellis weights (cuda/exl3).  `bytes` is the whole payload -- tiles
+ * followed by the suh/svh scale vectors -- and `bits` the K of the tensor. */
+int ds4_gpu_q4e_matmul_exl3( ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t bytes, uint32_t bits, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+
 int ds4_gpu_q4e_hc_init( ds4_gpu_tensor *res, const ds4_gpu_tensor *embed, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 /* res = embed broadcast over the streams + h ([n_tok, n_hc * n_embd]). */
 int ds4_gpu_q4e_hc_init_add( ds4_gpu_tensor *res, const ds4_gpu_tensor *embed, const ds4_gpu_tensor *h, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
@@ -3158,7 +3166,9 @@ int ds4_gpu_q4e_gdn_recurrent( ds4_gpu_tensor *attn_out, ds4_gpu_tensor *state, 
 
 int ds4_gpu_q4e_gdn_out_gate( ds4_gpu_tensor *out, const ds4_gpu_tensor *attn, const ds4_gpu_tensor *z, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t head_dim, uint32_t n_head, uint32_t n_tok, float eps);
 
-int ds4_gpu_q4e_ple_dequant( ds4_gpu_tensor *out, const ds4_gpu_tensor *rows, uint32_t head_dim, uint32_t n_heads, uint32_t row_bytes, uint32_t n_tok);
+/* row_type is DS4_PLE_ROW_* (ds4_ple_stream.h); the EXL3 codec reads its
+ * per-head bias ([head_dim, n_heads] f16) at bias_offset in the model map. */
+int ds4_gpu_q4e_ple_dequant( ds4_gpu_tensor *out, const ds4_gpu_tensor *rows, uint32_t head_dim, uint32_t n_heads, uint32_t row_bytes, uint32_t row_type, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint32_t n_tok);
 
 int ds4_gpu_q4e_ple_gated_value( ds4_gpu_tensor *gv, const ds4_gpu_tensor *key, const ds4_gpu_tensor *query, const ds4_gpu_tensor *value, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 

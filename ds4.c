@@ -938,22 +938,6 @@ static bool ds4_qwen4exp_layer_has_ple(uint32_t il) {
     return ds4_model_is_qwen4exp() && DS4_N_PLE_NGRAM != 0u && il == DS4_PLE_LAYER;
 }
 
-/* Fill the streamer's parameter block from the validated shape and the PLE
- * metadata the GGUF carried. */
-static void qwen4exp_ple_params(ds4_ple_params *p) {
-    memset(p, 0, sizeof(*p));
-    p->ngram_size      = DS4_N_PLE_NGRAM;
-    p->heads_per_ngram = DS4_N_PLE_HEADS_PER_NGRAM;
-    p->n_heads         = DS4_N_PLE_HEAD;
-    p->head_dim        = DS4_N_PLE_HEAD_DIM;
-    p->eos_token       = (int)DS4_PLE_EOS_TOKEN;
-    for (uint32_t i = 0; i < DS4_N_PLE_NGRAM; i++) p->multipliers[i] = g_ds4_ple.multipliers[i];
-    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
-        p->head_offsets[h] = g_ds4_ple.head_offsets[h];
-        p->head_vocab[h]   = g_ds4_ple.head_vocab[h];
-    }
-}
-
 static int g_ds4_lock_fd = -1;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -2291,6 +2275,16 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    /* Not GGUF types.  ds4's own ids for exllamav3's EXL3 trellis format, as
+     * written by gguf-tools/convert_exl3_qwen4exp.py: K bits per weight in
+     * 16x16 tiles (a "block" here is one tile of 256 weights, 32*K bytes),
+     * plus the 160-weight n-gram row codec of the same checkpoint (an fp16
+     * scale word and a 160x6-bit ring, 122 bytes).  Ids sit well above ggml's
+     * so a future GGUF type cannot collide with them. */
+    [68] = {"exl3_k4",   256, 128},
+    [69] = {"exl3_k5",   256, 160},
+    [70] = {"exl3_k6",   256, 192},
+    [72] = {"exl3_ngram6", 160, 122},
 };
 
 enum {
@@ -2310,6 +2304,10 @@ enum {
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_EXL3_K4     = 68,
+    DS4_TENSOR_EXL3_K5     = 69,
+    DS4_TENSOR_EXL3_K6     = 70,
+    DS4_TENSOR_EXL3_NGRAM6 = 72,
 };
 
 typedef struct {
@@ -2450,6 +2448,46 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     if (blocks > UINT64_MAX / info->block_bytes) return false;
     *bytes = blocks * info->block_bytes;
     return true;
+}
+
+/* An EXL3 tensor [k, n(, experts)] carries, after its tiles, one fp16 input
+ * scale/sign vector suh[k] and one output vector svh[n] per expert -- the
+ * kernels apply them around the format's 128-point Hadamard.  They live in the
+ * tensor's own payload ([E] tiles, [E] suh, [E] svh) so a tensor stays a single
+ * (offset, bytes) span for the weight cache; gguf_types accounts for the tiles
+ * and this adds the vectors. */
+static bool tensor_type_is_exl3(uint32_t type) {
+    return type >= DS4_TENSOR_EXL3_K4 && type <= DS4_TENSOR_EXL3_K6;
+}
+
+static uint32_t exl3_type_bits(uint32_t type) {
+    return type - DS4_TENSOR_EXL3_K4 + 4u;
+}
+
+static uint64_t exl3_scale_bytes(const ds4_tensor *t) {
+    const uint64_t experts = t->ndim >= 3 ? t->dim[2] : 1u;
+    const uint64_t n = t->ndim >= 2 ? t->dim[1] : 1u;
+    return experts * 2u * (t->dim[0] + n);
+}
+
+/* Fill the streamer's parameter block from the validated shape and the PLE
+ * metadata the GGUF carried. */
+static void qwen4exp_ple_params(ds4_ple_params *p, const ds4_model *m,
+                                const ds4_tensor *table, const ds4_tensor *bias) {
+    memset(p, 0, sizeof(*p));
+    p->row_type  = table->type == DS4_TENSOR_EXL3_NGRAM6 ? DS4_PLE_ROW_EXL3_K6
+                                                          : DS4_PLE_ROW_IQ4_NL;
+    p->head_bias = bias ? (const uint16_t *)(m->map + bias->abs_offset) : NULL;
+    p->ngram_size      = DS4_N_PLE_NGRAM;
+    p->heads_per_ngram = DS4_N_PLE_HEADS_PER_NGRAM;
+    p->n_heads         = DS4_N_PLE_HEAD;
+    p->head_dim        = DS4_N_PLE_HEAD_DIM;
+    p->eos_token       = (int)DS4_PLE_EOS_TOKEN;
+    for (uint32_t i = 0; i < DS4_N_PLE_NGRAM; i++) p->multipliers[i] = g_ds4_ple.multipliers[i];
+    for (uint32_t h = 0; h < DS4_N_PLE_HEAD; h++) {
+        p->head_offsets[h] = g_ds4_ple.head_offsets[h];
+        p->head_vocab[h]   = g_ds4_ple.head_vocab[h];
+    }
 }
 
 static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
@@ -2734,6 +2772,7 @@ static uint64_t parse_tensor_directory(ds4_model *m, ds4_cursor *c, uint32_t sha
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         }
+        if (tensor_type_is_exl3(t->type)) t->bytes += exl3_scale_bytes(t);
     }
 
     /* shard_base is page aligned and the GGUF alignment divides a page, so
@@ -4829,6 +4868,9 @@ typedef struct {
      * though a single layer reads it; it is never resident, so only its offset
      * and extent are used. */
     ds4_tensor *ple_table;
+    /* Per-head row bias of the EXL3 n-gram codec ([head_dim, n_heads] f16);
+     * absent for IQ4_NL tables. */
+    ds4_tensor *ple_bias;
     ds4_layer_weights layer[DS4_MAX_LAYER];
 } ds4_weights;
 
@@ -5029,7 +5071,18 @@ static bool tensor_type_is_glm_dense_quant(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q4_0 ||
-           type == DS4_TENSOR_BF16;
+           type == DS4_TENSOR_BF16 ||
+           type == DS4_TENSOR_F16 ||
+           tensor_type_is_exl3(type);
+}
+
+/* Small qwen4exp parameters the graph reads as plain vectors: the GGUF
+ * converter stores them as f32, the EXL3 repack keeps the checkpoint's fp16. */
+static void tensor_expect_f32_or_f16_layout(
+        const ds4_tensor *t, uint32_t ndim, uint64_t d0, uint64_t d1, uint64_t d2) {
+    if (!t) ds4_die("internal error: missing tensor while validating layout");
+    tensor_expect_layout(t, t->type == DS4_TENSOR_F16 ? DS4_TENSOR_F16 : DS4_TENSOR_F32,
+                         ndim, d0, d1, d2);
 }
 
 static bool tensor_type_is_dense_quant(uint32_t type) {
@@ -5126,6 +5179,7 @@ static void tensor_expect_f16_or_q8_0_layout(
 
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 ||
+           tensor_type_is_exl3(type) ||
            type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
            type == DS4_TENSOR_Q4_K ||
@@ -5868,10 +5922,17 @@ static void weights_validate_qwen4exp_layout(
         tensor_expect_glm_dense_quant_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
     if (w->ple_table) {
-        tensor_expect_layout(w->ple_table, DS4_TENSOR_IQ4_NL, 2,
-                             DS4_N_PLE_HEAD_DIM, w->ple_table->dim[1], 0);
+        /* Two row codecs: llama.cpp's IQ4_NL rows, or the EXL3 checkpoint's
+         * 6-bit trellis rows, which also carry a per-head bias tensor. */
+        const bool exl3_rows = w->ple_table->type == DS4_TENSOR_EXL3_NGRAM6;
+        tensor_expect_layout(w->ple_table, exl3_rows ? DS4_TENSOR_EXL3_NGRAM6 : DS4_TENSOR_IQ4_NL,
+                             2, DS4_N_PLE_HEAD_DIM, w->ple_table->dim[1], 0);
         if (w->ple_table->dim[1] < g_ds4_ple.total_rows) {
             ds4_die("qwen4exp PLE table has fewer rows than the head vocabularies address");
+        }
+        if (exl3_rows) {
+            if (!w->ple_bias) ds4_die("qwen4exp EXL3 PLE table is missing per_layer_token_embd.bias");
+            tensor_expect_layout(w->ple_bias, DS4_TENSOR_F16, 2, DS4_N_PLE_HEAD_DIM, DS4_N_PLE_HEAD, 0);
         }
     }
 
@@ -5885,11 +5946,11 @@ static void weights_validate_qwen4exp_layout(
         tensor_expect_layout(l->hc_attn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
         tensor_expect_glm_dense_quant_layout(l->hc_attn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
         tensor_expect_glm_dense_quant_layout(l->hc_attn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_layout(l->hc_attn_inject, DS4_TENSOR_F32, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_f32_or_f16_layout(l->hc_attn_inject, 2, hc_dim, DS4_N_HC, 0);
         tensor_expect_layout(l->hc_ffn_norm, DS4_TENSOR_F32, 1, hc_dim, 0, 0);
         tensor_expect_glm_dense_quant_layout(l->hc_ffn_down, 2, hc_dim, DS4_N_HC_LOWRANK, 0);
         tensor_expect_glm_dense_quant_layout(l->hc_ffn_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
-        tensor_expect_layout(l->hc_ffn_inject, DS4_TENSOR_F32, 2, hc_dim, DS4_N_HC, 0);
+        tensor_expect_f32_or_f16_layout(l->hc_ffn_inject, 2, hc_dim, DS4_N_HC, 0);
 
         if (ds4_qwen4exp_layer_is_full_attn(il)) {
             tensor_expect_glm_dense_quant_layout(l->qsa_q, 2, DS4_N_EMBD, 2u * q_dim, 0);
@@ -5907,8 +5968,8 @@ static void weights_validate_qwen4exp_layout(
             tensor_expect_glm_dense_quant_layout(l->gdn_gate, 2, DS4_N_EMBD, gdn_v, 0);
             tensor_expect_layout(l->gdn_conv1d, DS4_TENSOR_F32, 2, DS4_N_GDN_CONV, gdn_in, 0);
             tensor_expect_layout(l->gdn_a, DS4_TENSOR_F32, 1, DS4_N_GDN_VALUE_HEAD, 0, 0);
-            tensor_expect_layout(l->gdn_alpha, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
-            tensor_expect_layout(l->gdn_beta, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
+            tensor_expect_f32_or_f16_layout(l->gdn_alpha, 2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
+            tensor_expect_f32_or_f16_layout(l->gdn_beta, 2, DS4_N_EMBD, DS4_N_GDN_VALUE_HEAD, 0);
             tensor_expect_layout(l->gdn_dt_bias, DS4_TENSOR_F32, 1, DS4_N_GDN_VALUE_HEAD, 0, 0);
             tensor_expect_layout(l->gdn_norm, DS4_TENSOR_F32, 1, DS4_N_GDN_HEAD_DIM, 0, 0);
             tensor_expect_glm_dense_quant_layout(l->gdn_out, 2, gdn_v, DS4_N_EMBD, 0);
@@ -5924,8 +5985,8 @@ static void weights_validate_qwen4exp_layout(
             if (!w->ple_table) ds4_die("qwen4exp PLE layer is bound without its hash table");
         }
 
-        tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
-        tensor_expect_layout(l->ffn_gate_inp_shexp, DS4_TENSOR_F32, 1, DS4_N_EMBD, 0, 0);
+        tensor_expect_f32_or_f16_layout(l->ffn_gate_inp, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
+        tensor_expect_f32_or_f16_layout(l->ffn_gate_inp_shexp, 1, DS4_N_EMBD, 0, 0);
         tensor_expect_routed_expert(l->ffn_gate_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_up_exps, 3, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_routed_expert(l->ffn_down_exps, 3, DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
@@ -7640,6 +7701,7 @@ static void weights_bind(
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP &&
         DS4_PLE_LAYER >= start && DS4_PLE_LAYER <= end) {
         w->ple_table = required_tensor(m, "per_layer_token_embd.weight");
+        w->ple_bias = model_find_tensor(m, "per_layer_token_embd.bias");
     }
 
     for (uint32_t il = start; il <= end; il++) {
@@ -8177,6 +8239,7 @@ static bool weights_model_map_qwen4exp_spans(
     model_map_span_vec_include_one(spans, w->output_mix_norm);
     model_map_span_vec_include_one(spans, w->output_mix_down);
     model_map_span_vec_include_one(spans, w->output_mix_up);
+    model_map_span_vec_include_one(spans, w->ple_bias);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         model_map_span_vec_include_qwen4exp_layer(spans, &w->layer[il]);
     }
@@ -55576,6 +55639,8 @@ struct ds4_q4e_graph {
 
     /* PLE row streaming: the reader plus host scratch for one chunk's rows. */
     ds4_ple_stream *ple_stream;
+    ds4_ple_params  ple_params;   /* row codec, hash constants, host bias pointer */
+    uint64_t        ple_bias_offset;  /* per_layer_token_embd.bias in the model map, EXL3 rows only */
     uint64_t       *ple_row_ids;
     uint8_t        *ple_row_data;
 
@@ -67957,7 +68022,9 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     g->logit_rows = 1u + g->spec_k;
     g->mtp_ready = mtp;      /* the scratch's copy: what it allocated for */
 
-    const uint32_t row_bytes = (DS4_N_PLE_HEAD_DIM / 32u) * 18u;
+    qwen4exp_ple_params(&g->ple_params, &e->model, e->weights.ple_table, e->weights.ple_bias);
+    g->ple_bias_offset = e->weights.ple_bias ? e->weights.ple_bias->abs_offset : 0u;
+    const uint32_t row_bytes = ds4_ple_row_bytes(&g->ple_params);
     ok = ok
       && q4e_alloc(&g->tokens, (uint64_t)T * sizeof(int32_t))
       && q4e_alloc(&g->positions, (uint64_t)T * sizeof(int32_t))
@@ -68046,10 +68113,8 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     uint64_t file_offset = 0;
     const uint32_t shard = model_shard_of(&e->model, e->weights.ple_table->abs_offset,
                                           &file_offset);
-    ds4_ple_params params;
-    qwen4exp_ple_params(&params);
     char err[256] = {0};
-    if (ds4_ple_stream_open(&g->ple_stream, &params, e->model.shard_fd[shard], file_offset,
+    if (ds4_ple_stream_open(&g->ple_stream, &g->ple_params, e->model.shard_fd[shard], file_offset,
                             e->weights.ple_table->dim[1], e->ple_cache_bytes,
                             err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: cannot open the qwen4exp PLE reader: %s\n", err);
@@ -68166,9 +68231,11 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     }
     if (ok) {
         g->argmax_host = xmalloc((size_t)(g->logit_rows + 1u) * sizeof(int32_t));
+        qwen4exp_ple_params(&g->ple_params, &e->model, e->weights.ple_table, e->weights.ple_bias);
+        g->ple_bias_offset = e->weights.ple_bias ? e->weights.ple_bias->abs_offset : 0u;
         g->ple_row_ids = xmalloc((size_t)T * DS4_N_PLE_HEAD * sizeof(uint64_t));
         g->ple_row_data = xmalloc((size_t)T * DS4_N_PLE_HEAD *
-                                  (size_t)((DS4_N_PLE_HEAD_DIM / 32u) * 18u));
+                                  (size_t)ds4_ple_row_bytes(&g->ple_params));
     }
     if (!ok) {
         q4e_graph_free(g);
@@ -68348,6 +68415,14 @@ static int q4e_matmul_at(ds4_gpu_tensor *out, const void *map, uint64_t map_size
         }
         return ds4_gpu_glm53_matmul_bf16(out, map, map_size, w->abs_offset,
                                          (uint32_t)w->dim[0], (uint32_t)out_dim, x, n_tok);
+    case DS4_TENSOR_F16:
+        return ds4_gpu_q4e_matmul_f16(out, map, map_size, w->abs_offset,
+                                      w->dim[0], out_dim, x, n_tok);
+    case DS4_TENSOR_EXL3_K4:
+    case DS4_TENSOR_EXL3_K5:
+    case DS4_TENSOR_EXL3_K6:
+        return ds4_gpu_q4e_matmul_exl3(out, map, map_size, w->abs_offset, w->bytes,
+                                       exl3_type_bits(w->type), w->dim[0], out_dim, x, n_tok);
     case DS4_TENSOR_F32:
         /* The injection logits are 10240 inputs into 4 outputs, which the
          * generic one-block-per-row kernel runs on four blocks, so splitting
@@ -68370,6 +68445,19 @@ static int q4e_matmul_at(ds4_gpu_tensor *out, const void *map, uint64_t map_size
 static int q4e_matmul(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor *w,
                       const ds4_gpu_tensor *x, uint32_t n_tok) {
     return q4e_matmul_at(out, m->map, m->size, w, x, n_tok);
+}
+
+/* Token embedding rows into f32: Q8_0 in the GGUF, the checkpoint's bf16 in
+ * the EXL3 repack. */
+static int q4e_embed(ds4_gpu_tensor *out, const ds4_gpu_tensor *tokens,
+                     const ds4_model *m, const ds4_tensor *w, uint32_t n_tok) {
+    if (w->type == DS4_TENSOR_BF16) {
+        return ds4_gpu_glm53_embedding_bf16(out, m->map, m->size, w->abs_offset,
+                                            tokens, n_tok, DS4_N_EMBD, DS4_N_VOCAB);
+    }
+    return ds4_gpu_embed_tokens_quant_tensor(out, tokens, m->map, m->size,
+                                             w->abs_offset, w->type,
+                                             DS4_N_VOCAB, n_tok, DS4_N_EMBD);
 }
 
 /* The hyper-connection mix.  Produces the block input and, in `inject`, the
@@ -68406,9 +68494,10 @@ static int q4e_hc_mix(ds4_q4e_graph *g, const ds4_model *m,
  * layer ran, so this only decodes and applies them. */
 static int q4e_ple_block(ds4_q4e_graph *g, const ds4_model *m,
                          const ds4_layer_weights *l, uint32_t n_tok) {
-    const uint32_t row_bytes = (DS4_N_PLE_HEAD_DIM / 32u) * 18u;
     if (!ds4_gpu_q4e_ple_dequant(g->ple_emb, g->ple_rows, DS4_N_PLE_HEAD_DIM,
-                                 DS4_N_PLE_HEAD, row_bytes, n_tok)) return 0;
+                                 DS4_N_PLE_HEAD, ds4_ple_row_bytes(&g->ple_params),
+                                 g->ple_params.row_type, m->map, m->size,
+                                 g->ple_bias_offset, n_tok)) return 0;
     q4e_trace("ple_embd", -1, g->ple_emb, (uint64_t)n_tok * DS4_N_EMBD);
 
     if (!q4e_matmul(g->ple_k, m, l->ple_key, g->ple_emb, n_tok)) return 0;
@@ -68831,12 +68920,11 @@ static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
  * overlaps the first layer's compute. */
 static int q4e_ple_gather(ds4_q4e_graph *g, const int *history,
                           uint32_t pos0, uint32_t n_tok) {
-    ds4_ple_params params;
-    qwen4exp_ple_params(&params);
-    const uint32_t row_bytes = ds4_ple_row_bytes(&params);
-    const uint32_t n_rows = n_tok * params.n_heads;
+    const ds4_ple_params *params = &g->ple_params;
+    const uint32_t row_bytes = ds4_ple_row_bytes(params);
+    const uint32_t n_rows = n_tok * params->n_heads;
 
-    ds4_ple_row_ids(&params, history, pos0, n_tok, g->ple_row_ids);
+    ds4_ple_row_ids(params, history, pos0, n_tok, g->ple_row_ids);
     char err[256] = {0};
     if (ds4_ple_stream_fetch(g->ple_stream, g->ple_row_ids, n_rows,
                              g->ple_row_data, err, sizeof(err)) != 0) {
@@ -68889,9 +68977,7 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     q4e_phase_end(Q4E_PH_PLE_GATHER, tph);
 
     tph = q4e_phase_begin();
-    if (!ds4_gpu_embed_tokens_quant_tensor(g->embed, g->tokens, m->map, m->size,
-                                           w->token_embd->abs_offset, w->token_embd->type,
-                                           DS4_N_VOCAB, n_tok, DS4_N_EMBD)) return 1;
+    if (!q4e_embed(g->embed, g->tokens, m, w->token_embd, n_tok)) return 1;
     /* The residual starts as the embedding tiled across the streams. */
     if (!ds4_gpu_q4e_hc_init(g->res, g->embed, DS4_N_EMBD, DS4_N_HC, n_tok)) return 1;
     q4e_phase_end(Q4E_PH_EMBED, tph);
@@ -69047,10 +69133,7 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     }
 
     /* emb = fc_embedding(norm(embed(token))) -> g->mixed [n, n_embd] */
-    if (!ds4_gpu_embed_tokens_quant_tensor(d.embed, d.tokens, tm->map, tm->size,
-                                           e->weights.token_embd->abs_offset,
-                                           e->weights.token_embd->type,
-                                           DS4_N_VOCAB, n, DS4_N_EMBD)) return 1;
+    if (!q4e_embed(d.embed, d.tokens, tm, e->weights.token_embd, n)) return 1;
     q4e_trace("mtp_embed", -1, d.embed, (uint64_t)n * DS4_N_EMBD);
     if (!ds4_gpu_q4e_hc_norm(g->blk_out, d.embed, mm->map, mm->size,
                              mw->pre_fc_norm_embedding->abs_offset,
@@ -78941,7 +79024,7 @@ int ds4_test_qwen4exp_ple_embed(const char *model_path,
     const uint32_t shard = model_shard_of(&m, table->abs_offset, &file_offset);
 
     ds4_ple_params params;
-    qwen4exp_ple_params(&params);
+    qwen4exp_ple_params(&params, &m, table, model_find_tensor(&m, "per_layer_token_embd.bias"));
 
     ds4_ple_stream *stream = NULL;
     if (ds4_ple_stream_open(&stream, &params, m.shard_fd[shard], file_offset,
@@ -78965,7 +79048,7 @@ int ds4_test_qwen4exp_ple_embed(const char *model_path,
         goto done;
     }
     for (uint32_t i = 0; i < n_tokens * n_heads; i++) {
-        ds4_ple_dequant_row(&params, raw + (size_t)i * row_bytes,
+        ds4_ple_dequant_row(&params, raw + (size_t)i * row_bytes, i % n_heads,
                             out + (size_t)i * params.head_dim);
     }
     if (stats) ds4_ple_stream_get_stats(stream, stats);

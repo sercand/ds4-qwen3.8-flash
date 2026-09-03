@@ -27,9 +27,22 @@ enum {
     /* IQ4_NL packs 32 weights into an 18-byte block. */
     DS4_PLE_BLOCK_ELEMS = 32,
     DS4_PLE_BLOCK_BYTES = 18,
+    /* The EXL3 checkpoint's row codec: an fp16 row scale, then the 160
+     * weights as a 6-bit tail-biting trellis ring (exllamav3's
+     * exl3_ngram_trellis v1, mul1 codebook), 122 bytes a row, plus a
+     * per-head bias vector added after decoding. */
+    DS4_PLE_EXL3_BITS = 6,
+    DS4_PLE_EXL3_ROW_BYTES = 2 + 160 * DS4_PLE_EXL3_BITS / 8,
+};
+
+enum {
+    DS4_PLE_ROW_IQ4_NL = 0,
+    DS4_PLE_ROW_EXL3_K6 = 1,
 };
 
 typedef struct {
+    uint32_t row_type;         /* DS4_PLE_ROW_*: how a row is stored */
+    const uint16_t *head_bias; /* EXL3 rows: fp16 [n_heads][head_dim], NULL otherwise */
     uint32_t ngram_size;       /* trailing tokens the hash reads, 3 */
     uint32_t heads_per_ngram;  /* rows per n-gram order, 8 */
     uint32_t n_heads;          /* (ngram_size - 1) * heads_per_ngram, 16 */
@@ -64,8 +77,9 @@ uint32_t ds4_ple_row_bytes(const ds4_ple_params *p);
 void ds4_ple_row_ids(const ds4_ple_params *p, const int *tokens,
                      uint32_t pos0, uint32_t n, uint64_t *out_rows);
 
-/* Decode one IQ4_NL row into head_dim floats. */
-void ds4_ple_dequant_row(const ds4_ple_params *p, const uint8_t *src, float *dst);
+/* Decode one row into head_dim floats.  `head` is the hash head the row
+ * belongs to (row index % n_heads); the EXL3 codec adds that head's bias. */
+void ds4_ple_dequant_row(const ds4_ple_params *p, const uint8_t *src, uint32_t head, float *dst);
 
 /* `fd` stays owned by the caller and must outlive the stream.  A cache_bytes of
  * 0 disables caching and reads every row straight through. */

@@ -30,6 +30,50 @@ static const float GOLD[N_TOKENS][6] = {
 };
 static const float GOLD_SUM = 1.408114f;
 
+/* The EXL3 repack decodes a different quantization of the table, so its gate
+ * is exllamav3's own decode of the same rows (misc/qwen4exp-oracle/exl3_ple_ref.py,
+ * a (n_tokens, n_embd) f32 .npy named by DS4_QWEN4EXP_PLE_REF): every value must
+ * match to fp16 resolution, since both sides round the row to fp16. */
+static float *load_npy_f32(const char *path, long want) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    unsigned char pre[10];
+    if (fread(pre, 1, 10, f) != 10 || memcmp(pre, "\x93NUMPY", 6) != 0) { fclose(f); return NULL; }
+    const unsigned hlen = pre[8] | (pre[9] << 8);
+    if (fseek(f, (long)hlen, SEEK_CUR) != 0) { fclose(f); return NULL; }
+    float *v = malloc((size_t)want * sizeof(float));
+    if (!v || fread(v, sizeof(float), (size_t)want, f) != (size_t)want) { free(v); fclose(f); return NULL; }
+    fclose(f);
+    return v;
+}
+
+static int check_ref(const float *emb, uint32_t n_embd, const float *ref, const char *label) {
+    /* The reference is exllamav3's torch decode (two rounded fp32 ops); its
+     * CUDA kernel, like ours, fuses the multiply-add, so a value may land one
+     * fp16 ulp away from the torch number.  Anything beyond one ulp is a real
+     * codec mismatch. */
+    int bad = 0, ulp = 0;
+    double max_err = 0.0, sum = 0.0;
+    for (uint32_t i = 0; i < (uint32_t)N_TOKENS * n_embd; i++) {
+        const double e = fabs((double)emb[i] - (double)ref[i]);
+        int ex = 0;
+        (void)frexp(fabs((double)ref[i]), &ex);
+        const double one_ulp = ldexp(1.0, ex - 11) + 1e-7;
+        if (e > one_ulp) bad++;
+        else if (e > 0.0) ulp++;
+        if (e > max_err) max_err = e;
+        sum += emb[i];
+    }
+    if (bad) {
+        printf("  FAIL %s: %d of %u values differ from exllamav3 by more than an fp16 ulp "
+               "(max |diff| %.3g)\n", label, bad, (unsigned)N_TOKENS * n_embd, max_err);
+        return 1;
+    }
+    printf("  %-22s sum=%.6f matches exllamav3 (%d values one ulp off, max |diff| %.3g): PASS\n",
+           label, sum, ulp, max_err);
+    return 0;
+}
+
 static int check(const float *emb, uint32_t n_embd, const char *label) {
     int fail = 0;
     double sum = 0.0;
@@ -70,6 +114,12 @@ int main(void) {
     int fail = 0;
     char err[512] = {0};
     ds4_ple_stats stats;
+    const char *ref_path = getenv("DS4_QWEN4EXP_PLE_REF");
+    float *ref = NULL;
+    if (ref_path && ref_path[0]) {
+        ref = load_npy_f32(ref_path, (long)N_TOKENS * 2560);
+        if (!ref) { printf("  FAIL: cannot read %s\n", ref_path); free(emb); return 1; }
+    }
 
     /* A cache large enough to hold every row this test touches, and one far too
      * small for them: both must produce identical embeddings. */
@@ -90,7 +140,7 @@ int main(void) {
             fail = 1;
             break;
         }
-        fail |= check(emb, n_embd, labels[c]);
+        fail |= ref ? check_ref(emb, n_embd, ref, labels[c]) : check(emb, n_embd, labels[c]);
         printf("      lookups=%llu hits=%llu misses=%llu reads=%llu read=%.1f KiB in %.2f ms\n",
                (unsigned long long)stats.lookups,
                (unsigned long long)stats.hits,
@@ -101,6 +151,7 @@ int main(void) {
     }
 
     free(emb);
+    free(ref);
     printf("\n%s\n", fail ? "FAILED" : "all tests passed");
     return fail;
 }
