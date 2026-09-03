@@ -24,8 +24,9 @@ called by `ds4_qwen4exp_gpu.cuh`.
 | `exl3_gemm_inner.cuh` | `quant/exl3_gemm_inner.cuh` | include path only |
 | `exl3_gemm_kernel.cuh` | `quant/exl3_gemm_kernel.cuh` | **modified**, see below |
 | `exl3_kernel_map.cuh` | `quant/exl3_kernel_map.cuh` | **modified**: argument lists; host declarations dropped |
-| `exl3_moe_common.cuh` | `quant/exl3_moe_common.cuh` | verbatim (fused MoE prefill kernel, not wired yet) |
-| `exl3_moe_kernel.cuh` | `quant/exl3_moe_kernel.cuh` | include paths only (not wired yet) |
+| `exl3_moe_common.cuh` | `quant/exl3_moe_common.cuh` | **modified**: ds4 argument list (see below) |
+| `exl3_moe_kernel.cuh` | `quant/exl3_moe_kernel.cuh` | **modified**, see below |
+| `exl3_reconstruct.cuh` | `quant/reconstruct.cu` | `reconstruct_had_kernel` only; C++17 `register` dropped |
 | `exl3_devctx.cuh` | `quant/exl3_devctx.cuh` | lock-buffer layout constants only |
 | `ptx.cuh` | `ptx.cuh` | verbatim (mma.m16n8k16, cp.async, barriers) |
 | `util.cuh` | `util.cuh` | cuBLAS error helpers removed |
@@ -43,6 +44,20 @@ called by `ds4_qwen4exp_gpu.cuh`.
   The pointer-table arguments, the expert-range filtering, the weighted
   reduction into slot 0 and the per-matrix width lists are removed; ds4 does
   the routing-weight combine in its own kernel.
+- `exl3_moe_kernel` (the fused routed-expert prefill block) takes the same
+  treatment: fp32 `hidden_state` gathered by `had_fh_r_128_inner`, the nine
+  pointer tables replaced by three stacked tensors, the routing as int32
+  expert bounds plus expert-sorted slots (the map `cuda/mmq`'s
+  `ds4_mmq_moe_map_build` already produces), one bit width per instance,
+  SiLU only, staging sized by the token count (so the per-expert overflow
+  fallback is gone).  Its weighted atomic scatter-add is replaced by a
+  per-assignment store (`had_hf_r_128_out_inner`) that ds4's own combine
+  kernel sums: the atomics' order-dependent rounding flipped router near-ties
+  at 26k tokens from run to run.  Launched cooperatively so the co-residency
+  its group barriers assume is enforced rather than hoped for.
+- Prefill of the dense tensors follows exllamav3's `reconstruct_hgemm`: above
+  144 rows `ds4_exl3_reconstruct` expands the tensor to fp16 in the original
+  basis and cuBLAS runs the GEMM on the raw activations (`ds4_qwen4exp_gpu.cuh`).
 - Instances: K = 4, 5, 6 only, codebook mul1 only (`ds4_exl3.cu`).  The
   QTIP-style GEMV and int8 GEMV fast paths are not vendored: upstream keeps
   them off on Blackwell and they exclude K = 6.

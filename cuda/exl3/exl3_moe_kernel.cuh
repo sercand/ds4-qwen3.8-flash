@@ -1,8 +1,27 @@
 #pragma once
 
-#include <cuda_bf16.h>
-#include <stdio.h>
-#include <stdlib.h>
+// Vendored from exllamav3 (quant/exl3_moe_kernel.cuh, MIT, Copyright (c) 2025 Turboderp)
+// with ds4 modifications, see VENDOR.md:
+//   - hidden_state is fp32 (ds4 keeps every activation in fp32); the two input
+//     gathers convert while they Hadamard-transform;
+//   - the nine per-expert pointer tables are three stacked tensors addressed
+//     as base + expert * stride, like exl3_mgemm_kernel;
+//   - the routing arrives as int32 expert bounds plus expert-sorted slots (the
+//     map cuda/mmq already builds), and each assignment's down projection is
+//     stored to its own row instead of being weighted and atomically added
+//     into the token's row: fp32 atomics sum in whichever order the experts
+//     finish, and at long context that run-to-run noise was enough to flip
+//     router near-ties (26k-token logit L2 vs exllamav3 swung 5.6-16%);
+//   - the gate/up outputs, the gated product and the down output are staged
+//     in fp32, not fp16, so the fused block computes what ds4's staged path
+//     (fp32 GEMM outputs, fp32 SwiGLU) computed and differs from it only in
+//     summation order;
+//   - one bit width per instance (no runtime K switch), SiLU gating only, and
+//     the staging buffers are sized by num_tokens rather than a separate
+//     max_tokens_per_expert with an overflow fallback: no expert can hold more
+//     rows than there are tokens.
+
+#include <stdint.h>
 
 #include "exl3_moe_common.cuh"
 #include "util.cuh"
@@ -12,6 +31,73 @@
 #include "exl3_devctx.cuh"
 #include "ptx.cuh"
 
+// Fused op, fp32 in: o <- in_had(silu(out_had(g)) * out_had(u)), the fp32
+// twin of had_hf_r_128_guad_inner with ds4's SiLU (g / (1 + exp(-g))).
+inline __device__
+void had_ff_r_128_guad_inner
+(
+    const float* __restrict__ input_ptr_g,
+    const float* __restrict__ input_ptr_u,
+    half* __restrict__ output_ptr,
+    const half* __restrict__ post_scale_g,
+    const half* __restrict__ post_scale_u,
+    const half* __restrict__ pre_scale_d,
+    const float r_scale
+)
+{
+    int t = threadIdx.x & 31;
+
+    auto had = [&](float4& v)
+    {
+        float s0 = v.x + v.y, d0 = v.x - v.y;
+        float s1 = v.z + v.w, d1 = v.z - v.w;
+        v.x = s0 + s1;
+        v.y = d0 + d1;
+        v.z = s0 - s1;
+        v.w = d0 - d1;
+        shuffle_had_f2x32(v.x, v.y, t);
+        shuffle_had_f2x32(v.z, v.w, t);
+        v.x *= r_scale;
+        v.y *= r_scale;
+        v.z *= r_scale;
+        v.w *= r_scale;
+    };
+    auto scale = [&](float4& v, const half* __restrict__ sc)
+    {
+        half4 s = ((const half4*) sc)[t];
+        v.x *= __low2float(s.x);
+        v.y *= __high2float(s.x);
+        v.z *= __low2float(s.y);
+        v.w *= __high2float(s.y);
+    };
+    auto silu = [](float g) { return g / (1.0f + __expf(-g)); };
+
+    float4 g = ((const float4*) input_ptr_g)[t];
+    float4 u = ((const float4*) input_ptr_u)[t];
+    had(g);
+    had(u);
+    scale(g, post_scale_g);
+    scale(u, post_scale_u);
+    g.x = silu(g.x) * u.x;
+    g.y = silu(g.y) * u.y;
+    g.z = silu(g.z) * u.z;
+    g.w = silu(g.w) * u.w;
+    scale(g, pre_scale_d);
+    had(g);
+
+    half4 o;
+    o.x = __floats2half2_rn(g.x, g.y);
+    o.y = __floats2half2_rn(g.z, g.w);
+    ((half4*) output_ptr)[t] = o;
+}
+
+// Fused routed-expert block: for every expert with tokens, gather its rows,
+// gate and up GEMMs, SiLU gating, down GEMM, and the down output stored per
+// assignment into slot_out[n_tokens * num_experts_per_tok][hidden] (fp32).
+// The output Hadamards run in fp32 on fp32 GEMM outputs (see the header).  The grid is gridDim.z groups of
+// gridDim.x co-resident blocks; each group takes one expert at a time from a
+// self-resetting ticket counter, so the whole launch is one kernel however
+// the tokens spread over the experts.
 template<int t_bits, int MOE_TILESIZE_N, int cb>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
@@ -27,11 +113,16 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     const int warps_per_block = block_threads / 32;
     const int warp_idx0 = block_idx * warps_per_block + warp_id;
 
-    // Buffers for group
-    temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
-    temp_state_u += group_idx * max_tokens_per_expert * hidden_dim;
-    temp_intermediate_g += group_idx * max_tokens_per_expert * intermediate_dim;
-    temp_intermediate_u += group_idx * max_tokens_per_expert * intermediate_dim;
+    // Buffers for group.  The down output reuses the gathered-input bytes:
+    // gate and up are done with them by then, and two fp16 rows are one fp32 row.
+    temp_state += (size_t) group_idx * 2 * num_tokens * hidden_dim;
+    half* temp_state_g = temp_state;
+    half* temp_state_u = temp_state + (size_t) num_tokens * hidden_dim;
+    float* temp_down = (float*) temp_state;
+    temp_intermediate += (size_t) group_idx * 2 * num_tokens * intermediate_dim;
+    float* temp_intermediate_g = temp_intermediate;
+    float* temp_intermediate_u = temp_intermediate + (size_t) num_tokens * intermediate_dim;
+    temp_act += (size_t) group_idx * num_tokens * intermediate_dim;
 
     // Barriers for group sync
     int* barrier_counters_sense = locks + BARRIER_LOCKS_OFFSET;
@@ -42,63 +133,56 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
     // Individual GEMM barriers per group
     locks += group_idx * MAX(hidden_dim, intermediate_dim) / 128;
 
+    // Stacked expert tensors
+    const size_t trellis_stride = (size_t) hidden_dim * intermediate_dim * t_bits / 16;
+
     // Dynamic expert assignment: active experts are numbered in scan order, and each group processes the active
     // expert matching its current ticket. Initial tickets are the group indices; after finishing an expert, a group
     // draws the next unclaimed ticket, so load balances greedily without assuming uniform cost per expert
     int ticket = group_idx;
 
     // Loop over experts
-    int start = 0;
-    int end = 0;
-    int expert_idx = 0;
     int expert_idx_assign = 0;
-    for (; expert_idx < num_experts; ++expert_idx)
+    for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx)
     {
         // Token span for current expert
-        start = end;
-        end += expert_count[expert_idx];
-        int token_count = end - start;
-
-        // Skip if no tokens or too many tokens for fused kernel (batch is handled by reconstruct path outside kernel)
+        const int start = expert_bounds[expert_idx];
+        const int end = expert_bounds[expert_idx + 1];
+        const int token_count = end - start;
         if (token_count == 0) continue;
-        if (token_count > max_tokens_per_expert) continue;
 
         // Skip if expert is claimed by a different group
         if (expert_idx_assign++ != ticket) continue;
 
         // EXL3 weights for g, u, d
-        const uint16_t* exp_gate_trellis = gate_trellis[expert_idx];
-        const half* exp_gate_suh = gate_suh[expert_idx];
-        const half* exp_gate_svh = gate_svh[expert_idx];
-        const uint16_t* exp_up_trellis = up_trellis[expert_idx];
-        const half* exp_up_suh = up_suh[expert_idx];
-        const half* exp_up_svh = up_svh[expert_idx];
-        const uint16_t* exp_down_trellis = down_trellis[expert_idx];
-        const half* exp_down_suh = down_suh[expert_idx];
-        const half* exp_down_svh = down_svh[expert_idx];
+        const uint16_t* exp_gate_trellis = gate_trellis + expert_idx * trellis_stride;
+        const half* exp_gate_suh = gate_suh + (size_t) expert_idx * hidden_dim;
+        const half* exp_gate_svh = gate_svh + (size_t) expert_idx * intermediate_dim;
+        const uint16_t* exp_up_trellis = up_trellis + expert_idx * trellis_stride;
+        const half* exp_up_suh = up_suh + (size_t) expert_idx * hidden_dim;
+        const half* exp_up_svh = up_svh + (size_t) expert_idx * intermediate_dim;
+        const uint16_t* exp_down_trellis = down_trellis + expert_idx * trellis_stride;
+        const half* exp_down_suh = down_suh + (size_t) expert_idx * intermediate_dim;
+        const half* exp_down_svh = down_svh + (size_t) expert_idx * hidden_dim;
 
-        // Gather + input hadamard for g, u. Non-gated mode skips the g staging (and the g GEMM
-        // below); the activation synthesizes the gate lane from u
-        const bool gated = act_function != MOE_ACT_RELU2_NOGATE;
-        auto had_gather_gu_in = [&]()
+        // Gather + input hadamard for g, u
         {
             const int warps_per_token = hidden_dim / 128;
             const int total_warps = token_count * warps_per_token;
-            const int64_t* top_x = token_sorted + start;
+            const int32_t* slots = slot_sorted + start;
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
-                int token_idx = top_x[warp_idx / warps_per_token];
+                int token_idx = slots[warp_idx / warps_per_token] / num_experts_per_tok;
                 int token_off = warp_idx % warps_per_token;
-                const half* in_ptr = hidden_state + token_idx * hidden_dim + token_off * 128;
-                if (gated)
-                    had_hf_r_128_inner<true, false>
-                    (
-                        in_ptr,
-                        temp_state_g + 128 * warp_idx,
-                        exp_gate_suh + 128 * token_off,
-                        0.088388347648f
-                    );
-                had_hf_r_128_inner<true, false>
+                const float* in_ptr = hidden_state + (size_t) token_idx * hidden_dim + token_off * 128;
+                had_fh_r_128_inner<true, false>
+                (
+                    in_ptr,
+                    temp_state_g + 128 * warp_idx,
+                    exp_gate_suh + 128 * token_off,
+                    0.088388347648f
+                );
+                had_fh_r_128_inner<true, false>
                 (
                     in_ptr,
                     temp_state_u + 128 * warp_idx,
@@ -107,154 +191,72 @@ void exl3_moe_kernel(EXL3_MOE_KERNEL_ARGS)
                 );
             }
             group_barrier(group_idx, group_size, barrier_counters_sense);
-        };
+        }
 
-        had_gather_gu_in();
-
-        // g, u GEMM
-        auto gemm_up = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
+        // 16 rows of A at a time, as the standalone GEMM does; fp32 outputs
+        auto gemm = [&](const half* in_addr, float* out_addr, const uint16_t* trellis, const int size_k, const int size_n)
         {
             int size_m = token_count;
             while (size_m > 0)
             {
-                #define ARGS            \
-                    in_addr,            \
-                    trellis,            \
-                    out_addr,           \
-                    MIN(size_m, 16),    \
-                    hidden_dim,         \
-                    intermediate_dim,   \
-                    locks,              \
-                    nullptr
-                #define SHAPE_ARGS      \
-                    MOE_TILESIZE_M,     \
-                    MOE_TILESIZE_K,     \
-                    MOE_TILESIZE_N,     \
-                    MOE_SH_STAGES,      \
-                    MOE_FRAG_STAGES
-                if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
-                else switch(K)
-                {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                };
-                #undef ARGS
-                #undef SHAPE_ARGS
-
-                in_addr += 16 * hidden_dim;
-                out_addr += 16 * intermediate_dim;
+                exl3_gemm_kernel_inner<t_bits, true, cb, MOE_TILESIZE_M, MOE_TILESIZE_K, MOE_TILESIZE_N,
+                                       MOE_SH_STAGES, MOE_FRAG_STAGES, false>
+                    (in_addr, trellis, (void*) out_addr, MIN(size_m, 16), size_k, size_n, locks, nullptr);
+                in_addr += 16 * size_k;
+                out_addr += 16 * size_n;
                 size_m -= 16;
             }
         };
 
-        if (gated)
-            gemm_up(temp_state_g, temp_intermediate_g, exp_gate_trellis, K_gate);
-        gemm_up(temp_state_u, temp_intermediate_u, exp_up_trellis, K_up);
+        // g, u GEMM
+        gemm(temp_state_g, temp_intermediate_g, exp_gate_trellis, hidden_dim, intermediate_dim);
+        gemm(temp_state_u, temp_intermediate_u, exp_up_trellis, hidden_dim, intermediate_dim);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
-        // Output hadamard for g, u + activation+gate + input hadamard for d
-        auto had_guad = [&]()
+        // Output hadamard for g, u + silu gate + input hadamard for d
         {
             const int warps_per_token = intermediate_dim / 128;
             const int total_warps = token_count * warps_per_token;
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
                 int token_off = warp_idx % warps_per_token;
-                had_hf_r_128_guad_inner
+                had_ff_r_128_guad_inner
                 (
                     temp_intermediate_g + 128 * warp_idx,
                     temp_intermediate_u + 128 * warp_idx,
-                    temp_intermediate_g + 128 * warp_idx,
+                    temp_act + 128 * warp_idx,
                     exp_gate_svh + 128 * token_off,
                     exp_up_svh + 128 * token_off,
                     exp_down_suh + 128 * token_off,
-                    0.088388347648f,
-                    act_limit,
-                    act_function
+                    0.088388347648f
                 );
             }
             group_barrier(group_idx, group_size, barrier_counters_sense);
-        };
-
-        had_guad();
+        }
 
         // d GEMM
-        auto gemm_down = [&](const half* in_addr, half* out_addr, const uint16_t* trellis, const int K)
-        {
-            int size_m = token_count;
-            while (size_m > 0)
-            {
-                #define ARGS            \
-                    in_addr,            \
-                    trellis,            \
-                    out_addr,           \
-                    MIN(size_m, 16),    \
-                    intermediate_dim,   \
-                    hidden_dim,         \
-                    locks,              \
-                    nullptr
-                #define SHAPE_ARGS      \
-                    MOE_TILESIZE_M,     \
-                    MOE_TILESIZE_K,     \
-                    MOE_TILESIZE_N,     \
-                    MOE_SH_STAGES,      \
-                    MOE_FRAG_STAGES
-                if constexpr (t_bits)
-                    exl3_gemm_kernel_inner<t_bits, false, cb, SHAPE_ARGS, false>(ARGS);
-                else switch(K)
-                {
-                    case 1: exl3_gemm_kernel_inner<1, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 2: exl3_gemm_kernel_inner<2, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 3: exl3_gemm_kernel_inner<3, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 4: exl3_gemm_kernel_inner<4, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 5: exl3_gemm_kernel_inner<5, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 6: exl3_gemm_kernel_inner<6, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 7: exl3_gemm_kernel_inner<7, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                    case 8: exl3_gemm_kernel_inner<8, false, cb, SHAPE_ARGS, false>(ARGS); break;
-                };
-                #undef ARGS
-                #undef SHAPE_ARGS
-
-                in_addr += 16 * intermediate_dim;
-                out_addr += 16 * hidden_dim;
-                size_m -= 16;
-            }
-        };
-
-        gemm_down(temp_intermediate_g, temp_state_g, exp_down_trellis, K_down);
+        gemm(temp_act, temp_down, exp_down_trellis, intermediate_dim, hidden_dim);
         group_barrier(group_idx, group_size, barrier_counters_sense);
 
-        // Output hadamard for d + scatter add
-        auto had_d_out = [&]()
+        // Output hadamard for d, stored to the assignment's own row
         {
             const int warps_per_token = hidden_dim / 128;
             const int total_warps = token_count * warps_per_token;
-            const int64_t* top_x = token_sorted + start;
-            const half* weights = weight_sorted + start;
+            const int32_t* slots = slot_sorted + start;
             for (int warp_idx = warp_idx0; warp_idx < total_warps; warp_idx += warps_per_group)
             {
-                int token_idx = top_x[warp_idx / warps_per_token];
-                half weight = weights[warp_idx / warps_per_token];
+                int slot = slots[warp_idx / warps_per_token];
                 int token_off = warp_idx % warps_per_token;
-                float* out_ptr = output_state + token_idx * hidden_dim + token_off * 128;
-                had_hf_r_128_d_inner
+                float* out_ptr = slot_out + (size_t) slot * hidden_dim + token_off * 128;
+                had_ff_r_128_inner<false, true>
                 (
-                    temp_state_g + 128 * warp_idx,
+                    temp_down + 128 * warp_idx,
                     out_ptr,
                     exp_down_svh + 128 * token_off,
-                    0.088388347648f * __half2float(weight)
+                    0.088388347648f
                 );
             }
-        };
-
-        had_d_out();
+        }
 
         // Draw the next ticket and publish it to the group through the end-of-expert barrier, which also protects
         // the temp buffers for reuse. Grabbed tickets continue from num_groups since 0..num_groups-1 are implicit

@@ -68715,6 +68715,9 @@ static void q4e_route_dump(ds4_q4e_graph *g, uint32_t il, uint32_t n_tok) {
     free(lg);
 }
 
+static int q4e_moe_shared(ds4_q4e_graph *g, const ds4_model *m,
+                          const ds4_layer_weights *l, uint32_t il, uint32_t n_tok);
+
 static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
                    const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
     double t = q4e_phase_begin();
@@ -68726,6 +68729,27 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
               (uint64_t)n_tok * DS4_N_EXPERT_USED);
     q4e_route_dump(g, il, n_tok);
     q4e_phase_end(Q4E_PH_MOE_ROUTE, t);
+
+    /* EXL3 experts on a chunk: one fused launch does gate, up, SiLU and down
+     * per expert (cuda/exl3, exllamav3's prefill design) into the per-slot
+     * down buffer and combines it, so only the shared expert remains. */
+    if (tensor_type_is_exl3(l->ffn_gate_exps->type)) {
+        t = q4e_phase_begin();
+        const int rc = ds4_gpu_q4e_moe_exl3_fused(g->blk_out, g->moe_down, g->mixed, g->moe_ids, g->moe_w,
+                                                  m->map, m->size,
+                                                  l->ffn_gate_exps->abs_offset,
+                                                  l->ffn_up_exps->abs_offset,
+                                                  l->ffn_down_exps->abs_offset,
+                                                  l->ffn_gate_exps->type,
+                                                  DS4_N_FF_EXP, DS4_N_EMBD, n_tok,
+                                                  DS4_N_EXPERT, DS4_N_EXPERT_USED);
+        if (rc < 0) return 0;
+        if (rc > 0) {
+            q4e_trace("ffn_moe_out", (int)il, g->blk_out, (uint64_t)n_tok * DS4_N_EMBD);
+            q4e_phase_end(Q4E_PH_MOE_GATE_UP, t);
+            return q4e_moe_shared(g, m, l, il, n_tok);
+        }
+    }
 
     /* Gate and up read the same activation, so they run as one call that
      * quantizes it once; at a single token that call also folds in the
@@ -68774,9 +68798,14 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
                                  DS4_N_EMBD, DS4_N_EXPERT_USED, n_tok)) return 0;
     q4e_trace("ffn_moe_out", (int)il, g->blk_out, (uint64_t)n_tok * DS4_N_EMBD);
     q4e_phase_end(Q4E_PH_MOE_DOWN, t);
+    return q4e_moe_shared(g, m, l, il, n_tok);
+}
 
-    /* The shared expert runs dense on every token and carries a scalar gate. */
-    t = q4e_phase_begin();
+/* The shared expert runs dense on every token and carries a scalar gate,
+ * added onto the routed output already in blk_out. */
+static int q4e_moe_shared(ds4_q4e_graph *g, const ds4_model *m,
+                          const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
+    double t = q4e_phase_begin();
     if (!q4e_matmul(g->sh_gate, m, l->ffn_gate_shexp, g->mixed, n_tok)) return 0;
     if (!q4e_matmul(g->sh_up, m, l->ffn_up_shexp, g->mixed, n_tok)) return 0;
     if (!ds4_gpu_q4e_swiglu(g->sh_mid, g->sh_gate, g->sh_up,

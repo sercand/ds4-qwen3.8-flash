@@ -418,7 +418,7 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_qw
 
 # EXL3 GEMM kernels: cooperative-launch templates over K = 4, 5, 6 and four
 # tile shapes, in their own TU like the mmq pieces.
-cuda/exl3/ds4_exl3.o: cuda/exl3/ds4_exl3.cu cuda/exl3/ds4_exl3.h cuda/exl3/exl3_gemm_kernel.cuh cuda/exl3/exl3_gemm_inner.cuh cuda/exl3/exl3_dq.cuh cuda/exl3/codebook.cuh cuda/exl3/hadamard_inner.cuh cuda/exl3/exl3_kernel_map.cuh cuda/exl3/exl3_devctx.cuh cuda/exl3/ptx.cuh cuda/exl3/util.cuh cuda/exl3/compat.cuh
+cuda/exl3/ds4_exl3.o: cuda/exl3/ds4_exl3.cu cuda/exl3/ds4_exl3.h cuda/exl3/exl3_gemm_kernel.cuh cuda/exl3/exl3_reconstruct.cuh cuda/exl3/exl3_moe_kernel.cuh cuda/exl3/exl3_moe_common.cuh cuda/exl3/exl3_gemm_inner.cuh cuda/exl3/exl3_dq.cuh cuda/exl3/codebook.cuh cuda/exl3/hadamard_inner.cuh cuda/exl3/exl3_kernel_map.cuh cuda/exl3/exl3_devctx.cuh cuda/exl3/ptx.cuh cuda/exl3/util.cuh cuda/exl3/compat.cuh
 	$(NVCC) $(NVCC_BASE_FLAGS) $(EXL3_ARCH_FLAGS) -std=c++17 -c -o $@ $<
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively

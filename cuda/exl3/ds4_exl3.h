@@ -35,6 +35,32 @@ int ds4_exl3_mgemm(const float *x, int x_per_slot,
                    float *y, uint32_t m, uint32_t k, uint32_t n, uint32_t bits,
                    cudaStream_t stream);
 
+/* The routed-expert block of one layer as a single fused launch (exllamav3's
+ * exl3_moe): slot_out[slot][hidden] = down(silu(gate(x)) * up(x)) through the
+ * expert of routing slot = token * n_used + rank, unweighted -- the caller's
+ * combine applies the routing weights in a fixed order, which keeps a chunk
+ * reproducible where the kernel's own atomic scatter-add was not.  The three
+ * projections are stacked expert tensors ([E] tiles, [E] suh, [E] svh;
+ * gate/up are hidden -> inter, down is inter -> hidden, all of one bit
+ * width).  The routing is the expert-sorted map cuda/mmq builds: expert e
+ * owns slot_sorted[bounds[e] .. bounds[e+1]).  Prefill only: the staging
+ * buffers are sized by n_tok and never allocated under graph capture. */
+int ds4_exl3_moe(const float *x, float *slot_out, uint32_t n_tok, uint32_t hidden, uint32_t inter,
+                 const void *gate_tiles, const void *gate_suh, const void *gate_svh,
+                 const void *up_tiles, const void *up_suh, const void *up_svh,
+                 const void *down_tiles, const void *down_suh, const void *down_svh,
+                 uint32_t bits, const int32_t *expert_bounds, const int32_t *slot_sorted,
+                 uint32_t n_expert, uint32_t n_used, cudaStream_t stream);
+
+/* Expand a trellis tensor to fp16 W[k][n] in the original basis
+ * (diag(suh) . H128 . W_hat . H128 . diag(svh)), so that y = x @ W on the raw
+ * activations equals ds4_exl3_gemm up to fp16 rounding.  For prefill: past a
+ * few hundred rows one expansion plus a cuBLAS GEMM beats streaming the trellis
+ * once per 16 rows.  Needs k % 128 == 0 and n % 128 == 0. */
+int ds4_exl3_reconstruct(const void *tiles, const void *suh, const void *svh,
+                         uint32_t k, uint32_t n, uint32_t bits, void *w_out,
+                         cudaStream_t stream);
+
 /* Size the transformed-activation scratch for the largest launch (slots * m *
  * k halfs) ahead of CUDA graph capture, inside which it cannot grow. */
 int ds4_exl3_reserve(cudaStream_t stream, uint64_t had_halfs);

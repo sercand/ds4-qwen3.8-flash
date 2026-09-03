@@ -1337,6 +1337,10 @@ static bool q4e_exl3_ptrs(const void *model_map, uint64_t model_size, uint64_t o
     return true;
 }
 
+/* exllamav3's AUTO_RECONSTRUCT_THRESHOLD: above this many rows a dense EXL3
+ * tensor is expanded to fp16 for cuBLAS rather than run through the trellis GEMM. */
+#define Q4E_EXL3_RECONSTRUCT_ROWS 144u
+
 extern "C" int ds4_gpu_q4e_matmul_exl3(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t bytes, uint32_t bits, uint64_t in_dim, uint64_t out_dim,
@@ -1352,6 +1356,35 @@ extern "C" int ds4_gpu_q4e_matmul_exl3(
     const uint8_t *tiles, *suh, *svh;
     if (!q4e_exl3_ptrs(model_map, model_size, weight_offset, bytes, bits, in_dim, out_dim, 1u,
                        out, "qwen4exp exl3 dense", &tiles, &suh, &svh)) return 0;
+    /* The trellis GEMM streams the whole tensor once per 16 rows, so a prefill
+     * chunk re-reads it over a hundred times.  Past exllamav3's own threshold
+     * expand the tensor to fp16 once and let cuBLAS do the GEMM on the raw
+     * activations (the expansion folds the scales and both Hadamards in).
+     * Decode never gets here: it runs 1 + K rows, inside a captured graph
+     * where the scratch could not grow anyway. */
+    if (n_tok > Q4E_EXL3_RECONSTRUCT_ROWS && g_cublas_ready && !g_decode_graph_capturing &&
+        (in_dim % 128u) == 0u && (out_dim % 128u) == 0u) {
+        const uint64_t w_halfs = in_dim * out_dim, x_halfs = (uint64_t)n_tok * in_dim;
+        __half *w = (__half *)cuda_tmp_alloc_on(ds4_tensor_device_idx(out),
+                                                (w_halfs + x_halfs) * sizeof(__half),
+                                                "qwen4exp exl3 reconstruct");
+        if (!w) return 0;
+        __half *xh = w + w_halfs;
+        if (!ds4_exl3_reconstruct(tiles, suh, svh, (uint32_t)in_dim, (uint32_t)out_dim, bits, w,
+                                  cuda_decode_stream())) return 0;
+        q4e_f32_to_f16_kernel<<<(unsigned)((x_halfs + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+                xh, (const float *)x->ptr, x_halfs);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp exl3 activation conversion")) return 0;
+        /* y[m][n] = x[m][k] @ W[k][n]: both row-major, which column-major
+         * cuBLAS sees as W (n x k, ld n) times x (k x m, ld k) without transposes. */
+        const float alpha = 1.0f, beta = 0.0f;
+        const cublasStatus_t st = cublasGemmEx(
+                cuda_cublas_for_tier(ds4_tensor_device_idx(out)), CUBLAS_OP_N, CUBLAS_OP_N,
+                (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+                w, CUDA_R_16F, (int)out_dim, xh, CUDA_R_16F, (int)in_dim, &beta,
+                (float *)out->ptr, CUDA_R_32F, (int)out_dim, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        return cublas_ok(st, "qwen4exp exl3 reconstructed matmul");
+    }
     return ds4_exl3_gemm((const float *)x->ptr, tiles, suh, svh, (float *)out->ptr,
                          n_tok, (uint32_t)in_dim, (uint32_t)out_dim, bits, cuda_decode_stream());
 }
@@ -1394,6 +1427,52 @@ static int q4e_moe_exl3(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, bool x_per
     }
     return ds4_exl3_mgemm(xin, per_slot, tiles, suh, svh, (const int32_t *)ids->ptr, n_slots,
                           (float *)out->ptr, 1u, in_dim, out_dim, bits, cuda_decode_stream());
+}
+
+/* The routed block of a prefill chunk as exllamav3 runs it: one fused launch
+ * that gathers each expert's tokens and runs gate, up, SiLU and down on them
+ * -- so every expert's weights are read once per chunk, where the per-slot
+ * fan-out above reads them once per (token, expert).  The routing map is the
+ * same expert sort the mmq prefill tiers build (ds4_mmq_moe_map); its dst
+ * index is the flat slot, which is where the kernel stores that assignment's
+ * down output in `down`, the [n_tok * n_used][n_embd] layout the combine
+ * below already sums with the routing weights.
+ *
+ * Returns 0 below the batch threshold or when the map cannot be built (under
+ * capture), leaving the caller on the per-slot path; 1 done; -1 failed. */
+static uint32_t q4e_moe_batch_min_tok(void);
+extern "C" int ds4_gpu_q4e_moe_combine(ds4_gpu_tensor *out, const ds4_gpu_tensor *down,
+                                       const ds4_gpu_tensor *weights, uint32_t n_embd,
+                                       uint32_t n_used, uint32_t n_tok);
+extern "C" int ds4_gpu_q4e_moe_exl3_fused(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *down, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids,
+        const ds4_gpu_tensor *weights, const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t weight_type,
+        uint32_t ff_dim, uint32_t n_embd, uint32_t n_tok, uint32_t n_expert, uint32_t n_used) {
+    if (!out || !down || !x || !ids || !weights || !n_tok) return -1;
+    if (weight_type < 68u || weight_type > 70u) return -1;   /* DS4_TENSOR_EXL3_K4..K6 */
+    if (n_tok < q4e_moe_batch_min_tok()) return 0;
+    if (x->bytes < (uint64_t)n_tok * n_embd * sizeof(float) ||
+        out->bytes < (uint64_t)n_tok * n_embd * sizeof(float) ||
+        down->bytes < (uint64_t)n_tok * n_used * n_embd * sizeof(float)) return -1;
+    const uint32_t bits = weight_type - 68u + 4u;
+    const uint64_t bytes = (uint64_t)n_expert *
+        ((uint64_t)n_embd * ff_dim * bits / 8u + 2u * ((uint64_t)n_embd + ff_dim));
+    const uint8_t *gt, *gs, *gv, *ut, *us, *uv, *dt, *ds, *dv;
+    if (!q4e_exl3_ptrs(model_map, model_size, gate_offset, bytes, bits, n_embd, ff_dim, n_expert,
+                       out, "qwen4exp exl3 moe gate", &gt, &gs, &gv) ||
+        !q4e_exl3_ptrs(model_map, model_size, up_offset, bytes, bits, n_embd, ff_dim, n_expert,
+                       out, "qwen4exp exl3 moe up", &ut, &us, &uv) ||
+        !q4e_exl3_ptrs(model_map, model_size, down_offset, bytes, bits, ff_dim, n_embd, n_expert,
+                       out, "qwen4exp exl3 moe down", &dt, &ds, &dv)) return -1;
+    ds4_mmq_moe_map map;
+    if (ds4_mmq_moe_map_build(&map, (const int32_t *)ids->ptr, (int)n_tok, (int)n_expert,
+                              (int)n_used, cuda_decode_stream()) != 0) return 0;
+    if (!ds4_exl3_moe((const float *)x->ptr, (float *)down->ptr, n_tok, n_embd, ff_dim,
+                      gt, gs, gv, ut, us, uv, dt, ds, dv, bits,
+                      map.expert_bounds, map.ids_dst, n_expert, n_used, cuda_decode_stream()))
+        return -1;
+    return ds4_gpu_q4e_moe_combine(out, down, weights, n_embd, n_used, n_tok) ? 1 : -1;
 }
 
 /* F32 mat-vec with the contraction split across blocks.

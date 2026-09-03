@@ -12,6 +12,8 @@ namespace cg = cooperative_groups;
 #include "util.cuh"
 #include "ptx.cuh"
 #include "exl3_gemm_kernel.cuh"
+#include "exl3_reconstruct.cuh"
+#include "exl3_moe_kernel.cuh"
 
 /* Only the mul1 codebook (cb 2) and fp32 outputs are instantiated: the
  * qwen4exp checkpoint is mul1 throughout, K = 4 for routed experts and the
@@ -29,6 +31,16 @@ static fp_exl3_mgemm_kernel g_mgemm[DS4_EXL3_MAX_BITS - DS4_EXL3_MIN_BITS + 1][E
     { EXL3_MGEMM_KERNEL_INSTANCES(5, true, 2) },
     { EXL3_MGEMM_KERNEL_INSTANCES(6, true, 2) },
 };
+typedef void (*fp_exl3_reconstruct_kernel)(half *, const uint16_t *, const half *, const half *, int, int);
+static fp_exl3_reconstruct_kernel g_reconstruct[DS4_EXL3_MAX_BITS - DS4_EXL3_MIN_BITS + 1] = {
+    reconstruct_had_kernel<4, 2>, reconstruct_had_kernel<5, 2>, reconstruct_had_kernel<6, 2>,
+};
+/* The routed-expert block: the N = 128 tile, since the intermediate width
+ * (640) is not a multiple of 256. */
+static fp_exl3_moe_kernel g_moe[DS4_EXL3_MAX_BITS - DS4_EXL3_MIN_BITS + 1] = {
+    exl3_moe_kernel<4, 128, 2>, exl3_moe_kernel<5, 128, 2>, exl3_moe_kernel<6, 128, 2>,
+};
+#define DS4_EXL3_MOE_BLOCK_DIM (EXL3_GEMM_BASE_THREADS * MOE_TILESIZE_K / 16)
 static const int g_tile_k[] = { EXL3_GEMM_TILESIZE_K };
 static const int g_tile_n[] = { EXL3_GEMM_TILESIZE_N };
 static const int g_block_dim[] = { EXL3_GEMM_BLOCKDIM };
@@ -42,6 +54,8 @@ struct exl3_stream_ctx {
     int         *locks;
     half        *had;
     uint64_t     had_halfs;
+    uint8_t     *moe;          /* fused MoE staging (prefill only, never captured) */
+    uint64_t     moe_bytes;
 };
 static exl3_stream_ctx g_ctx[DS4_EXL3_MAX_STREAMS];
 static int g_n_ctx = 0;
@@ -76,6 +90,15 @@ static bool exl3_device_init(void) {
                                   &o, g_gemm[b][s], g_block_dim[s], SMEM_MAX), "occupancy")) return false;
             occ = (occ == 0 || o < occ) ? o : occ;
         }
+    }
+    for (int b = 0; b <= DS4_EXL3_MAX_BITS - DS4_EXL3_MIN_BITS; b++) {
+        if (exl3_fail(cudaFuncSetAttribute((const void *)g_moe[b],
+                                           cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX),
+                      "moe shared memory opt-in")) return false;
+        int o = 0;
+        if (exl3_fail(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                              &o, g_moe[b], DS4_EXL3_MOE_BLOCK_DIM, SMEM_MAX), "moe occupancy")) return false;
+        occ = (occ == 0 || o < occ) ? o : occ;
     }
     if (occ < 1) occ = 1;
     g_max_blocks = g_num_sms * occ;
@@ -245,4 +268,88 @@ extern "C" int ds4_exl3_mgemm(const float *x, int x_per_slot,
     return !exl3_fail(cudaLaunchCooperativeKernel((const void *)kernel, dim3(per_group, 1, concurrency),
                                                   dim3(g_block_dim[shape]), args, SMEM_MAX, stream),
                       "mgemm launch");
+}
+
+extern "C" int ds4_exl3_reconstruct(const void *tiles, const void *suh, const void *svh,
+                                    uint32_t k, uint32_t n, uint32_t bits, void *w_out,
+                                    cudaStream_t stream) {
+    if (!tiles || !suh || !svh || !w_out) return 0;
+    if (!exl3_check_shape(k, n, bits, "reconstruct") || (k % 128u) != 0u) {
+        fprintf(stderr, "ds4: exl3 reconstruct: k=%u is not a multiple of 128\n", k);
+        return 0;
+    }
+    /* One block per 128x128 tile; the tile row index is n/16 packed blocks
+     * long, the same layout the GEMMs read. */
+    g_reconstruct[bits - DS4_EXL3_MIN_BITS]<<<dim3(n / 128u, k / 128u), RH_THREADS, 0, stream>>>(
+            (half *)w_out, (const uint16_t *)tiles, (const half *)suh, (const half *)svh, (int)(n / 16u), 0);
+    return !exl3_fail(cudaGetLastError(), "reconstruct launch");
+}
+
+/* Geometry as exllamav3's exl3_moe: groups of MOE_SMS_PER_EXPERT blocks, one
+ * expert at a time each, every block of the grid co-resident for the group
+ * barriers.  With 256 experts and ten per token nearly every expert has rows
+ * in a real chunk, so the group count is never the limit. */
+extern "C" int ds4_exl3_moe(const float *x, float *slot_out, uint32_t n_tok, uint32_t hidden, uint32_t inter,
+                            const void *gate_tiles, const void *gate_suh, const void *gate_svh,
+                            const void *up_tiles, const void *up_suh, const void *up_svh,
+                            const void *down_tiles, const void *down_suh, const void *down_svh,
+                            uint32_t bits, const int32_t *expert_bounds, const int32_t *slot_sorted,
+                            uint32_t n_expert, uint32_t n_used, cudaStream_t stream) {
+    if (!x || !slot_out || !gate_tiles || !gate_suh || !gate_svh || !up_tiles || !up_suh || !up_svh ||
+        !down_tiles || !down_suh || !down_svh || !expert_bounds || !slot_sorted ||
+        n_tok == 0 || n_expert == 0 || n_used == 0) return 0;
+    if (!exl3_check_shape(hidden, inter, bits, "moe") || (hidden % 128u) != 0u) {
+        fprintf(stderr, "ds4: exl3 moe: hidden=%u is not a multiple of 128\n", hidden);
+        return 0;
+    }
+    exl3_stream_ctx *c = exl3_ctx(stream, 0);
+    if (!c) return 0;
+
+    int num_groups = g_num_sms / MOE_SMS_PER_EXPERT;
+    if (num_groups > MOE_MAX_GROUPS) num_groups = MOE_MAX_GROUPS;
+    if (num_groups > (int)n_expert) num_groups = (int)n_expert;
+    if (num_groups < 1) num_groups = 1;
+    int group_size = g_num_sms / num_groups;
+    if (group_size > MOE_MAX_SMS_PER_EXPERT) group_size = MOE_MAX_SMS_PER_EXPERT;
+    if (group_size * num_groups > g_max_blocks) group_size = g_max_blocks / num_groups;
+    if (group_size < 1) group_size = 1;
+
+    /* Per group and token: gathered gate and up inputs (fp16, later the fp32
+     * down output), gate and up outputs (fp32), the down input (fp16). */
+    const uint64_t row_bytes = 2u * hidden * sizeof(half) + 2u * inter * sizeof(float) + inter * sizeof(half);
+    const uint64_t moe_bytes = (uint64_t)num_groups * n_tok * row_bytes;
+    if (c->moe_bytes < moe_bytes) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        (void)cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            fprintf(stderr, "ds4: exl3 moe: cannot allocate staging during graph capture\n");
+            return 0;
+        }
+        if (exl3_fail(cudaStreamSynchronize(stream), "moe staging drain")) return 0;
+        if (c->moe) (void)cudaFree(c->moe);
+        c->moe = NULL;
+        c->moe_bytes = 0;
+        if (exl3_fail(cudaMalloc((void **)&c->moe, moe_bytes), "moe staging")) return 0;
+        c->moe_bytes = moe_bytes;
+    }
+    half *state = (half *)c->moe;
+    float *inter_gu = (float *)(state + (uint64_t)num_groups * n_tok * 2u * hidden);
+    half *act = (half *)(inter_gu + (uint64_t)num_groups * n_tok * 2u * inter);
+
+    const uint16_t *gt = (const uint16_t *)gate_tiles, *ut = (const uint16_t *)up_tiles,
+                   *dt = (const uint16_t *)down_tiles;
+    const half *gs = (const half *)gate_suh, *gv = (const half *)gate_svh,
+               *us = (const half *)up_suh, *uv = (const half *)up_svh,
+               *ds = (const half *)down_suh, *dv = (const half *)down_svh;
+    int *locks = c->locks;
+    int i_tok = (int)n_tok, i_hidden = (int)hidden, i_inter = (int)inter,
+        i_expert = (int)n_expert, i_used = (int)n_used;
+    void *args[] = { (void *)&x, (void *)&state, (void *)&inter_gu, (void *)&act, (void *)&slot_out, (void *)&gt, (void *)&gs, (void *)&gv, (void *)&ut, (void *)&us,
+                     (void *)&uv, (void *)&dt, (void *)&ds, (void *)&dv, (void *)&expert_bounds,
+                     (void *)&slot_sorted, (void *)&i_tok, (void *)&i_hidden,
+                     (void *)&i_inter, (void *)&i_expert, (void *)&i_used, (void *)&locks };
+    return !exl3_fail(cudaLaunchCooperativeKernel((const void *)g_moe[bits - DS4_EXL3_MIN_BITS],
+                                                  dim3(group_size, 1, num_groups),
+                                                  dim3(DS4_EXL3_MOE_BLOCK_DIM), args, SMEM_MAX, stream),
+                      "moe launch");
 }

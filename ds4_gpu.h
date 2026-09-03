@@ -3214,6 +3214,11 @@ int ds4_gpu_q4e_moe_gate_up( ds4_gpu_tensor *mid, ds4_gpu_tensor *gate, ds4_gpu_
 
 int ds4_gpu_q4e_moe_down( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used, const ds4_q4e_moe_map *map);
 
+/* EXL3 routed experts on a prefill chunk as one fused launch, its per-slot
+ * down outputs in `down`, combined with the routing weights into `out`;
+ * 0 = not for this size (take the staged path). */
+int ds4_gpu_q4e_moe_exl3_fused( ds4_gpu_tensor *out, ds4_gpu_tensor *down, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const ds4_gpu_tensor *weights, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t weight_type, uint32_t ff_dim, uint32_t n_embd, uint32_t n_tok, uint32_t n_expert, uint32_t n_used);
+
 int ds4_gpu_q4e_moe_matmul( ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const ds4_gpu_tensor *ids, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type, uint32_t out_dim, uint32_t in_dim, uint32_t n_tok, uint32_t n_expert, uint32_t n_used);
 
 #ifdef __cplusplus

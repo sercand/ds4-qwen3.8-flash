@@ -1,11 +1,10 @@
 #pragma once
 
+// Vendored from exllamav3 (quant/exl3_moe_common.cuh, MIT, Copyright (c) 2025 Turboderp)
+// with the ds4 argument list, see VENDOR.md and exl3_moe_kernel.cuh.
+
 #include <cuda_fp16.h>
 #include <stdint.h>
-
-#define MOE_ACT_SILU 0
-#define MOE_ACT_GELU 1
-#define MOE_ACT_RELU2_NOGATE 2  // non-gated relu2 (NemotronH): gate GEMM and staging skipped
 
 #define MOE_SMS_PER_EXPERT 8       // default/minimum group width, also sets max concurrency (buffer count)
 #define MOE_MAX_SMS_PER_EXPERT 32  // widest expert group when few experts are active
@@ -22,38 +21,46 @@
 #define SMEM_MAX (90 * 1024)  // max shared memory on compute capability 8.6
 #endif
 
+// The three projections are stacked expert tensors: expert e's tiles are
+// `trellis + e * hidden * intermediate * bits / 16`, its scale vectors
+// `suh + e * k` and `svh + e * n` with (k, n) = (hidden, intermediate) for
+// gate and up and (intermediate, hidden) for down.  The routing comes as the
+// assignments sorted by expert -- expert e owns slot_sorted[bounds[e] ..
+// bounds[e + 1]) -- where a slot is token * num_experts_per_tok + rank, and
+// slot_out[slot] receives that assignment's unweighted down projection: the
+// routing weights are applied by the caller's combine, in a fixed order, so a
+// chunk's output does not depend on which expert finished first.  Every
+// group's staging buffers hold num_tokens rows, the bound on any expert's
+// share: temp_state is the fp16 gathered input for gate and up (2 x hidden
+// halfs a row) and afterwards the fp32 down output (hidden floats a row, the
+// same bytes), temp_intermediate the fp32 gate and up outputs (2 x
+// intermediate floats a row), temp_act the fp16 down input.
 #define EXL3_MOE_KERNEL_ARGS                    \
-    const half* __restrict__ hidden_state,      \
-    half* __restrict__ temp_state_g,            \
-    half* __restrict__ temp_state_u,            \
-    half* __restrict__ temp_intermediate_g,     \
-    half* __restrict__ temp_intermediate_u,     \
-    float* __restrict__ output_state,           \
+    const float* __restrict__ hidden_state,     \
+    half* __restrict__ temp_state,              \
+    float* __restrict__ temp_intermediate,      \
+    half* __restrict__ temp_act,                \
+    float* __restrict__ slot_out,               \
                                                 \
-    const uint16_t** __restrict__ gate_trellis, \
-    const half** __restrict__ gate_suh,         \
-    const half** __restrict__ gate_svh,         \
-    const uint16_t** __restrict__ up_trellis,   \
-    const half** __restrict__ up_suh,           \
-    const half** __restrict__ up_svh,           \
-    const uint16_t** __restrict__ down_trellis, \
-    const half** __restrict__ down_suh,         \
-    const half** __restrict__ down_svh,         \
+    const uint16_t* __restrict__ gate_trellis,  \
+    const half* __restrict__ gate_suh,          \
+    const half* __restrict__ gate_svh,          \
+    const uint16_t* __restrict__ up_trellis,    \
+    const half* __restrict__ up_suh,            \
+    const half* __restrict__ up_svh,            \
+    const uint16_t* __restrict__ down_trellis,  \
+    const half* __restrict__ down_suh,          \
+    const half* __restrict__ down_svh,          \
                                                 \
-    const int64_t* __restrict__ expert_count,   \
-    const int64_t* __restrict__ token_sorted,   \
-    const half* __restrict__ weight_sorted,     \
+    const int32_t* __restrict__ expert_bounds,  \
+    const int32_t* __restrict__ slot_sorted,    \
                                                 \
+    const int num_tokens,                       \
     const int hidden_dim,                       \
     const int intermediate_dim,                 \
     const int num_experts,                      \
     const int num_experts_per_tok,              \
-    const int max_tokens_per_expert,            \
-    const int concurrency,                      \
-    const float act_limit,                      \
-    const int act_function,                     \
-    const int K_gate,                           \
-    const int K_up,                             \
-    const int K_down,                           \
                                                 \
     int* __restrict__ locks
+
+typedef void (*fp_exl3_moe_kernel)(EXL3_MOE_KERNEL_ARGS);
