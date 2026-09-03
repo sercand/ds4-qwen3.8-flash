@@ -68973,8 +68973,8 @@ static int q4e_run_island(ds4_q4e_graph *g, const ds4_model *m,
 
 /* Gather the PLE rows for this chunk.  The hash reads up to ngram_size - 1
  * tokens before each position, so `history` must hold the whole prefix, not
- * just the chunk.  Doing this before the layer loop means the read latency
- * overlaps the first layer's compute. */
+ * just the chunk.  Called from the layer loop right before the PLE layer, so
+ * the reads overlap the layers already enqueued ahead of it. */
 static int q4e_ple_gather(ds4_q4e_graph *g, const int *history,
                           uint32_t pos0, uint32_t n_tok) {
     const ds4_ple_params *params = &g->ple_params;
@@ -69030,10 +69030,6 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     if (!uploaded) return 1;
 
     double tph = q4e_phase_begin();
-    if (q4e_ple_gather(g, history, pos0, n_tok) != 0) return 1;
-    q4e_phase_end(Q4E_PH_PLE_GATHER, tph);
-
-    tph = q4e_phase_begin();
     if (!q4e_embed(g->embed, g->tokens, m, w->token_embd, n_tok)) return 1;
     /* The residual starts as the embedding tiled across the streams. */
     if (!ds4_gpu_q4e_hc_init(g->res, g->embed, DS4_N_EMBD, DS4_N_HC, n_tok)) return 1;
@@ -69060,6 +69056,15 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
 
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
+        /* The PLE rows come off the disk on the host (a dozen cold 4 KiB
+         * reads a token, one to two milliseconds); gathering them here, once
+         * the layers before the PLE block are already enqueued, hides that
+         * behind their GPU time instead of stalling the step at its start. */
+        if (ds4_qwen4exp_layer_has_ple(il)) {
+            tph = q4e_phase_begin();
+            if (q4e_ple_gather(g, history, pos0, n_tok) != 0) return 1;
+            q4e_phase_end(Q4E_PH_PLE_GATHER, tph);
+        }
         /* Which norm each island hands to the next: see q4e_encode_island.
          * The attention island always feeds this layer's FFN mix; the FFN
          * island feeds the next layer's attention mix unless that layer's PLE
