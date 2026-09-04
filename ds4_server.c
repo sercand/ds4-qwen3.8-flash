@@ -15750,13 +15750,18 @@ int main(int argc, char **argv) {
                    s.slot_count, ds4_session_prefill_cap(s.slots[0].session),
                    s.mixed_prefill_quantum,
                    ds4_engine_has_mtp(engine) ? " (MTP stays on)" : "");
-        server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: batched decode %s%s",
-                   s.batched_decode ? "on" : "off",
-                   s.batched_decode ?
-                       ": from two generations up, one pass over the weights "
-                       "serves every generating context; a lone one keeps its "
-                       "speculative step" : "");
+        if (s.batched_decode) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: batched decode on: from %d generations up, one "
+                       "pass over the weights serves every generating context; "
+                       "below that each keeps its speculative step%s",
+                       DS4_BATCH_DECODE_MIN_GENERATIONS,
+                       s.slot_count < DS4_BATCH_DECODE_MIN_GENERATIONS ?
+                           " -- which this many execution contexts can never reach,"
+                           " so raise --exec-contexts to use it" : "");
+        } else {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: batched decode off");
+        }
     }
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
