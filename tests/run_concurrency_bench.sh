@@ -25,6 +25,7 @@ setsid env "$@" /home/otsimo/work/qwen-3.8-flash/gpu_lock.sh \
     ./ds4-server --host 127.0.0.1 --port $PORT --cuda -m "$M" --ctx "$CTX" \
     --mtp-model "$MT" --mtp-draft "${MTP_DRAFT:-4}" \
     --exec-contexts $CTXS --cache-log-every 1000 \
+    ${POOL:+--kv-pool-tokens $POOL} \
     ${EXTRA_ARGS:-} > "$SLOG" 2>&1 < /dev/null &
 
 for i in $(seq 1 300); do
@@ -34,7 +35,8 @@ done
 sleep 2
 
 python3 tests/bench_concurrency.py --url http://127.0.0.1:$PORT \
-    --sweep "$SWEEP" --max-tokens "$MAX_TOKENS" 2>&1 | tee "$BLOG"
+    --sweep "$SWEEP" --max-tokens "$MAX_TOKENS" \
+    ${PROMPT_WORDS:+--prompt-words $PROMPT_WORDS} 2>&1 | tee "$BLOG"
 rc=${PIPESTATUS[0]}
 
 pkill -INT -f "ds4-server --host 127.0.0.1 --port $PORT"

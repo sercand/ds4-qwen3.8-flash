@@ -14,6 +14,7 @@ would be answered from the prompt cache and measure the cache, not decode.
 
 import argparse
 import json
+import random
 import statistics
 import sys
 import threading
@@ -106,10 +107,19 @@ def run_one(url, model, prompt, max_tokens, res, barrier):
     res.end = time.perf_counter()
 
 
+def filler(seed, words):
+    """Distinct, non-repeating padding so each client prefills its own path."""
+    rnd = random.Random(seed)
+    vocab = ("harbour ledger quartz meadow lantern cobalt thistle marrow "
+             "furnace bramble cipher tundra pigment saffron trellis vellum").split()
+    return " ".join(rnd.choice(vocab) for _ in range(words))
+
+
 def sweep_once(url, model, n, max_tokens, prompt_words):
     prompts = [
         f"Write about {TOPICS[i % len(TOPICS)]}. "
-        f"Give roughly {prompt_words} words of background first, then continue at length."
+        f"Here are some notes to consider: {filler(i, prompt_words)}. "
+        f"Now write at length on the topic."
         for i in range(n)
     ]
     results = [Result(i) for i in range(n)]
@@ -151,9 +161,15 @@ def report(n, results, wall):
               f"{rate:>8.2f} {r.chunks:>6} {p50:>12.2f} {p99:>12.2f}")
 
     agg = total_tokens / wall
+    # Decode-only aggregate: the per-request rates sum to what the GPU is
+    # actually producing while the streams overlap, with prefill excluded.
+    # At long contexts prefill dominates the wall clock and would otherwise
+    # hide what the decode loop is doing.
+    decode_agg = sum(r.tokens / (r.end - r.start - r.ttft)
+                     for r in ok if r.end - r.start - r.ttft > 0)
     ttfts = sorted(r.ttft for r in ok)
     print(f"  ---- wall {wall:.2f}s  total_tokens {total_tokens}  "
-          f"AGGREGATE {agg:.2f} tok/s")
+          f"AGGREGATE {agg:.2f} tok/s  DECODE-ONLY {decode_agg:.2f} tok/s")
     print(f"  ---- ttft  min {ttfts[0]:.3f}  median {statistics.median(ttfts):.3f}  "
           f"max {ttfts[-1]:.3f}")
     return agg
