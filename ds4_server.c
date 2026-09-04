@@ -12075,22 +12075,31 @@ static bool server_prefill_before_decode_locked(const server *s) {
 /* Should this decode step be batched with the other contexts' rather than
  * take a grant of its own?
  *
- * Only when there is something to batch with.  The two paths spend the same
- * rows differently: a speculative step runs 1 + K rows of one sequence and
- * keeps the prefix the target agrees with -- about half the drafts -- while a
- * batched step runs one row of each of B sequences and keeps all of them.
- * Alone, speculation wins outright (measured 44 tok/s against 30).  From two
- * generations up, the batch does, because its rows are never wasted and they
- * share one read of the weights.
+ * The two paths spend rows differently.  A speculative step runs 1 + K rows
+ * of one sequence and keeps the prefix the target agrees with -- a little
+ * over half the drafts.  A batched step runs one row of each of B sequences
+ * and keeps every one, but pays a fixed cost per step that the rows share.
+ * Measured on GB10 at 8k context, aggregate tokens/s:
+ *
+ *     generations     1       2       4       8
+ *     speculative    42.1    44.4    44.5    43.8
+ *     batched          -     43.2    62.2    79.2
+ *
+ * So speculation holds up to two generations and the batch takes over from
+ * three, which is where its fixed cost is spread thinly enough to beat what
+ * the drafts were winning.  Below that the batch is a small loss, not a
+ * small gain, so the threshold is three rather than two.
  *
  * Sampled per step, so a request arriving or finishing moves the whole set
  * over on the next token; both paths leave the session in the same state, so
  * alternating between them is safe (q4e_forward_batch clears the draft's
  * staged residual so a later speculative step rebuilds it). */
+#define DS4_BATCH_DECODE_MIN_GENERATIONS 3
+
 static bool server_batch_decode_now(server *s) {
     if (!s->batched_decode) return false;
     pthread_mutex_lock(&s->model_mu);
-    const bool batch = s->active_generations > 1;
+    const bool batch = s->active_generations >= DS4_BATCH_DECODE_MIN_GENERATIONS;
     pthread_mutex_unlock(&s->model_mu);
     return batch;
 }
