@@ -109,6 +109,15 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+/* Cumulative cost of those synchronizes, for the decode-step reports. */
+void ds4_gpu_sync_stats(uint64_t *calls, double *seconds, double *max_seconds);
+int ds4_gpu_synchronize_tagged(const char *tag);
+void ds4_gpu_sync_report(void);
+/* Callers get attributed to their function; the backend's own definition
+ * opts out so it can implement the real entry point. */
+#ifndef DS4_GPU_SYNC_IMPL
+#define ds4_gpu_synchronize() ds4_gpu_synchronize_tagged(__func__)
+#endif
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);

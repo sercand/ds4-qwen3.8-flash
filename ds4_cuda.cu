@@ -4052,7 +4052,71 @@ extern "C" int ds4_gpu_end_commands(void) {
     }
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
-extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
+/* Device-wide, so with several execution contexts a synchronize waits for
+ * whatever every other context has in flight as well as its own.  Counted so
+ * that cost is visible next to the PLE and speculation reports. */
+static uint64_t g_sync_calls;
+static uint64_t g_sync_ns;
+static uint64_t g_sync_max_ns;
+
+/* Per-call-site totals: the tags are string literals from __func__, so the
+ * table compares pointers and stays a short linear scan. */
+#define DS4_SYNC_TAGS 32
+static struct { const char *tag; uint64_t calls; uint64_t ns; uint64_t max_ns; }
+    g_sync_tag[DS4_SYNC_TAGS];
+static pthread_mutex_t g_sync_tag_mu = PTHREAD_MUTEX_INITIALIZER;
+
+extern "C" int ds4_gpu_synchronize_tagged(const char *tag) {
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    const int ok = cuda_ok(cudaDeviceSynchronize(), "synchronize");
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    const uint64_t ns = (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000ull +
+                        (uint64_t)(b.tv_nsec - a.tv_nsec);
+    __atomic_fetch_add(&g_sync_calls, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_sync_ns, ns, __ATOMIC_RELAXED);
+    uint64_t prev = __atomic_load_n(&g_sync_max_ns, __ATOMIC_RELAXED);
+    while (ns > prev &&
+           !__atomic_compare_exchange_n(&g_sync_max_ns, &prev, ns, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    if (tag) {
+        pthread_mutex_lock(&g_sync_tag_mu);
+        int i = 0;
+        for (; i < DS4_SYNC_TAGS && g_sync_tag[i].tag; i++) {
+            if (g_sync_tag[i].tag == tag) break;
+        }
+        if (i < DS4_SYNC_TAGS) {
+            g_sync_tag[i].tag = tag;
+            g_sync_tag[i].calls++;
+            g_sync_tag[i].ns += ns;
+            if (ns > g_sync_tag[i].max_ns) g_sync_tag[i].max_ns = ns;
+        }
+        pthread_mutex_unlock(&g_sync_tag_mu);
+    }
+    return ok;
+}
+
+extern "C" int ds4_gpu_synchronize(void) {
+    return ds4_gpu_synchronize_tagged(NULL);
+}
+
+extern "C" void ds4_gpu_sync_report(void) {
+    pthread_mutex_lock(&g_sync_tag_mu);
+    for (int i = 0; i < DS4_SYNC_TAGS && g_sync_tag[i].tag; i++) {
+        fprintf(stderr, "ds4:   sync %-34s %6llu calls  %7.2f ms each  max %7.1f ms  %6.1f s\n",
+                g_sync_tag[i].tag, (unsigned long long)g_sync_tag[i].calls,
+                (double)g_sync_tag[i].ns / 1e6 / (double)g_sync_tag[i].calls,
+                (double)g_sync_tag[i].max_ns / 1e6,
+                (double)g_sync_tag[i].ns / 1e9);
+    }
+    pthread_mutex_unlock(&g_sync_tag_mu);
+}
+
+extern "C" void ds4_gpu_sync_stats(uint64_t *calls, double *seconds, double *max_seconds) {
+    if (calls) *calls = __atomic_load_n(&g_sync_calls, __ATOMIC_RELAXED);
+    if (seconds) *seconds = (double)__atomic_load_n(&g_sync_ns, __ATOMIC_RELAXED) / 1e9;
+    if (max_seconds) *max_seconds = (double)__atomic_load_n(&g_sync_max_ns, __ATOMIC_RELAXED) / 1e9;
+}
 
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;

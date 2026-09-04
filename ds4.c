@@ -7505,9 +7505,9 @@ static bool q4e_mtp_split_eh_proj(ds4_q4e_mtp_weights *w, const ds4_model *m,
  * differ only in name (plus eh_proj's fusion).  The type differences between
  * the two files -- Q8_0 rather than Q4_K routed gate/up, F32 rather than Q8_0
  * routers, BF16 rather than Q8_0 indexer projections -- need no work here:
- * q4e_matmul and the MoE entries dispatch on the bound tensor's own type, and
- * the draft never runs the indexer at all (q4e_qsa_layer skips it when
- * is_draft). */
+ * q4e_matmul and the MoE entries dispatch on the bound tensor's own type.
+ * The indexer projections are bound like the rest: the draft runs its own
+ * indexer over its own KV, so they are required, not decoration. */
 static bool q4e_mtp_weights_bind(ds4_q4e_mtp_weights *w, const ds4_model *m) {
     memset(w, 0, sizeof(*w));
     w->fc_map = m->map;
@@ -55672,7 +55672,6 @@ struct ds4_q4e_graph {
     uint32_t        idx_max_blocks;
     bool            idx_ready;    /* indexer caches allocated for the attention layers */
     bool            qsa_sparse;   /* this forward selects blocks (context past the budget) */
-    bool            is_draft;     /* the MTP head's shallow copy: dense attention, own KV */
 
     ds4_gpu_tensor *argmax_dev;      /* int32 per logits row */
     int32_t        *argmax_host;     /* the verify rows' greedy picks */
@@ -55687,6 +55686,11 @@ struct ds4_q4e_graph {
     ds4_gpu_tensor *mtp_tokens;
     ds4_gpu_tensor *mtp_positions;
     ds4_gpu_tensor *mtp_k_cache;   /* borrowed */
+    /* The draft head's own indexer planes, paged like the target's: without
+     * them its attention would be dense over the whole KV at every draft
+     * pass, the one decode cost that grows without bound with the context. */
+    ds4_gpu_tensor *mtp_idx_k_cache;  /* borrowed: [pool_slots][128] f16 */
+    ds4_gpu_tensor *mtp_idx_pooled;   /* borrowed: [pool_slots/4][128] f16 */
     ds4_gpu_tensor *mtp_v_cache;   /* borrowed */
     ds4_gpu_tensor *mtp_logits;
     FILE           *mtp_dump_fp;     /* DS4_QWEN4EXP_MTP_DUMP record awaiting its logits */
@@ -55819,6 +55823,8 @@ struct q4e_cache {
     ds4_gpu_tensor *idx_pooled[DS4_MAX_LAYER];
     ds4_gpu_tensor *mtp_k_cache;
     ds4_gpu_tensor *mtp_v_cache;
+    ds4_gpu_tensor *mtp_idx_k_cache;
+    ds4_gpu_tensor *mtp_idx_pooled;
     bool            idx_ready;
     bool            mtp_ready;
 
@@ -55847,6 +55853,10 @@ static uint64_t q4e_page_bytes(bool idx, bool mtp) {
     uint64_t b = (uint64_t)attn * 2u * rows * Q4E_KV_DIM * sizeof(uint16_t);
     if (idx) b += (uint64_t)attn * (rows + rows / 4u) * 128u * sizeof(uint16_t);
     if (mtp) b += 2u * rows * Q4E_KV_DIM * sizeof(uint16_t);
+    /* The draft head runs the same indexer over its own KV, so its raw and
+     * pooled planes are part of a page too.  This number is in the payload
+     * header, so a file written before they existed is refused by geometry. */
+    if (mtp && idx) b += (rows + rows / 4u) * 128u * sizeof(uint16_t);
     return b;
 }
 
@@ -56080,6 +56090,12 @@ static int q4e_page_copy(ds4_q4e_graph *g, int32_t dst, int32_t src) {
                               g->mtp_k_cache, (uint64_t)src * rows * kv, rows * kv) ||
          !ds4_gpu_tensor_copy(g->mtp_v_cache, (uint64_t)dst * rows * kv,
                               g->mtp_v_cache, (uint64_t)src * rows * kv, rows * kv))) return 1;
+    if (g->mtp_idx_k_cache &&
+        (!ds4_gpu_tensor_copy(g->mtp_idx_k_cache, (uint64_t)dst * rows * ik,
+                              g->mtp_idx_k_cache, (uint64_t)src * rows * ik, rows * ik) ||
+         !ds4_gpu_tensor_copy(g->mtp_idx_pooled, (uint64_t)dst * pooled * ik,
+                              g->mtp_idx_pooled, (uint64_t)src * pooled * ik,
+                              pooled * ik))) return 1;
     return 0;
 }
 
@@ -56096,6 +56112,8 @@ static void q4e_cache_close(ds4_engine *e) {
     }
     ds4_gpu_tensor_free(c->mtp_k_cache);
     ds4_gpu_tensor_free(c->mtp_v_cache);
+    ds4_gpu_tensor_free(c->mtp_idx_k_cache);
+    ds4_gpu_tensor_free(c->mtp_idx_pooled);
     q4e_tree_free(&c->tree);
     pthread_mutex_destroy(&c->mu);
     free(c);
@@ -56234,6 +56252,12 @@ static q4e_cache *q4e_cache_open(ds4_engine *e, uint32_t ctx_size, bool mtp,
     if (ok && mtp) {
         const uint64_t slots = (uint64_t)c->pool_slots * Q4E_KV_DIM * sizeof(uint16_t);
         ok = q4e_alloc(&c->mtp_k_cache, slots) && q4e_alloc(&c->mtp_v_cache, slots);
+        if (ok && c->idx_ready) {
+            ok = q4e_alloc(&c->mtp_idx_k_cache,
+                           (uint64_t)c->pool_slots * 128u * sizeof(uint16_t)) &&
+                 q4e_alloc(&c->mtp_idx_pooled,
+                           (uint64_t)(c->pool_slots / 4u) * 128u * sizeof(uint16_t));
+        }
     }
     if (!ok) {
         e->q4e_cache = c;
@@ -66930,6 +66954,14 @@ static const char *const Q4E_PHASE_NAME[Q4E_PH_COUNT] = {
 static double g_q4e_phase[Q4E_PH_COUNT];
 static uint64_t g_q4e_steps;
 
+/* The PLE gather is the one place a forward pass waits on the host, and it
+ * does it holding the model: two clock reads a step is cheap enough to leave
+ * on always, so the wait is visible without a profiler run.  Shared by every
+ * execution context, like the reader itself. */
+static double   g_q4e_ple_wait_s;
+static uint64_t g_q4e_ple_waits;
+static double   g_q4e_ple_wait_max_s;
+
 static int q4e_profile_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
@@ -66971,6 +67003,34 @@ static void q4e_profile_report(void) {
 static void q4e_graph_free(ds4_q4e_graph *g) {
     q4e_profile_report();
     if (!g) return;
+    if (g_q4e_ple_waits && g->ple_stream) {
+        ds4_ple_stats ps = {0};
+        ds4_ple_stream_get_stats(g->ple_stream, &ps);
+        fprintf(stderr,
+                "ds4: qwen4exp PLE gather: %llu waits, %.1f ms each (max %.1f ms), "
+                "%.1f s total; rows %llu lookups %.1f%% hit, %llu reads %.1f ms each\n",
+                (unsigned long long)g_q4e_ple_waits,
+                g_q4e_ple_wait_s * 1e3 / (double)g_q4e_ple_waits,
+                g_q4e_ple_wait_max_s * 1e3, g_q4e_ple_wait_s,
+                (unsigned long long)ps.lookups,
+                ps.lookups ? 100.0 * (double)ps.hits / (double)ps.lookups : 0.0,
+                (unsigned long long)ps.reads,
+                ps.reads ? ps.read_seconds * 1e3 / (double)ps.reads : 0.0);
+#ifndef DS4_NO_GPU
+        uint64_t sc = 0; double ss = 0.0, sm = 0.0;
+        ds4_gpu_sync_stats(&sc, &ss, &sm);
+        if (sc) {
+            fprintf(stderr,
+                    "ds4: qwen4exp device sync: %llu calls, %.2f ms each "
+                    "(max %.1f ms), %.1f s total\n",
+                    (unsigned long long)sc, ss * 1e3 / (double)sc, sm * 1e3, ss);
+            ds4_gpu_sync_report();
+        }
+#endif
+        g_q4e_ple_wait_s = 0.0;
+        g_q4e_ple_waits = 0;
+        g_q4e_ple_wait_max_s = 0.0;
+    }
     if (g->spec_steps) {
         fprintf(stderr,
                 "ds4: qwen4exp spec stats: steps=%llu drafted=%llu accepted=%llu "
@@ -67551,6 +67611,11 @@ static int q4e_payload_page(FILE *fp, ds4_q4e_graph *g, int32_t page, bool write
         (q4e_payload_span(fp, g->mtp_k_cache, p * rows * kv, rows * kv,
                           write, buf, cap, remaining, err, errlen) != 0 ||
          q4e_payload_span(fp, g->mtp_v_cache, p * rows * kv, rows * kv,
+                          write, buf, cap, remaining, err, errlen) != 0)) return 1;
+    if (g->mtp_idx_k_cache &&
+        (q4e_payload_span(fp, g->mtp_idx_k_cache, p * rows * ik, rows * ik,
+                          write, buf, cap, remaining, err, errlen) != 0 ||
+         q4e_payload_span(fp, g->mtp_idx_pooled, p * pooled * ik, pooled * ik,
                           write, buf, cap, remaining, err, errlen) != 0)) return 1;
     return 0;
 }
@@ -68187,7 +68252,6 @@ static void q4e_scratch_bind(ds4_q4e_graph *g, const ds4_q4e_graph *sc) {
     g->logits_pos = 0;
     g->ready = false;
     g->qsa_sparse = false;
-    g->is_draft = false;
     g->pend_res = NULL;
     g->pend_valid = false;
     g->pend_n = 0;
@@ -68299,6 +68363,8 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
         }
         if (mtp) {
             g->mtp_k_cache = cache->mtp_k_cache;
+            g->mtp_idx_k_cache = cache->mtp_idx_k_cache;
+            g->mtp_idx_pooled = cache->mtp_idx_pooled;
             g->mtp_v_cache = cache->mtp_v_cache;
             g->mtp_ready = g->mtp_k_cache != NULL;
         }
@@ -68624,7 +68690,10 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
      * forward; select blocks only once the context holds more complete
      * blocks than the budget (below that the selection is every visible
      * token and the dense kernel is exact and faster). */
-    const bool idx_on = !g->is_draft && g->idx_k_cache[il] && l->idx_q && l->idx_k &&
+    /* The draft head has its own indexer weights (blk.48 in the sidecar) and
+     * its own raw/pooled planes at Q4E_MTP_SLOT, so it selects blocks exactly
+     * like the target instead of reading its whole KV per draft pass. */
+    const bool idx_on = g->idx_k_cache[il] && l->idx_q && l->idx_k &&
                         l->idx_q_norm && l->idx_k_norm;
     if (idx_on) {
         const uint32_t pos0 = g->pos;
@@ -68991,11 +69060,16 @@ static int q4e_ple_gather(ds4_q4e_graph *g, const int *history,
 
     ds4_ple_row_ids(params, history, pos0, n_tok, g->ple_row_ids);
     char err[256] = {0};
+    const double t0 = now_sec();
     if (ds4_ple_stream_fetch(g->ple_stream, g->ple_row_ids, n_rows,
                              g->ple_row_data, err, sizeof(err)) != 0) {
         fprintf(stderr, "ds4: qwen4exp PLE gather failed: %s\n", err);
         return 0;
     }
+    const double wait = now_sec() - t0;
+    g_q4e_ple_wait_s += wait;
+    g_q4e_ple_waits++;
+    if (wait > g_q4e_ple_wait_max_s) g_q4e_ple_wait_max_s = wait;
     return ds4_gpu_tensor_write(g->ple_rows, 0, g->ple_row_data,
                                 (uint64_t)n_rows * row_bytes) ? 0 : 1;
 }
@@ -69170,6 +69244,18 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
  * draft's. */
 #define Q4E_MTP_SLOT (DS4_N_LAYER - 1u)
 
+/* DS4_QWEN4EXP_DRAFT_DENSE=1 restores the draft head's dense attention over
+ * its whole KV, the behaviour before it got its own indexer planes -- an A/B
+ * arm for the decode-vs-context sweep, not a mode anyone should serve with. */
+static bool q4e_draft_dense_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_DRAFT_DENSE");
+        cached = env && env[0] && env[0] != '0';
+    }
+    return cached != 0;
+}
+
 /* One draft pass over n rows.  `hidden` is [n, hc * n_embd]: target residual
  * rows on the first step, the previous draft step's residual afterwards.
  * tokens[i] is the token at positions[i] + 1.  When out_logits is set the last
@@ -69203,11 +69289,17 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     d.logits = g->mtp_logits;
     d.k_cache[Q4E_MTP_SLOT] = g->mtp_k_cache;
     d.v_cache[Q4E_MTP_SLOT] = g->mtp_v_cache;
-    /* The draft layer has no recurrent state to checkpoint, and its attention
-     * stays dense over its own KV (the indexer caches belong to the target). */
+    /* Q4E_MTP_SLOT is a real attention layer of the target, so the shallow
+     * copy would otherwise leave the target's planes in place: name the
+     * draft's own, or NULL when there are none and it falls back to dense. */
+    d.idx_k_cache[Q4E_MTP_SLOT] = q4e_draft_dense_enabled() ? NULL : g->mtp_idx_k_cache;
+    d.idx_pooled[Q4E_MTP_SLOT] = q4e_draft_dense_enabled() ? NULL : g->mtp_idx_pooled;
+    /* The draft layer has no recurrent state to checkpoint.  Its attention
+     * follows the same rule as the target's: dense (and exact) until its own
+     * KV holds more complete blocks than the indexer budget, gathered after. */
     d.spec_k = 0;
-    d.is_draft = true;
-    d.qsa_sparse = false;
+    d.qsa_sparse = d.idx_k_cache[Q4E_MTP_SLOT] && g->idx_ready &&
+                   (hi + 1u) / 4u > DS4_N_INDEXER_TOP_K / 4u;
     d.ctx_slot = -1;          /* it owns no execution-context slot */
 
     if (!ds4_gpu_tensor_write(d.tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) ||

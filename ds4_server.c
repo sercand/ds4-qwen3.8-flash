@@ -9631,6 +9631,9 @@ struct server_slot {
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
     int continued_last_store_tokens;
+    /* A continued boundary was crossed while generating; the store itself
+     * waits until the stream is over (kv_cache_note_continued_boundary). */
+    bool continued_pending;
 
     job *assigned;
     job *running;
@@ -11009,9 +11012,27 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
     }
     pthread_mutex_unlock(&s->kv_mu);
     slot->continued_last_store_tokens = 0;
+    slot->continued_pending = false;
     server_inference_lock(s);
     ds4_session_invalidate(slot->session);
     server_inference_unlock(s);
+}
+
+/* Called per decode step.  Crossing a continued boundary used to store right
+ * here: for qwen4exp that is a ~1 GB payload staged under the model lock plus
+ * a full-history detokenize, SHA-1 and NVMe write -- a second of stall in the
+ * middle of a stream, and it grows with the context (measured: 40960 tokens,
+ * stage 540 ms + save 465 ms).  The frontier only has honest logits to write
+ * at the end of the turn anyway, so record the crossing and store then.  The
+ * boundary is marked stored at once so this fires once per interval. */
+static void kv_cache_note_continued_boundary(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (!tokens) return;
+    const int target = kv_cache_slot_continued_target(s, slot, tokens->len);
+    if (target == 0) return;
+    slot->continued_pending = true;
+    kv_cache_slot_note_store(slot, target);
 }
 
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
@@ -13644,7 +13665,7 @@ decode_again:
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
-            if (!multimodal) kv_cache_maybe_store_continued(s, slot);
+            if (!multimodal) kv_cache_note_continued_boundary(s, slot);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -13928,6 +13949,14 @@ decode_again:
         buf_free(&text);
         ds4_tokens_free(&effective_prompt);
         return;
+    }
+
+    /* The continued store the decode loop deferred: the whole live path now,
+     * which is what the next turn wants to load anyway, with the stream done
+     * and nobody waiting on a token. */
+    if (slot->continued_pending) {
+        slot->continued_pending = false;
+        kv_cache_store_current(s, slot, "continued");
     }
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {

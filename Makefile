@@ -538,6 +538,12 @@ tests/test_qwen4exp_graph.o: tests/test_qwen4exp_graph.c ds4.h
 tests/test_qwen4exp_graph: tests/test_qwen4exp_graph.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/bench_qwen4exp_ctx.o: tests/bench_qwen4exp_ctx.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_qwen4exp_ctx: tests/bench_qwen4exp_ctx.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
 tests/test_qwen4exp_exl3.o: tests/test_qwen4exp_exl3.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
