@@ -9673,6 +9673,11 @@ struct server {
      * cache, time-sliced by the executor.  Mutually exclusive with
      * batched_mode, which is refused for a family that shares its cache. */
     bool multi_ctx_mode;
+    /* Coalesce those contexts' decode steps into one pass over the weights
+     * once more than one of them is generating (--batched-decode).  A lone
+     * generation keeps its speculative step: MTP is worth more than batching
+     * when there is nothing to batch with. */
+    bool batched_decode;
     pthread_t *slot_threads;
     pthread_t decode_thread;
     int default_tokens;
@@ -12067,6 +12072,29 @@ static bool server_prefill_before_decode_locked(const server *s) {
            s->decodes_since_prefill >= s->active_generations;
 }
 
+/* Should this decode step be batched with the other contexts' rather than
+ * take a grant of its own?
+ *
+ * Only when there is something to batch with.  The two paths spend the same
+ * rows differently: a speculative step runs 1 + K rows of one sequence and
+ * keeps the prefix the target agrees with -- about half the drafts -- while a
+ * batched step runs one row of each of B sequences and keeps all of them.
+ * Alone, speculation wins outright (measured 44 tok/s against 30).  From two
+ * generations up, the batch does, because its rows are never wasted and they
+ * share one read of the weights.
+ *
+ * Sampled per step, so a request arriving or finishing moves the whole set
+ * over on the next token; both paths leave the session in the same state, so
+ * alternating between them is safe (q4e_forward_batch clears the draft's
+ * staged residual so a later speculative step rebuilds it). */
+static bool server_batch_decode_now(server *s) {
+    if (!s->batched_decode) return false;
+    pthread_mutex_lock(&s->model_mu);
+    const bool batch = s->active_generations > 1;
+    pthread_mutex_unlock(&s->model_mu);
+    return batch;
+}
+
 static bool server_model_enter_prefill(server *s, server_slot *slot) {
     if (!s || !slot || slot_job_cancelled(slot)) return false;
     if (!server_time_sliced(s)) {
@@ -12902,7 +12930,7 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
 static int server_eval_token(server *s, server_slot *slot, int token,
                              char *err, size_t errlen) {
     if (!s || !slot) return 1;
-    if (s->multi_ctx_mode) {
+    if (s->multi_ctx_mode && !server_batch_decode_now(s)) {
         /* One grant of the model for one token.  No coalescing: contexts here
          * keep their own state and their own speculative step (D4). */
         if (!server_model_enter_decode(s, slot)) {
@@ -12915,7 +12943,7 @@ static int server_eval_token(server *s, server_slot *slot, int token,
         server_model_leave(s);
         return rc;
     }
-    if (!s->batched_mode) {
+    if (!s->batched_mode && !s->batched_decode) {
         if (g_stop_requested || slot_job_cancelled(slot)) {
             if (err && errlen) snprintf(err, errlen, "%s",
                                         g_stop_requested ? "shutdown requested" :
@@ -13710,7 +13738,7 @@ decode_again:
          * --batched-session, which coalesces decode into one batched forward
          * over shared rows, has to turn it off.  Draft and verify are one
          * grant of the model. */
-        if (!s->batched_mode &&
+        if (!s->batched_mode && !server_batch_decode_now(s) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL)
         {
@@ -15138,6 +15166,8 @@ typedef struct {
     int batched_sessions;
     int mixed_prefill_quantum;
     bool mixed_prefill_quantum_set;
+    bool batched_decode;
+    bool batched_decode_set;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -15430,6 +15460,15 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.ssm_checkpoints =
                 (uint32_t)parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
             c.engine.ssm_checkpoints_set = true;
+        } else if (!strcmp(arg, "--batched-decode")) {
+            const char *v = need_arg(&i, argc, argv, arg);
+            if (strcmp(v, "0") && strcmp(v, "1")) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --batched-decode takes 0 or 1, got: %s", v);
+                exit(2);
+            }
+            c.batched_decode = (v[0] == '1');
+            c.batched_decode_set = true;
         } else if (!strcmp(arg, "--exec-contexts")) {
             int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             if (v <= 0) {
@@ -15618,6 +15657,12 @@ int main(int argc, char **argv) {
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.multi_ctx_mode = multi_ctx_mode;
+    /* On by default wherever there are contexts to batch: a lone generation
+     * still takes the speculative path, so this costs a single request
+     * nothing and is the only thing that makes concurrent ones share a pass
+     * over the weights. */
+    s.batched_decode = multi_ctx_mode && slot_count > 1 &&
+                       (cfg.batched_decode_set ? cfg.batched_decode : true);
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     /* The executor's contended quantum.  128 -- this flag's default, sized for
      * DeepSeek -- is far too small for a 512-expert MoE, where a chunk that
@@ -15696,6 +15741,13 @@ int main(int argc, char **argv) {
                    s.slot_count, ds4_session_prefill_cap(s.slots[0].session),
                    s.mixed_prefill_quantum,
                    ds4_engine_has_mtp(engine) ? " (MTP stays on)" : "");
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: batched decode %s%s",
+                   s.batched_decode ? "on" : "off",
+                   s.batched_decode ?
+                       ": from two generations up, one pass over the weights "
+                       "serves every generating context; a lone one keeps its "
+                       "speculative step" : "");
     }
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
@@ -15713,10 +15765,11 @@ int main(int argc, char **argv) {
     int slot_threads_started = 0;
     bool decode_thread_started = false;
     if (server_time_sliced(&s)) {
-        /* Only batched mode coalesces decode into one backend call, so only
-         * it needs the coordinator; multi-context decode is one grant of the
-         * model per context, taken by the context's own worker. */
-        if (s.batched_mode) {
+        /* The coordinator is what coalesces decode into one backend call.
+         * Batched mode always needs it; multi-context mode needs it once
+         * --batched-decode is on, which is the only difference between a
+         * context taking a grant of its own and joining a batch. */
+        if (s.batched_mode || s.batched_decode) {
             if (pthread_create(&s.decode_thread, NULL, decode_worker_main, &s) != 0) {
                 server_log(DS4_LOG_DEFAULT, "ds4-server: failed to start decode coordinator");
                 server_close_resources(&s);

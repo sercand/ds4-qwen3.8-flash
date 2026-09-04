@@ -55532,6 +55532,16 @@ bool ds4_test_q4e_span_tree(void) {
  * recurrent state, its page table, its pending draft rows and its
  * per-generation bookkeeping; q4e_graph_free frees exactly that and
  * q4e_scratch_bind is the list of it. */
+/* One batched decode step: n independent sequences, one token each, sharing a
+ * single pass over the weights.  seq[r] owns row r's recurrent state, conv
+ * windows and page table; the shared scratch is whichever context's graph the
+ * pass runs through, since q4e_scratch_bind gives every context the same
+ * buffers. */
+typedef struct q4e_batch {
+    struct ds4_q4e_graph **seq;
+    uint32_t               n;
+} q4e_batch;
+
 struct ds4_q4e_graph {
     uint32_t ctx_size;
     uint32_t tok_cap;
@@ -55672,6 +55682,14 @@ struct ds4_q4e_graph {
     uint32_t        idx_max_blocks;
     bool            idx_ready;    /* indexer caches allocated for the attention layers */
     bool            qsa_sparse;   /* this forward selects blocks (context past the budget) */
+
+    /* Batched decode: set for the length of one q4e_forward_batch, NULL
+     * everywhere else.  Row r of every shared scratch buffer then belongs to
+     * a different sequence -- seq[r] -- which owns that row's recurrent
+     * state, conv windows and page table.  Only the handful of kernels that
+     * read one of those consult it (q4e_row_owner); everything else is
+     * row-parallel and already sees the batch as n_tok rows. */
+    const struct q4e_batch *batch;
 
     ds4_gpu_tensor *argmax_dev;      /* int32 per logits row */
     int32_t        *argmax_host;     /* the verify rows' greedy picks */
@@ -68100,7 +68118,12 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
         if (k > g->spec_k) g->spec_k = k;
     }
     if (g->spec_k > Q4E_SPEC_MAX_DRAFT) g->spec_k = Q4E_SPEC_MAX_DRAFT;
+    /* Wide enough for a speculative verify's 1 + K rows or for one row per
+     * execution context, whichever asks for more: a batched decode step
+     * samples every row, because every row is some sequence's frontier.  The
+     * buffer is shared scratch, so the difference is a few megabytes once. */
     g->logit_rows = 1u + g->spec_k;
+    if (g->logit_rows < Q4E_CTX_MAX) g->logit_rows = Q4E_CTX_MAX;
     g->mtp_ready = mtp;      /* the scratch's copy: what it allocated for */
 
     qwen4exp_ple_params(&g->ple_params, &e->model, e->weights.ple_table, e->weights.ple_bias);
@@ -68594,6 +68617,17 @@ static int q4e_hc_mix(ds4_q4e_graph *g, const ds4_model *m,
 
 /* PLE n-gram block.  The rows were gathered on the host before the first
  * layer ran, so this only decodes and applies them. */
+/* A one-row slice of a shared scratch buffer, for the per-sequence kernels of
+ * a batched pass (see "Batched decode: the per-sequence kernels" below).  The
+ * caller frees it. */
+static ds4_gpu_tensor *q4e_row(const ds4_gpu_tensor *t, uint32_t r, uint64_t row_bytes) {
+    return ds4_gpu_tensor_view((ds4_gpu_tensor *)t, (uint64_t)r * row_bytes, row_bytes);
+}
+
+static void q4e_row_free(ds4_gpu_tensor **v, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) ds4_gpu_tensor_free(v[i]);
+}
+
 static int q4e_ple_block(ds4_q4e_graph *g, const ds4_model *m,
                          const ds4_layer_weights *l, uint32_t n_tok) {
     if (!ds4_gpu_q4e_ple_dequant(g->ple_emb, g->ple_rows, DS4_N_PLE_HEAD_DIM,
@@ -68621,22 +68655,103 @@ static int q4e_ple_block(ds4_q4e_graph *g, const ds4_model *m,
     if (!ds4_gpu_q4e_hc_norm(g->ple_cv, g->ple_gv, m->map, m->size,
                              l->ple_norm_conv->abs_offset,
                              DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
-    if (!ds4_gpu_q4e_ple_conv(g->ple_cv, g->ple_conv, g->ple_cv, m->map, m->size,
-                              l->ple_conv1d->abs_offset, Q4E_HC_DIM,
-                              DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, n_tok,
-                              g->ple_conv_ckpt, g->spec_k)) return 0;
+    if (!g->batch) {
+        if (!ds4_gpu_q4e_ple_conv(g->ple_cv, g->ple_conv, g->ple_cv, m->map, m->size,
+                                  l->ple_conv1d->abs_offset, Q4E_HC_DIM,
+                                  DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, n_tok,
+                                  g->ple_conv_ckpt, g->spec_k)) return 0;
+    } else {
+        /* The dilated window is this sequence's own, like the DeltaNet one. */
+        const uint64_t rb = (uint64_t)Q4E_HC_DIM * sizeof(float);
+        for (uint32_t r = 0; r < n_tok; r++) {
+            ds4_gpu_tensor *cv = q4e_row(g->ple_cv, r, rb);
+            const int ok = cv &&
+                ds4_gpu_q4e_ple_conv(cv, g->batch->seq[r]->ple_conv, cv, m->map, m->size,
+                                     l->ple_conv1d->abs_offset, Q4E_HC_DIM,
+                                     DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, 1u, NULL, 0u);
+            ds4_gpu_tensor_free(cv);
+            if (!ok) return 0;
+        }
+    }
     q4e_trace("ple_conv_out", (int)DS4_PLE_LAYER, g->ple_cv, (uint64_t)n_tok * Q4E_HC_DIM);
 
     return ds4_gpu_q4e_add2(g->res, g->ple_gv, g->ple_cv, (uint64_t)n_tok * Q4E_HC_DIM);
 }
 
+/* ------------------------------------------------------------------------
+ * Batched decode: the per-sequence kernels.
+ * ------------------------------------------------------------------------
+ *
+ * Almost all of a forward pass is row-parallel -- every matmul, the router,
+ * the MoE, the norms and the gates take n_tok and do not care which sequence
+ * a row came from.  Six things do care, because they read or write state that
+ * belongs to one sequence: the two gated-DeltaNet windows (conv and the
+ * recurrent matrix), the PLE conv window, and everything that goes through a
+ * page table (the KV store, the indexer's store and pooling, and attention).
+ *
+ * In a batched pass those run once per row against that row's owner instead
+ * of once over the whole range.  That is the whole cost of the arrangement:
+ * B small launches where there was one, against one pass over the weights
+ * where there were B.  Unbatched, g->batch is NULL and every one of these is
+ * the single call it has always been, on exactly the arguments it had.
+ */
+
+/* The gated-DeltaNet conv window. */
+static int q4e_gdn_conv_step(ds4_q4e_graph *g, const ds4_model *m,
+                             const ds4_layer_weights *l, uint32_t il,
+                             uint32_t n_tok) {
+    if (!g->batch) {
+        return ds4_gpu_q4e_gdn_conv(g->gdn_conv_out, g->gdn_conv[il], g->gdn_qkv,
+                                    m->map, m->size, l->gdn_conv1d->abs_offset,
+                                    Q4E_GDN_IN, DS4_N_GDN_CONV, n_tok,
+                                    g->gdn_conv_ckpt[il], g->spec_k);
+    }
+    const uint64_t rb = (uint64_t)Q4E_GDN_IN * sizeof(float);
+    for (uint32_t r = 0; r < n_tok; r++) {
+        ds4_gpu_tensor *v[2] = { q4e_row(g->gdn_conv_out, r, rb),
+                                 q4e_row(g->gdn_qkv, r, rb) };
+        const int ok = v[0] && v[1] &&
+            ds4_gpu_q4e_gdn_conv(v[0], g->batch->seq[r]->gdn_conv[il], v[1],
+                                 m->map, m->size, l->gdn_conv1d->abs_offset,
+                                 Q4E_GDN_IN, DS4_N_GDN_CONV, 1u, NULL, 0u);
+        q4e_row_free(v, 2);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* The recurrent 128x128 matrix per value head. */
+static int q4e_gdn_recurrent_step(ds4_q4e_graph *g, uint32_t il, uint32_t n_tok) {
+    if (!g->batch) {
+        return ds4_gpu_q4e_gdn_recurrent(g->gdn_attn, g->gdn_state[il], g->gdn_conv_out,
+                                         g->gdn_decay, g->gdn_beta,
+                                         DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                         DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, n_tok,
+                                         g->gdn_state_ckpt[il], g->spec_k);
+    }
+    const uint64_t in_b  = (uint64_t)Q4E_GDN_IN * sizeof(float);
+    const uint64_t out_b = (uint64_t)Q4E_GDN_V * sizeof(float);
+    const uint64_t gate_b = (uint64_t)DS4_N_GDN_VALUE_HEAD * sizeof(float);
+    for (uint32_t r = 0; r < n_tok; r++) {
+        ds4_gpu_tensor *v[4] = { q4e_row(g->gdn_attn, r, out_b),
+                                 q4e_row(g->gdn_conv_out, r, in_b),
+                                 q4e_row(g->gdn_decay, r, gate_b),
+                                 q4e_row(g->gdn_beta, r, gate_b) };
+        const int ok = v[0] && v[1] && v[2] && v[3] &&
+            ds4_gpu_q4e_gdn_recurrent(v[0], g->batch->seq[r]->gdn_state[il], v[1],
+                                      v[2], v[3],
+                                      DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                      DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, 1u, NULL, 0u);
+        q4e_row_free(v, 4);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
 static int q4e_gdn_layer(ds4_q4e_graph *g, const ds4_model *m,
                          const ds4_layer_weights *l, uint32_t il, uint32_t n_tok) {
     if (!q4e_matmul(g->gdn_qkv, m, l->gdn_qkv, g->mixed, n_tok)) return 0;
-    if (!ds4_gpu_q4e_gdn_conv(g->gdn_conv_out, g->gdn_conv[il], g->gdn_qkv,
-                              m->map, m->size, l->gdn_conv1d->abs_offset,
-                              Q4E_GDN_IN, DS4_N_GDN_CONV, n_tok,
-                              g->gdn_conv_ckpt[il], g->spec_k)) return 0;
+    if (!q4e_gdn_conv_step(g, m, l, il, n_tok)) return 0;
     q4e_trace("conv_output_silu", (int)il, g->gdn_conv_out, (uint64_t)n_tok * Q4E_GDN_IN);
     /* q and k are L2 normalized after the conv; v is used as it comes. */
     if (!ds4_gpu_q4e_gdn_l2norm(g->gdn_conv_out, DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
@@ -68653,11 +68768,7 @@ static int q4e_gdn_layer(ds4_q4e_graph *g, const ds4_model *m,
     q4e_trace("gate", (int)il, g->gdn_decay, (uint64_t)n_tok * DS4_N_GDN_VALUE_HEAD);
     q4e_trace("beta_sigmoid", (int)il, g->gdn_beta, (uint64_t)n_tok * DS4_N_GDN_VALUE_HEAD);
 
-    if (!ds4_gpu_q4e_gdn_recurrent(g->gdn_attn, g->gdn_state[il], g->gdn_conv_out,
-                                   g->gdn_decay, g->gdn_beta,
-                                   DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
-                                   DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, n_tok,
-                                   g->gdn_state_ckpt[il], g->spec_k)) return 0;
+    if (!q4e_gdn_recurrent_step(g, il, n_tok)) return 0;
     q4e_trace("attn_output", (int)il, g->gdn_attn, (uint64_t)n_tok * Q4E_GDN_V);
 
     if (!q4e_matmul(g->gdn_z, m, l->gdn_gate, g->mixed, n_tok)) return 0;
@@ -68666,6 +68777,87 @@ static int q4e_gdn_layer(ds4_q4e_graph *g, const ds4_model *m,
                                   DS4_N_GDN_HEAD_DIM, DS4_N_GDN_VALUE_HEAD,
                                   n_tok, DS4_RMS_EPS)) return 0;
     return q4e_matmul(g->blk_out, m, l->gdn_out, g->gdn_gated, n_tok);
+}
+
+/* Everything in the attention layer that goes through a page table: the KV
+ * store, the indexer's key store and pooling, and attention itself.  The K/V
+ * planes and the indexer planes are borrowed from the shared pool and mean
+ * the same rows in every context, so only `pages` -- and, for the dense
+ * kernel, the position that bounds the causal span -- changes per row. */
+static int q4e_qsa_store_step(ds4_q4e_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, uint32_t il,
+                              uint32_t n_tok) {
+    if (!g->batch) {
+        return ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], g->qsa_k, g->qsa_v,
+                                        m->map, m->size, l->qsa_k_norm->abs_offset,
+                                        g->positions, g->kv_pages, DS4_N_HEAD_DIM,
+                                        DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
+                                        g->pool_slots, n_tok, DS4_RMS_EPS);
+    }
+    const uint64_t kv_b = (uint64_t)Q4E_KV_DIM * sizeof(float);
+    for (uint32_t r = 0; r < n_tok; r++) {
+        ds4_gpu_tensor *v[3] = { q4e_row(g->qsa_k, r, kv_b),
+                                 q4e_row(g->qsa_v, r, kv_b),
+                                 q4e_row(g->positions, r, sizeof(int32_t)) };
+        const int ok = v[0] && v[1] && v[2] &&
+            ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], v[0], v[1],
+                                     m->map, m->size, l->qsa_k_norm->abs_offset,
+                                     v[2], g->batch->seq[r]->kv_pages, DS4_N_HEAD_DIM,
+                                     DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
+                                     g->pool_slots, 1u, DS4_RMS_EPS);
+        q4e_row_free(v, 3);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+static int q4e_idx_store_step(ds4_q4e_graph *g, const ds4_model *m,
+                              const ds4_layer_weights *l, uint32_t il,
+                              uint32_t n_tok) {
+    if (!g->batch) {
+        return ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], g->idx_k, g->positions,
+                                       g->kv_pages, n_tok) &&
+               ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
+                                    l->idx_k_norm->abs_offset, g->positions, g->kv_pages,
+                                    n_tok, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+    }
+    const uint64_t k_b = 128u * sizeof(float);
+    for (uint32_t r = 0; r < n_tok; r++) {
+        ds4_gpu_tensor *pages = g->batch->seq[r]->kv_pages;
+        ds4_gpu_tensor *v[2] = { q4e_row(g->idx_k, r, k_b),
+                                 q4e_row(g->positions, r, sizeof(int32_t)) };
+        const int ok = v[0] && v[1] &&
+            ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], v[0], v[1], pages, 1u) &&
+            ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
+                                 l->idx_k_norm->abs_offset, v[1], pages,
+                                 1u, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
+        q4e_row_free(v, 2);
+        if (!ok) return 0;
+    }
+    return 1;
+}
+
+/* Dense attention over each row's own page table.  The sparse path keeps its
+ * own loop below, because its scratch is sized per query block. */
+static int q4e_qsa_attention_step(ds4_q4e_graph *g, uint32_t il, uint32_t n_tok) {
+    if (!g->batch) {
+        return ds4_gpu_q4e_qsa_attention(g->qsa_out, g->k_cache[il], g->v_cache[il],
+                                         g->qsa_q, g->positions, g->kv_pages,
+                                         DS4_N_HEAD_DIM, DS4_N_HEAD, DS4_N_HEAD_KV, n_tok);
+    }
+    const uint64_t q_b = (uint64_t)Q4E_Q_DIM * sizeof(float);
+    for (uint32_t r = 0; r < n_tok; r++) {
+        ds4_gpu_tensor *v[3] = { q4e_row(g->qsa_out, r, q_b),
+                                 q4e_row(g->qsa_q, r, q_b),
+                                 q4e_row(g->positions, r, sizeof(int32_t)) };
+        const int ok = v[0] && v[1] && v[2] &&
+            ds4_gpu_q4e_qsa_attention(v[0], g->k_cache[il], g->v_cache[il], v[1], v[2],
+                                      g->batch->seq[r]->kv_pages, DS4_N_HEAD_DIM,
+                                      DS4_N_HEAD, DS4_N_HEAD_KV, 1u);
+        q4e_row_free(v, 3);
+        if (!ok) return 0;
+    }
+    return 1;
 }
 
 static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
@@ -68681,11 +68873,7 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
                                      DS4_RMS_EPS)) return 0;
     if (!q4e_matmul(g->qsa_k, m, l->qsa_k, g->mixed, n_tok)) return 0;
     if (!q4e_matmul(g->qsa_v, m, l->qsa_v, g->mixed, n_tok)) return 0;
-    if (!ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], g->qsa_k, g->qsa_v,
-                                  m->map, m->size, l->qsa_k_norm->abs_offset,
-                                  g->positions, g->kv_pages, DS4_N_HEAD_DIM, DS4_N_HEAD_KV,
-                                  DS4_N_ROT, DS4_ROPE_FREQ_BASE, g->pool_slots,
-                                  n_tok, DS4_RMS_EPS)) return 0;
+    if (!q4e_qsa_store_step(g, m, l, il, n_tok)) return 0;
     /* QSA indexer: keep the raw and pooled indexer keys current for every
      * forward; select blocks only once the context holds more complete
      * blocks than the budget (below that the selection is every visible
@@ -68696,14 +68884,8 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
     const bool idx_on = g->idx_k_cache[il] && l->idx_q && l->idx_k &&
                         l->idx_q_norm && l->idx_k_norm;
     if (idx_on) {
-        const uint32_t pos0 = g->pos;
         if (!q4e_matmul(g->idx_k, m, l->idx_k, g->mixed, n_tok)) return 0;
-        if (!ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], g->idx_k, g->positions,
-                                     g->kv_pages, n_tok)) return 0;
-        (void)pos0;
-        if (!ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
-                                  l->idx_k_norm->abs_offset, g->positions, g->kv_pages,
-                                  n_tok, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
+        if (!q4e_idx_store_step(g, m, l, il, n_tok)) return 0;
     }
     if (idx_on && g->qsa_sparse) {
         /* Block counts come from the positions on the device (see the
@@ -68711,15 +68893,21 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
          * a captured graph tracks the growing context; only the buffer
          * stride (idx_max_blocks) is fixed. */
         const uint32_t kb = DS4_N_INDEXER_TOP_K / 4u;
-        ds4_gpu_tensor *pos_last = ds4_gpu_tensor_view(g->positions, (uint64_t)(n_tok - 1u) * sizeof(int32_t),
-                                                       sizeof(int32_t));
-        if (!pos_last) return 0;
+        /* Batched, a block is one row: its own sequence's frontier bounds the
+         * selection, and its own page table resolves it.  Unbatched the whole
+         * range shares the last row's position, as it always has. */
+        const uint32_t qb = g->batch ? 1u : Q4E_IDX_QB;
+        ds4_gpu_tensor *pos_last = g->batch ? NULL :
+            ds4_gpu_tensor_view(g->positions, (uint64_t)(n_tok - 1u) * sizeof(int32_t),
+                                sizeof(int32_t));
+        if (!g->batch && !pos_last) return 0;
         if (!q4e_matmul(g->idx_q, m, l->idx_q, g->mixed, n_tok)) return 0;
         if (!ds4_gpu_q4e_idx_q(g->idx_qn, g->idx_q, m->map, m->size, l->idx_q_norm->abs_offset,
                                g->positions, DS4_N_INDEXER_HEAD, n_tok, DS4_N_ROT,
                                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
-        for (uint32_t r0 = 0; r0 < n_tok; r0 += Q4E_IDX_QB) {
-            const uint32_t nb = (n_tok - r0 < Q4E_IDX_QB) ? (n_tok - r0) : Q4E_IDX_QB;
+        for (uint32_t r0 = 0; r0 < n_tok; r0 += qb) {
+            const uint32_t nb = (n_tok - r0 < qb) ? (n_tok - r0) : qb;
+            ds4_gpu_tensor *pages = g->batch ? g->batch->seq[r0]->kv_pages : g->kv_pages;
             ds4_gpu_tensor *qn_v = ds4_gpu_tensor_view(g->idx_qn,
                     (uint64_t)r0 * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t),
                     (uint64_t)nb * DS4_N_INDEXER_HEAD * 128u * sizeof(uint16_t));
@@ -68729,16 +68917,17 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
                                                       (uint64_t)nb * Q4E_Q_DIM * sizeof(float));
             ds4_gpu_tensor *out_v = ds4_gpu_tensor_view(g->qsa_out, (uint64_t)r0 * Q4E_Q_DIM * sizeof(float),
                                                         (uint64_t)nb * Q4E_Q_DIM * sizeof(float));
+            const ds4_gpu_tensor *last = g->batch ? pos_v : pos_last;
             int ok = qn_v && pos_v && q_v && out_v &&
-                     ds4_gpu_q4e_idx_score(g->idx_score, qn_v, g->idx_pooled[il], pos_v, pos_last,
-                                           g->kv_pages, DS4_N_INDEXER_HEAD, nb,
+                     ds4_gpu_q4e_idx_score(g->idx_score, qn_v, g->idx_pooled[il], pos_v, last,
+                                           pages, DS4_N_INDEXER_HEAD, nb,
                                            g->idx_max_blocks) &&
-                     ds4_gpu_q4e_idx_topk(g->idx_sel, g->idx_cnt, g->idx_score, pos_last, nb,
+                     ds4_gpu_q4e_idx_topk(g->idx_sel, g->idx_cnt, g->idx_score, last, nb,
                                           g->idx_max_blocks, kb) &&
                      ds4_gpu_q4e_idx_expand(g->idx_tokens, g->idx_nsel, g->idx_sel, g->idx_cnt, pos_v,
                                             nb, kb, Q4E_IDX_WIDTH) &&
                      ds4_gpu_q4e_qsa_attention_sparse(out_v, g->idx_part, g->k_cache[il], g->v_cache[il],
-                                                      q_v, g->idx_tokens, g->idx_nsel, g->kv_pages,
+                                                      q_v, g->idx_tokens, g->idx_nsel, pages,
                                                       Q4E_IDX_WIDTH, DS4_N_HEAD_DIM, DS4_N_HEAD,
                                                       DS4_N_HEAD_KV, nb);
             ds4_gpu_tensor_free(qn_v);
@@ -68748,9 +68937,7 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
             if (!ok) { ds4_gpu_tensor_free(pos_last); return 0; }
         }
         ds4_gpu_tensor_free(pos_last);
-    } else if (!ds4_gpu_q4e_qsa_attention(g->qsa_out, g->k_cache[il], g->v_cache[il], g->qsa_q,
-                                          g->positions, g->kv_pages, DS4_N_HEAD_DIM, DS4_N_HEAD,
-                                          DS4_N_HEAD_KV, n_tok)) {
+    } else if (!q4e_qsa_attention_step(g, il, n_tok)) {
         return 0;
     }
     if (!ds4_gpu_q4e_qsa_gate(g->qsa_out, g->qsa_gate,
@@ -69074,6 +69261,40 @@ static int q4e_ple_gather(ds4_q4e_graph *g, const int *history,
                                 (uint64_t)n_rows * row_bytes) ? 0 : 1;
 }
 
+/* The same gather for a batched pass: row r's hash reads the trailing n-gram
+ * of items[r]'s own history, so the ids are built per row into one buffer and
+ * fetched in a single call -- the reader coalesces and the cache is shared, so
+ * one fetch of n * n_heads scattered rows beats n fetches. */
+static int q4e_ple_gather_batch(ds4_q4e_graph *g, const ds4_decode_item *items,
+                                uint32_t n) {
+    const ds4_ple_params *params = &g->ple_params;
+    const uint32_t row_bytes = ds4_ple_row_bytes(params);
+    const uint32_t heads = params->n_heads;
+
+    for (uint32_t r = 0; r < n; r++) {
+        const ds4_session *s = items[r].session;
+        /* The row's token is already the last of its own history, so the
+         * hash reads the real trailing n-gram. */
+        ds4_ple_row_ids(params, s->checkpoint.v, (uint32_t)s->checkpoint.len - 1u, 1u,
+                        g->ple_row_ids + (uint64_t)r * heads);
+    }
+
+    char err[256] = {0};
+    const double t0 = now_sec();
+    if (ds4_ple_stream_fetch(g->ple_stream, g->ple_row_ids, n * heads,
+                             g->ple_row_data, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp PLE batch gather failed: %s\n", err);
+        return 1;
+    }
+    const double wait = now_sec() - t0;
+    g_q4e_ple_wait_s += wait;
+    g_q4e_ple_waits++;
+    if (wait > g_q4e_ple_wait_max_s) g_q4e_ple_wait_max_s = wait;
+
+    return ds4_gpu_tensor_write(g->ple_rows, 0, g->ple_row_data,
+                                (uint64_t)n * heads * row_bytes) ? 0 : 1;
+}
+
 /* Warm the row cache with the next prefill chunk's rows while this chunk runs
  * on the GPU: a 2048-token chunk misses ~20k rows, 100-300 ms of direct
  * reads that would otherwise sit on the critical path (the reads themselves
@@ -69218,6 +69439,163 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     }
     g->pos = pos0 + n_tok;
     return 0;
+}
+
+/* Advance `n` independent sessions by one token each in a single pass.
+ *
+ * Row r is items[r]'s next token at items[r]'s own frontier, so the pass is
+ * n_tok = n rows wide and every row-parallel kernel -- which is nearly all of
+ * them -- sees it as an n-row chunk, exactly the shape prefill already uses.
+ * The six kernels that carry per-sequence state take the batch through
+ * g->batch instead (see q4e_row_owner and the _step helpers above).
+ *
+ * The scratch belongs to whichever context's graph drives the pass, and
+ * q4e_scratch_bind gives every context the same buffers, so `lead` is an
+ * arbitrary choice among them; what each session keeps is its own state,
+ * page table and logits.
+ *
+ * The point of the arrangement is the weights: one read of them answers n
+ * sequences instead of one.  Speculation is off here on purpose -- a draft
+ * row is accepted about half the time and a real sequence's row always is, so
+ * once there is more than one sequence the rows are better spent on them. */
+static int q4e_forward_batch(ds4_decode_item *items, uint32_t n,
+                             char *err, size_t errlen) {
+    if (n == 0) return 1;
+    ds4_session *lead_s = items[0].session;
+    ds4_q4e_graph *g = &lead_s->q4e_graph;
+    ds4_engine *e = lead_s->engine;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+
+    if (n > g->tok_cap || n > g->logit_rows) {
+        if (err && errlen) snprintf(err, errlen, "decode batch of %u exceeds the pass width", n);
+        return 1;
+    }
+
+    ds4_q4e_graph **seq = xmalloc((size_t)n * sizeof(*seq));
+    int32_t *ids = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *pos = xmalloc((size_t)n * sizeof(int32_t));
+    q4e_batch batch = { .seq = seq, .n = n };
+    double tph = 0.0;
+    uint32_t pushed = 0;
+    int rc = 1;
+
+    /* The PLE hash reads the two tokens before each position, so a row's
+     * token has to be in its own history before the pass runs -- the same
+     * order the single-token path uses.  `pushed` is how many are in, so a
+     * failure can take them back out again. */
+    for (uint32_t r = 0; r < n; r++) {
+        ds4_session *s = items[r].session;
+        ds4_q4e_graph *o = &s->q4e_graph;
+        seq[r] = o;
+        ids[r] = items[r].token;
+        token_vec_push(&s->checkpoint, items[r].token);
+        pushed++;
+        pos[r] = (int32_t)s->checkpoint.len - 1;
+        const uint32_t end = (uint32_t)s->checkpoint.len;
+        if (end > o->ctx_size || q4e_kv_reserve(o, end) != 0) {
+            if (err && errlen) snprintf(err, errlen, "decode batch item %u has no room", r);
+            goto done;
+        }
+        /* Whatever this session's logits held describes the position it is
+         * about to leave behind. */
+        o->logits_pos = 0;
+    }
+
+    g->batch = &batch;
+    g_q4e_trace_ntok = n;
+
+    if (!ds4_gpu_tensor_write(g->tokens, 0, ids, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n * sizeof(int32_t))) {
+        if (err && errlen) snprintf(err, errlen, "decode batch upload failed");
+        goto done;
+    }
+
+    tph = q4e_phase_begin();
+    if (!q4e_embed(g->embed, g->tokens, m, w->token_embd, n) ||
+        !ds4_gpu_q4e_hc_init(g->res, g->embed, DS4_N_EMBD, DS4_N_HC, n)) goto done;
+    q4e_phase_end(Q4E_PH_EMBED, tph);
+    g_q4e_steps++;
+
+    /* The sparse-attention mode is a property of a sequence's context length,
+     * and the rows here come from different sequences.  Take the mode the
+     * deepest of them needs: the indexer's selection is exact for a shorter
+     * one too, only wider than it had to be. */
+    g->qsa_sparse = false;
+    if (g->idx_ready) {
+        for (uint32_t r = 0; r < n; r++) {
+            if ((seq[r]->pos + 1u) / 4u > DS4_N_INDEXER_TOP_K / 4u) g->qsa_sparse = true;
+        }
+    }
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (ds4_qwen4exp_layer_has_ple(il)) {
+            tph = q4e_phase_begin();
+            if (q4e_ple_gather_batch(g, items, n) != 0) goto done;
+            q4e_phase_end(Q4E_PH_PLE_GATHER, tph);
+        }
+        const bool next_is_ple = il + 1u < DS4_N_LAYER &&
+                                 ds4_qwen4exp_layer_has_ple(il + 1u);
+        const ds4_tensor *after_ffn = (il + 1u < DS4_N_LAYER && !next_is_ple)
+            ? w->layer[il + 1u].hc_attn_norm : NULL;
+        const bool attn_xn_ready = il > 0u && !ds4_qwen4exp_layer_has_ple(il);
+        /* No graph capture: a captured launch bakes in one page table, and
+         * here the rows carry several. */
+        if (!q4e_run_island(g, m, l, il, 0u, n, /*graphs_ok=*/false, attn_xn_ready,
+                            l->hc_ffn_norm)) goto done;
+        if (!q4e_run_island(g, m, l, il, 1u, n, /*graphs_ok=*/false, /*xn_ready=*/true,
+                            after_ffn)) goto done;
+    }
+
+    tph = q4e_phase_begin();
+    if (!q4e_hc_mix(g, m, w->output_mix_norm, w->output_mix_down,
+                    w->output_mix_up, NULL, n)) goto done;
+    if (!q4e_matmul(g->logits, m, w->output, g->mixed, n)) goto done;
+    q4e_phase_end(Q4E_PH_OUTPUT, tph);
+
+    /* Every row is a frontier here, so every row's distribution goes back to
+     * its own session -- unlike a verify pass, where only the committed row
+     * matters and the greedy picks are enough. */
+    if (!ds4_gpu_synchronize()) goto done;
+    for (uint32_t r = 0; r < n; r++) {
+        if (!ds4_gpu_tensor_read(g->logits, (uint64_t)r * DS4_N_VOCAB * sizeof(float),
+                                 items[r].session->logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float))) goto done;
+    }
+
+    for (uint32_t r = 0; r < n; r++) {
+        ds4_q4e_graph *o = seq[r];
+        o->pos = (uint32_t)pos[r] + 1u;
+        o->logits_pos = o->pos;
+        /* This step wrote no draft-side KV, so whatever the MTP head had
+         * staged no longer describes the frontier.  Clearing it is what lets
+         * a later speculative step -- when this session is generating alone
+         * again -- rebuild instead of drafting from a stale residual. */
+        o->pend_valid = false;
+        items[r].session->checkpoint_valid = true;
+        items[r].session->mtp_draft_valid = false;
+    }
+    rc = 0;
+
+done:
+    g->batch = NULL;
+    if (rc != 0) {
+        /* All-or-nothing: take the tokens back out and make every member
+         * rebuild, since some of them may have advanced on the device. */
+        for (uint32_t r = 0; r < pushed; r++) {
+            ds4_session *s = items[r].session;
+            if (s->checkpoint.len > 0) s->checkpoint.len--;
+        }
+        for (uint32_t r = 0; r < n; r++) ds4_session_invalidate(items[r].session);
+    }
+    free(seq);
+    free(ids);
+    free(pos);
+    if (rc != 0 && err && errlen && !err[0]) {
+        snprintf(err, errlen, "qwen4exp batched decode failed");
+    }
+    return rc;
 }
 
 /* =========================================================================
@@ -79049,6 +79427,13 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
     }
     if (count == 1) {
         return ds4_session_eval(items[0].session, items[0].token, err, errlen);
+    }
+
+    /* qwen4exp runs its own batched pass: the sessions share one prefix cache
+     * and one set of scratch buffers, so their rows can go through the
+     * weights together instead of one graph after another. */
+    if (ds4_session_is_qwen4exp(items[0].session)) {
+        return q4e_forward_batch(items, (uint32_t)count, err, errlen);
     }
 
     ds4_session *first = items[0].session;

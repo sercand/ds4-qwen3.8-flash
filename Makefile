@@ -538,6 +538,12 @@ tests/test_qwen4exp_graph.o: tests/test_qwen4exp_graph.c ds4.h
 tests/test_qwen4exp_graph: tests/test_qwen4exp_graph.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/test_qwen4exp_batch.o: tests/test_qwen4exp_batch.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_batch: tests/test_qwen4exp_batch.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
 tests/bench_qwen4exp_ctx.o: tests/bench_qwen4exp_ctx.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
@@ -677,9 +683,10 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test tests/test_gguf_split mxfp4-
 # they are not part of `make test`; point DS4_QWEN4EXP_MODEL at the first GGUF
 # shard.  See misc/qwen4exp-oracle/README.md.
 DS4_QWEN4EXP_MODEL ?=
-test-qwen4exp: tests/test_qwen4exp_ple tests/test_qwen4exp_graph
+test-qwen4exp: tests/test_qwen4exp_ple tests/test_qwen4exp_graph tests/test_qwen4exp_batch
 	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_ple
 	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_graph
+	DS4_QWEN4EXP_MODEL="$(DS4_QWEN4EXP_MODEL)" ./tests/test_qwen4exp_batch
 
 # The EXL3 repack of the same model against exllamav3's dump of the
 # checkpoint (misc/qwen4exp-oracle/exl3_dump.py).  See tests/test_qwen4exp_exl3.c.
