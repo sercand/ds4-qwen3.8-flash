@@ -2075,12 +2075,54 @@ __device__ static void q4e_rope_neox(
     }
 }
 
+/* Interleaved multimodal RoPE.
+ *
+ * mrope_section splits the n_rot/2 frequency pairs across three position axes
+ * -- time, height, width -- interleaved rather than chunked, so every axis
+ * keeps a spread of frequencies instead of a contiguous band: pair i belongs
+ * to axis i % 3.  Qwen3.8-Flash-Next uses [11, 11, 10] over 32 pairs, which
+ * tiles exactly, so the budget check below never fires for this checkpoint; it
+ * is here because the rule is general and a future section triple need not
+ * tile.  Anything past its section's budget falls back to the time axis, which
+ * is what the reference does.
+ *
+ * With pos_t == pos_h == pos_w this is bit-identical to q4e_rope_neox -- same
+ * expression, same iteration order, same casts -- which is what makes a
+ * text-only prompt a no-op.  q4e_rope_neox is kept beside it as the reference
+ * that property is stated against; the gate that actually checks it is an
+ * end-to-end DS4_QWEN4EXP_TRACE diff of a text prompt against the pre-mRoPE
+ * build, which exercises all four rope sites in place rather than in a
+ * harness. */
+__device__ static void q4e_rope_mrope(
+        float *v, uint32_t n_rot, float base,
+        int32_t pos_t, int32_t pos_h, int32_t pos_w,
+        uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
+        uint32_t lane, uint32_t nlanes) {
+    const uint32_t half = n_rot / 2u;
+    for (uint32_t i = lane; i < half; i += nlanes) {
+        uint32_t axis = i % 3u;
+        const uint32_t used = i / 3u;   /* pairs this axis has already taken */
+        const uint32_t budget = (axis == 0u) ? sec_t : ((axis == 1u) ? sec_h : sec_w);
+        if (used >= budget) axis = 0u;
+        const int32_t p = (axis == 0u) ? pos_t : ((axis == 1u) ? pos_h : pos_w);
+        /* Accurate powf/sincosf for the same reason as q4e_rope_neox. */
+        const float theta = (float)(uint32_t)p * powf(base, -(float)(2u * i) / (float)n_rot);
+        float s, c;
+        sincosf(theta, &s, &c);
+        const float x0 = v[i];
+        const float x1 = v[i + half];
+        v[i]        = x0 * c - x1 * s;
+        v[i + half] = x0 * s + x1 * c;
+    }
+}
+
 /* Per-head RMSNorm then partial RoPE, reading the query out of its strided
  * slot and writing it contiguous. */
 __global__ static void q4e_qsa_q_norm_rope_kernel(
         float *q_out, float *gate_out, const float *qkv, const float *w,
         uint32_t head_dim, uint32_t n_head, uint32_t n_rot, float rope_base,
-        const int32_t *pos, float eps) {
+        const int32_t *mrope, uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
+        float eps) {
     const uint32_t t = blockIdx.y;
     const uint32_t h = blockIdx.x;
     const uint64_t src = (uint64_t)t * n_head * 2u * head_dim + (uint64_t)h * 2u * head_dim;
@@ -2098,7 +2140,9 @@ __global__ static void q4e_qsa_q_norm_rope_kernel(
     const float scale = rsqrtf(q4e_block_sum(sum) / (float)head_dim + eps);
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) s_q[i] *= scale * w[i];
     __syncthreads();
-    q4e_rope_neox(s_q, n_rot, rope_base, (uint32_t)pos[t], threadIdx.x, blockDim.x);
+    q4e_rope_mrope(s_q, n_rot, rope_base,
+                   mrope[3u * t], mrope[3u * t + 1u], mrope[3u * t + 2u],
+                   sec_t, sec_h, sec_w, threadIdx.x, blockDim.x);
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) q_out[dst + i] = s_q[i];
 }
@@ -2119,7 +2163,8 @@ __device__ __forceinline__ static uint32_t q4e_kv_row(const int32_t *pages, uint
 __global__ static void q4e_qsa_store_kv_kernel(
         __half *k_cache, __half *v_cache, const float *k, const float *v,
         const float *kw, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot,
-        float rope_base, const int32_t *pos, const int32_t *pages,
+        float rope_base, const int32_t *pos, const int32_t *mrope,
+        uint32_t sec_t, uint32_t sec_h, uint32_t sec_w, const int32_t *pages,
         uint32_t pool_slots, float eps) {
     const uint32_t t = blockIdx.y;
     const uint32_t h = blockIdx.x;
@@ -2136,7 +2181,12 @@ __global__ static void q4e_qsa_store_kv_kernel(
     const float scale = rsqrtf(q4e_block_sum(sum) / (float)head_dim + eps);
     for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) s_k[i] *= scale * kw[i];
     __syncthreads();
-    q4e_rope_neox(s_k, n_rot, rope_base, (uint32_t)pos[t], threadIdx.x, blockDim.x);
+    /* This is where the decoupling is visible in one line: the angle comes from
+     * mrope, the cache slot below still comes from pos.  They are the same
+     * number for text and diverge inside an image. */
+    q4e_rope_mrope(s_k, n_rot, rope_base,
+                   mrope[3u * t], mrope[3u * t + 1u], mrope[3u * t + 2u],
+                   sec_t, sec_h, sec_w, threadIdx.x, blockDim.x);
     __syncthreads();
 
     /* The only write into the cache, and it is always at the frontier: the
@@ -2709,7 +2759,10 @@ static_assert(DS4_Q4E_PAGE_TOKENS % Q4E_IDX_R == 0u,
               "a pooled key block must not straddle a KV page");
 __global__ static void q4e_idx_pool_kernel(__half *pooled, const __half *cache, const float *w,
                                            const int32_t *pos, const int32_t *pages, uint32_t n_tok,
-                                           uint32_t n_rot, float rope_base, float eps) {
+                                           uint32_t n_rot, float rope_base,
+                                           const int32_t *mrope_all,
+                                           uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
+                                           float eps) {
     /* Blocks completed by this forward: [pos0/r, (pos_last+1)/r).  Derived on
      * the device so a captured graph stays right as the context grows. */
     const uint32_t b0 = (uint32_t)pos[0] / Q4E_IDX_R;
@@ -2732,7 +2785,19 @@ __global__ static void q4e_idx_pool_kernel(__half *pooled, const __half *cache, 
     const float scale = rsqrtf(q4e_block_sum(sum) / (float)Q4E_IDX_DIM + eps);
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) s_k[i] *= scale * w[i];
     __syncthreads();
-    q4e_rope_neox(s_k, n_rot, rope_base, b * Q4E_IDX_R, threadIdx.x, blockDim.x);
+    /* This block's start position, unlike every other rope site, is derived
+     * arithmetically rather than read out of pos[], and b0 rounds pos[0] down --
+     * so the start can sit up to Q4E_IDX_R-1 slots BEFORE this chunk's first
+     * token.  That is why mrope_all carries DS4_Q4E_MROPE_BACK rows in front of
+     * token 0, and why the row index below can reach back into them.  Leaving
+     * this kernel on scalar rope while the query went mrope would make the
+     * indexer's inner product inconsistent, and only past the 2048-token budget
+     * where the indexer starts being consulted at all. */
+    const int32_t block_pos = (int32_t)(b * Q4E_IDX_R);
+    const uint32_t mrow = (uint32_t)((int32_t)DS4_Q4E_MROPE_BACK + block_pos - pos[0]);
+    q4e_rope_mrope(s_k, n_rot, rope_base,
+                   mrope_all[3u * mrow], mrope_all[3u * mrow + 1u], mrope_all[3u * mrow + 2u],
+                   sec_t, sec_h, sec_w, threadIdx.x, blockDim.x);
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) {
         pooled[(uint64_t)brow * Q4E_IDX_DIM + i] = __float2half(s_k[i]);
@@ -2741,22 +2806,26 @@ __global__ static void q4e_idx_pool_kernel(__half *pooled, const __half *cache, 
 
 extern "C" int ds4_gpu_q4e_idx_pool(ds4_gpu_tensor *pooled, const ds4_gpu_tensor *cache,
                                     const void *model_map, uint64_t model_size, uint64_t norm_offset,
-                                    const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages,
+                                    const ds4_gpu_tensor *pos, const ds4_gpu_tensor *mrope_all,
+                                    uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
+                                    const ds4_gpu_tensor *pages,
                                     uint32_t n_tok, uint32_t n_rot, float rope_base, float eps) {
-    if (!pooled || !cache || !pos || !pages || !n_tok) return 0;
+    if (!pooled || !cache || !pos || !mrope_all || !pages || !n_tok) return 0;
     const float *w = q4e_weight(model_map, model_size, norm_offset,
                                 (uint64_t)Q4E_IDX_DIM * sizeof(float), pooled, "qwen4exp idx k norm");
     if (!w) return 0;
     /* At most n_tok/r + 1 blocks complete in one forward. */
     q4e_idx_pool_kernel<<<n_tok / Q4E_IDX_R + 1u, 128, 0, cuda_decode_stream()>>>(
             (__half *)pooled->ptr, (const __half *)cache->ptr, w, (const int32_t *)pos->ptr,
-            (const int32_t *)pages->ptr, n_tok, n_rot, rope_base, eps);
+            (const int32_t *)pages->ptr, n_tok, n_rot, rope_base,
+            (const int32_t *)mrope_all->ptr, sec_t, sec_h, sec_w, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp idx pool");
 }
 
 /* Per (row, head): RMSNorm + RoPE of the indexer query, stored f16. */
 __global__ static void q4e_idx_q_kernel(__half *qn, const float *q, const float *w,
-                                        const int32_t *pos, uint32_t n_head,
+                                        const int32_t *mrope, uint32_t sec_t,
+                                        uint32_t sec_h, uint32_t sec_w, uint32_t n_head,
                                         uint32_t n_rot, float rope_base, float eps) {
     const uint32_t t = blockIdx.y, h = blockIdx.x;
     const uint64_t base = ((uint64_t)t * n_head + h) * Q4E_IDX_DIM;
@@ -2770,23 +2839,26 @@ __global__ static void q4e_idx_q_kernel(__half *qn, const float *q, const float 
     const float scale = rsqrtf(q4e_block_sum(sum) / (float)Q4E_IDX_DIM + eps);
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) s_q[i] *= scale * w[i];
     __syncthreads();
-    q4e_rope_neox(s_q, n_rot, rope_base, (uint32_t)pos[t], threadIdx.x, blockDim.x);
+    q4e_rope_mrope(s_q, n_rot, rope_base,
+                   mrope[3u * t], mrope[3u * t + 1u], mrope[3u * t + 2u],
+                   sec_t, sec_h, sec_w, threadIdx.x, blockDim.x);
     __syncthreads();
     for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) qn[base + i] = __float2half(s_q[i]);
 }
 
 extern "C" int ds4_gpu_q4e_idx_q(ds4_gpu_tensor *qn, const ds4_gpu_tensor *q,
                                  const void *model_map, uint64_t model_size, uint64_t norm_offset,
-                                 const ds4_gpu_tensor *pos, uint32_t n_head, uint32_t n_tok,
+                                 const ds4_gpu_tensor *mrope, uint32_t sec_t, uint32_t sec_h,
+                                 uint32_t sec_w, uint32_t n_head, uint32_t n_tok,
                                  uint32_t n_rot, float rope_base, float eps) {
-    if (!qn || !q || !pos || !n_tok) return 0;
+    if (!qn || !q || !mrope || !n_tok) return 0;
     const float *w = q4e_weight(model_map, model_size, norm_offset,
                                 (uint64_t)Q4E_IDX_DIM * sizeof(float), qn, "qwen4exp idx q norm");
     if (!w) return 0;
     const dim3 grid(n_head, n_tok, 1);
     q4e_idx_q_kernel<<<grid, 128, 0, cuda_decode_stream()>>>(
-            (__half *)qn->ptr, (const float *)q->ptr, w, (const int32_t *)pos->ptr,
-            n_head, n_rot, rope_base, eps);
+            (__half *)qn->ptr, (const float *)q->ptr, w, (const int32_t *)mrope->ptr,
+            sec_t, sec_h, sec_w, n_head, n_rot, rope_base, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp idx q");
 }
 
@@ -3200,10 +3272,10 @@ __global__ static void q4e_qsa_gate_kernel(float *x, const float *gate, uint64_t
 extern "C" int ds4_gpu_q4e_qsa_q_norm_rope(
         ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, const ds4_gpu_tensor *qkv,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
-        const ds4_gpu_tensor *pos,
+        const ds4_gpu_tensor *mrope, uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
         uint32_t head_dim, uint32_t n_head, uint32_t n_rot, float rope_base,
         uint32_t n_tok, float eps) {
-    if (!q_out || !gate_out || !qkv || !pos || !n_tok) return 0;
+    if (!q_out || !gate_out || !qkv || !mrope || !n_tok) return 0;
     const float *w = q4e_weight(model_map, model_size, weight_offset,
                                 (uint64_t)head_dim * sizeof(float), q_out,
                                 "qwen4exp q norm");
@@ -3212,7 +3284,8 @@ extern "C" int ds4_gpu_q4e_qsa_q_norm_rope(
     q4e_qsa_q_norm_rope_kernel<<<grid, 128, head_dim * sizeof(float),
                                  cuda_decode_stream()>>>(
             (float *)q_out->ptr, (float *)gate_out->ptr, (const float *)qkv->ptr, w,
-            head_dim, n_head, n_rot, rope_base, (const int32_t *)pos->ptr, eps);
+            head_dim, n_head, n_rot, rope_base, (const int32_t *)mrope->ptr,
+            sec_t, sec_h, sec_w, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp qsa q");
 }
 
@@ -3220,10 +3293,11 @@ extern "C" int ds4_gpu_q4e_qsa_store_kv(
         ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,
-        const ds4_gpu_tensor *pos, const ds4_gpu_tensor *pages,
+        const ds4_gpu_tensor *pos, const ds4_gpu_tensor *mrope,
+        uint32_t sec_t, uint32_t sec_h, uint32_t sec_w, const ds4_gpu_tensor *pages,
         uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base,
         uint32_t pool_slots, uint32_t n_tok, float eps) {
-    if (!k_cache || !v_cache || !k || !v || !pos || !pages || !n_tok) return 0;
+    if (!k_cache || !v_cache || !k || !v || !pos || !mrope || !pages || !n_tok) return 0;
     const float *w = q4e_weight(model_map, model_size, weight_offset,
                                 (uint64_t)head_dim * sizeof(float), k_cache,
                                 "qwen4exp k norm");
@@ -3234,7 +3308,8 @@ extern "C" int ds4_gpu_q4e_qsa_store_kv(
             (__half *)k_cache->ptr, (__half *)v_cache->ptr,
             (const float *)k->ptr, (const float *)v->ptr, w,
             head_dim, n_head_kv, n_rot, rope_base,
-            (const int32_t *)pos->ptr, (const int32_t *)pages->ptr, pool_slots, eps);
+            (const int32_t *)pos->ptr, (const int32_t *)mrope->ptr,
+            sec_t, sec_h, sec_w, (const int32_t *)pages->ptr, pool_slots, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp qsa kv store");
 }
 

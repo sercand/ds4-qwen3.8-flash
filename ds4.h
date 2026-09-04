@@ -213,6 +213,12 @@ typedef struct {
     uint32_t height;
     uint32_t content_width;
     uint32_t content_height;
+    /* Post-merge grid: token_count == grid_h * grid_w.  Qwen's mRoPE gives an
+     * image token the position triple (base, base+row, base+col) over this
+     * grid, so the shape has to survive alongside the embedding rather than
+     * being recomputed from a pixel size. */
+    uint32_t grid_h;
+    uint32_t grid_w;
     uint8_t fingerprint[32];
 } ds4_vision_embedding;
 

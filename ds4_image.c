@@ -563,6 +563,175 @@ int ds4_image_preprocess_glm53(
     return 1;
 }
 
+/* Python's round() is round-half-to-even, and smart_resize leans on it: a 48.0 stays
+ * 48 but a 2.5 becomes 2, not 3.  lround()/floor(x+0.5) would disagree on exact .5
+ * cases, and a single factor of difference in either edge changes grid_h/grid_w --
+ * and with it the token count, the mrope grid and every patch index downstream. */
+static double ds4_round_half_even(double x) {
+    double floor_value = floor(x);
+    double fraction = x - floor_value;
+    if (fraction > 0.5) return floor_value + 1.0;
+    if (fraction < 0.5) return floor_value;
+    return fmod(floor_value, 2.0) == 0.0 ? floor_value : floor_value + 1.0;
+}
+
+/* Qwen3-VL's smart_resize.
+ *
+ * Deliberately not ds4_glm53_smart_resize: that one aligns both edges *up* to the
+ * factor, whereas this rounds to the *nearest* multiple, and its over-budget branch
+ * rescales from the original pixel count rather than the aligned one.  The two agree
+ * often enough to look interchangeable and differ exactly where it matters.
+ *
+ * Note the reference does not clamp the initial rounding to `factor`, so a tiny image
+ * can land on 0 here; that is fine, because 0 is always below min_pixels and the
+ * under-budget branch then lifts it back to at least one factor. */
+static int ds4_qwen3vl_smart_resize(
+        uint32_t  height,
+        uint32_t  width,
+        uint64_t  min_pixels,
+        uint64_t  max_pixels,
+        uint32_t  factor,
+        uint32_t *target_height,
+        uint32_t *target_width) {
+    if (height == 0 || width == 0 || factor == 0) return 0;
+    double tall = (double)(height > width ? height : width);
+    double thin = (double)(height < width ? height : width);
+    if (tall / thin > 200.0) return 0;  /* the reference raises on this */
+
+    double h_bar = ds4_round_half_even((double)height / factor) * factor;
+    double w_bar = ds4_round_half_even((double)width / factor) * factor;
+    if (h_bar * w_bar > (double)max_pixels) {
+        double beta = sqrt(((double)height * (double)width) / (double)max_pixels);
+        h_bar = floor((double)height / beta / factor) * factor;
+        w_bar = floor((double)width / beta / factor) * factor;
+        if (h_bar < (double)factor) h_bar = (double)factor;
+        if (w_bar < (double)factor) w_bar = (double)factor;
+    } else if (h_bar * w_bar < (double)min_pixels) {
+        double beta = sqrt((double)min_pixels / ((double)height * (double)width));
+        h_bar = ceil((double)height * beta / factor) * factor;
+        w_bar = ceil((double)width * beta / factor) * factor;
+    }
+    if (h_bar < (double)factor || w_bar < (double)factor) return 0;
+    if (h_bar > (double)DS4_IMAGE_MAX_DIMENSION ||
+        w_bar > (double)DS4_IMAGE_MAX_DIMENSION) return 0;
+    *target_height = (uint32_t)h_bar;
+    *target_width = (uint32_t)w_bar;
+    return 1;
+}
+
+int ds4_image_preprocess_qwen3vl(
+        ds4_image_patches *out,
+        const ds4_image   *image,
+        uint32_t           min_image_tokens,
+        uint32_t           max_image_tokens,
+        char              *error,
+        size_t             error_cap) {
+    /* Qwen3-VL normalizes to [-1, 1]; these are NOT the CLIP constants GLM uses. */
+    static const float mean[3] = {0.5f, 0.5f, 0.5f};
+    static const float stddev[3] = {0.5f, 0.5f, 0.5f};
+    const uint32_t patch = 16, merge = 2, temporal = 2;
+    const uint32_t factor = patch * merge;             /* 32 */
+    const uint64_t pixels_per_token = (uint64_t)factor * factor;  /* 1024 */
+
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    if (!image || !image->rgb || image->width == 0 || image->height == 0 ||
+        min_image_tokens == 0 || max_image_tokens < min_image_tokens ||
+        max_image_tokens > 16384) {
+        ds4_image_error(error, error_cap, "invalid Qwen3-VL image preprocessing parameters");
+        return 0;
+    }
+
+    uint32_t target_height, target_width;
+    if (!ds4_qwen3vl_smart_resize(image->height, image->width,
+                                  (uint64_t)min_image_tokens * pixels_per_token,
+                                  (uint64_t)max_image_tokens * pixels_per_token,
+                                  factor, &target_height, &target_width)) {
+        ds4_image_error(error, error_cap,
+                        "image cannot be fitted to the Qwen3-VL token budget "
+                        "(aspect ratio above 200:1, or a degenerate size)");
+        return 0;
+    }
+
+    /* Unlike GLM there is no letterbox: smart_resize already snapped both edges to a
+     * multiple of the factor, and the reference resizes straight onto that canvas, so
+     * the aspect ratio shifts by up to half a factor rather than being padded. */
+    size_t canvas_values = (size_t)target_height * target_width * 3;
+    float *canvas = malloc(canvas_values * sizeof(float));
+    if (!canvas) {
+        ds4_image_error(error, error_cap, "unable to allocate resized image");
+        return 0;
+    }
+    if (target_width == image->width && target_height == image->height) {
+        for (size_t i = 0; i < canvas_values; i++) canvas[i] = (float)image->rgb[i];
+    } else {
+        ds4_resize_rgb_bicubic(image->rgb, image->width, image->height,
+                               canvas, target_width, target_height, target_width);
+    }
+    for (size_t i = 0; i < canvas_values; i++) {
+        canvas[i] = (canvas[i] / 255.0f - mean[i % 3]) / stddev[i % 3];
+    }
+
+    uint32_t grid_height = target_height / patch;
+    uint32_t grid_width = target_width / patch;
+    uint32_t patch_count = grid_height * grid_width;
+    size_t patch_values = (size_t)patch_count * 3 * temporal * patch * patch;
+    float *patches = malloc(patch_values * sizeof(float));
+    if (!patches) {
+        free(canvas);
+        ds4_image_error(error, error_cap, "unable to allocate vision patches");
+        return 0;
+    }
+
+    /* Merge-block order, matching the reference's
+     *   reshape(B,3,gh/2,2,16,gw/2,2,16) -> permute(0,2,5,3,6,1,4,7)
+     * so the four patches of one 2x2 block land on four consecutive rows.  That is
+     * what lets the merger simply view 4 rows as one 4608-wide vector.  Each row is
+     * channel-major, then temporal, then patch row, then patch column; for a still
+     * image the two temporal slices are identical copies. */
+    size_t index = 0;
+    for (uint32_t block_y = 0; block_y < grid_height / merge; block_y++) {
+        for (uint32_t block_x = 0; block_x < grid_width / merge; block_x++) {
+            for (uint32_t merge_y = 0; merge_y < merge; merge_y++) {
+                for (uint32_t merge_x = 0; merge_x < merge; merge_x++) {
+                    uint32_t patch_y = block_y * merge + merge_y;
+                    uint32_t patch_x = block_x * merge + merge_x;
+                    for (uint32_t channel = 0; channel < 3; channel++) {
+                        for (uint32_t slice = 0; slice < temporal; slice++) {
+                            (void)slice;
+                            for (uint32_t y = 0; y < patch; y++) {
+                                for (uint32_t x = 0; x < patch; x++) {
+                                    const float *pixel = canvas +
+                                        ((size_t)(patch_y * patch + y) * target_width +
+                                         patch_x * patch + x) * 3;
+                                    patches[index++] = pixel[channel];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    free(canvas);
+    if (index != patch_values) {
+        free(patches);
+        ds4_image_error(error, error_cap, "internal vision patch layout mismatch");
+        return 0;
+    }
+
+    out->content_width = target_width;
+    out->content_height = target_height;
+    out->padded_width = target_width;
+    out->padded_height = target_height;
+    out->grid_width = grid_width;
+    out->grid_height = grid_height;
+    out->patch_count = patch_count;
+    out->image_token_count = patch_count / (merge * merge);
+    out->patches = patches;
+    return 1;
+}
+
 void ds4_image_patches_free(ds4_image_patches *patches) {
     if (!patches) return;
     free(patches->patches);

@@ -525,6 +525,13 @@ typedef struct {
     uint32_t n_head_dim;
     uint32_t n_value_dim;
     uint32_t n_rot;
+    /* Interleaved mRoPE section widths (time, height, width) over the n_rot/2
+     * frequency pairs; they must sum to n_rot/2.  All-zero means the model has
+     * no mRoPE, and q4e_rope_mrope then falls every pair back to the time axis,
+     * which is plain scalar RoPE. */
+    uint32_t mrope_sec_t;
+    uint32_t mrope_sec_h;
+    uint32_t mrope_sec_w;
     uint32_t n_out_group;
     uint32_t n_lora_q;
     uint32_t n_lora_o;
@@ -761,6 +768,12 @@ static const ds4_shape DS4_SHAPE_QWEN38F = {
     .n_head_dim = 256,
     .n_value_dim = 256,
     .n_rot = 64,
+    /* rope_parameters.mrope_section from the checkpoint, also recorded in the
+     * GGUF as qwen4exp.rope.dimension_sections = [11, 11, 10, 0].  Sums to 32,
+     * which is n_rot/2, so the three axes tile the frequency pairs exactly. */
+    .mrope_sec_t = 11,
+    .mrope_sec_h = 11,
+    .mrope_sec_w = 10,
     .n_expert = 512,
     .n_expert_used = 10,
     .n_expert_shared = 1,
@@ -851,6 +864,9 @@ static struct {
 #define DS4_N_HEAD_DIM                (g_ds4_shape.n_head_dim)
 #define DS4_N_VALUE_DIM               (g_ds4_shape.n_value_dim)
 #define DS4_N_ROT                     (g_ds4_shape.n_rot)
+#define DS4_MROPE_SEC_T               (g_ds4_shape.mrope_sec_t)
+#define DS4_MROPE_SEC_H               (g_ds4_shape.mrope_sec_h)
+#define DS4_MROPE_SEC_W               (g_ds4_shape.mrope_sec_w)
 #define DS4_N_OUT_GROUP               (g_ds4_shape.n_out_group)
 #define DS4_N_LORA_Q                  (g_ds4_shape.n_lora_q)
 #define DS4_N_LORA_O                  (g_ds4_shape.n_lora_o)
@@ -7136,6 +7152,99 @@ static uint64_t vision_required_offset(
         uint32_t         ndim,
         const uint64_t  *dims) {
     return vision_required_tensor(m, name, ndim, dims)->abs_offset;
+}
+
+/* Bind the Qwen3-VL tower out of the sidecar built by
+ * gguf-tools/qwen3vl_vision.py.  Tensor names are the checkpoint's own
+ * (model.visual.*), and GGUF dimension order is the reverse of HF's, so a
+ * [3456, 1152] weight is declared {1152, 3456} here. */
+static void qwen3vl_vision_weights_bind(
+        ds4_qwen3vl_vision_weights *w,
+        const ds4_model            *m) {
+    ds4_str arch = {0};
+    if (!model_get_string(m, "general.architecture", &arch) ||
+        !ds4_streq(arch, "qwen38f-vision")) {
+        ds4_die("--vision file is not a Qwen3.8-Flash-Next vision encoder GGUF");
+    }
+    if (m->n_tensors != 333u) {
+        fprintf(stderr,
+                "ds4: vision GGUF has %" PRIu64 " tensors, expected 333\n",
+                m->n_tensors);
+        exit(1);
+    }
+    config_expect_u32("vision block_count",
+                      required_u32(m, "qwen38f-vision.block_count"), 27u);
+    config_expect_u32("vision embedding_length",
+                      required_u32(m, "qwen38f-vision.embedding_length"), 1152u);
+    config_expect_u32("vision feed_forward_length",
+                      required_u32(m, "qwen38f-vision.feed_forward_length"), 4304u);
+    config_expect_u32("vision head_count",
+                      required_u32(m, "qwen38f-vision.attention.head_count"), 16u);
+    config_expect_u32("vision projection_length",
+                      required_u32(m, "qwen38f-vision.projection_length"), 2560u);
+    config_expect_u32("vision patch_size",
+                      required_u32(m, "qwen38f-vision.patch_size"), 16u);
+    config_expect_u32("vision temporal_patch_size",
+                      required_u32(m, "qwen38f-vision.temporal_patch_size"), 2u);
+    config_expect_u32("vision spatial_merge_size",
+                      required_u32(m, "qwen38f-vision.spatial_merge_size"), 2u);
+    config_expect_u32("vision position_embedding_count",
+                      required_u32(m, "qwen38f-vision.position_embedding_count"), 2304u);
+
+    static const uint64_t d1152[] = {1152u};
+    static const uint64_t d2560[] = {2560u};
+    static const uint64_t d3456[] = {3456u};
+    static const uint64_t d4304[] = {4304u};
+    static const uint64_t d4608[] = {4608u};
+    static const uint64_t d1152_2304[] = {1152u, 2304u};
+    static const uint64_t d1152_1152[] = {1152u, 1152u};
+    static const uint64_t d1152_3456[] = {1152u, 3456u};
+    static const uint64_t d1152_4304[] = {1152u, 4304u};
+    static const uint64_t d4304_1152[] = {4304u, 1152u};
+    static const uint64_t d4608_4608[] = {4608u, 4608u};
+    static const uint64_t d4608_2560[] = {4608u, 2560u};
+    static const uint64_t patch_dims[] = {16u, 16u, 2u, 3u, 1152u};
+
+    memset(w, 0, sizeof(*w));
+    w->patch_weight = vision_required_offset(
+            m, "model.visual.patch_embed.proj.weight", 5u, patch_dims);
+    w->patch_bias = vision_required_offset(
+            m, "model.visual.patch_embed.proj.bias", 1u, d1152);
+    w->pos_embed = vision_required_offset(
+            m, "model.visual.pos_embed.weight", 2u, d1152_2304);
+    w->merger_norm_weight = vision_required_offset(
+            m, "model.visual.merger.norm.weight", 1u, d1152);
+    w->merger_norm_bias = vision_required_offset(
+            m, "model.visual.merger.norm.bias", 1u, d1152);
+    w->merger_fc1_weight = vision_required_offset(
+            m, "model.visual.merger.linear_fc1.weight", 2u, d4608_4608);
+    w->merger_fc1_bias = vision_required_offset(
+            m, "model.visual.merger.linear_fc1.bias", 1u, d4608);
+    w->merger_fc2_weight = vision_required_offset(
+            m, "model.visual.merger.linear_fc2.weight", 2u, d4608_2560);
+    w->merger_fc2_bias = vision_required_offset(
+            m, "model.visual.merger.linear_fc2.bias", 1u, d2560);
+
+#define QWEN3VL_VISION_LAYER_TENSOR(field_, suffix_, rank_, dims_) do { \
+        char name[128]; \
+        snprintf(name, sizeof(name), "model.visual.blocks.%u." suffix_, il); \
+        w->layer[il].field_ = vision_required_offset(m, name, rank_, dims_); \
+    } while (0)
+    for (uint32_t il = 0; il < DS4_QWEN3VL_VISION_LAYERS; il++) {
+        QWEN3VL_VISION_LAYER_TENSOR(norm1_weight, "norm1.weight", 1u, d1152);
+        QWEN3VL_VISION_LAYER_TENSOR(norm1_bias,   "norm1.bias",   1u, d1152);
+        QWEN3VL_VISION_LAYER_TENSOR(qkv_weight,   "attn.qkv.weight",  2u, d1152_3456);
+        QWEN3VL_VISION_LAYER_TENSOR(qkv_bias,     "attn.qkv.bias",    1u, d3456);
+        QWEN3VL_VISION_LAYER_TENSOR(proj_weight,  "attn.proj.weight", 2u, d1152_1152);
+        QWEN3VL_VISION_LAYER_TENSOR(proj_bias,    "attn.proj.bias",   1u, d1152);
+        QWEN3VL_VISION_LAYER_TENSOR(norm2_weight, "norm2.weight", 1u, d1152);
+        QWEN3VL_VISION_LAYER_TENSOR(norm2_bias,   "norm2.bias",   1u, d1152);
+        QWEN3VL_VISION_LAYER_TENSOR(fc1_weight,   "mlp.linear_fc1.weight", 2u, d1152_4304);
+        QWEN3VL_VISION_LAYER_TENSOR(fc1_bias,     "mlp.linear_fc1.bias",   1u, d4304);
+        QWEN3VL_VISION_LAYER_TENSOR(fc2_weight,   "mlp.linear_fc2.weight", 2u, d4304_1152);
+        QWEN3VL_VISION_LAYER_TENSOR(fc2_bias,     "mlp.linear_fc2.bias",   1u, d1152);
+    }
+#undef QWEN3VL_VISION_LAYER_TENSOR
 }
 
 static void vision_weights_bind(
@@ -39192,6 +39301,9 @@ struct ds4_engine {
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
+    ds4_qwen3vl_vision_weights qwen3vl_vision_weights;
+    /* Which tower the sidecar holds; the plumbing around it is family-neutral. */
+    bool vision_is_qwen3vl;
 #endif
     int vision_image_token;
     int vision_start_token;
@@ -48681,7 +48793,8 @@ static bool glm_vision_overlay_prepare(
         const ds4_vision_span   *images,
         size_t                   image_count,
         uint32_t                 pos0,
-        uint32_t                 n_tokens) {
+        uint32_t                 n_tokens,
+        uint32_t                 width) {
     memset(overlay, 0, sizeof(*overlay));
     if (!images || image_count == 0) return true;
     const uint64_t chunk_end = (uint64_t)pos0 + n_tokens;
@@ -48701,10 +48814,10 @@ static bool glm_vision_overlay_prepare(
     }
     if (segments == 0) return true;
     if (total_rows > UINT32_MAX ||
-        total_rows > UINT64_MAX / (4096u * sizeof(float))) return false;
+        total_rows > UINT64_MAX / ((uint64_t)width * sizeof(float))) return false;
     overlay->segments = xcalloc(segments, sizeof(overlay->segments[0]));
     overlay->tensor = ds4_gpu_tensor_alloc(
-            total_rows * 4096u * sizeof(float));
+            total_rows * (uint64_t)width * sizeof(float));
     if (!overlay->tensor) {
         glm_vision_overlay_free(overlay);
         return false;
@@ -48719,11 +48832,11 @@ static bool glm_vision_overlay_prepare(
         if (begin >= end) continue;
         const uint32_t rows = (uint32_t)(end - begin);
         const uint32_t image_row = (uint32_t)(begin - span->token_start);
-        const uint64_t bytes = (uint64_t)rows * 4096u * sizeof(float);
+        const uint64_t bytes = (uint64_t)rows * (uint64_t)width * sizeof(float);
         const float *source = span->embedding.data +
-                              (uint64_t)image_row * 4096u;
+                              (uint64_t)image_row * width;
         if (!ds4_gpu_tensor_write(overlay->tensor,
-                                  (uint64_t)upload_row * 4096u * sizeof(float),
+                                  (uint64_t)upload_row * (uint64_t)width * sizeof(float),
                                   source,
                                   bytes)) {
             glm_vision_overlay_free(overlay);
@@ -48827,7 +48940,7 @@ static bool glm_graph_forward_tokens(
 
     glm_vision_overlay vision_overlay = {0};
     if (!glm_vision_overlay_prepare(&vision_overlay, images, image_count,
-                                    pos0, n_tokens)) return false;
+                                    pos0, n_tokens, 4096u)) return false;
     const double trace_upload_t0 = trace ? now_sec() : 0.0;
     bool ok = glm_graph_upload_tokens(g->prefill_tokens, tokens, n_tokens);
     if (trace) {
@@ -50138,7 +50251,7 @@ static bool glm_graph_forward_indexed_tokens(
 
     glm_vision_overlay vision_overlay = {0};
     if (!glm_vision_overlay_prepare(&vision_overlay, images, image_count,
-                                    pos0, n_tokens)) return false;
+                                    pos0, n_tokens, 4096u)) return false;
 
     const double trace_upload_t0 = trace ? now_sec() : 0.0;
     bool ok = glm_graph_upload_tokens(g->prefill_tokens, tokens, n_tokens);
@@ -55592,6 +55705,32 @@ struct ds4_q4e_graph {
     /* Per-step inputs. */
     ds4_gpu_tensor *tokens;
     ds4_gpu_tensor *positions;
+    /* Interleaved mRoPE (t,h,w) per row, int32 [DS4_Q4E_MROPE_BACK + T][3].
+     *
+     * The KV slot and the rope angle used to be the same number.  They stop
+     * being the same once an image is in the prompt: an image of H x W merged
+     * tokens occupies H*W KV slots but advances the scalar position counter by
+     * only max(H,W).  `positions` stays the slot address every cache kernel
+     * needs -- q4e_kv_row, the attention scan, indexer pooling, page
+     * reservation and checkpoint admission are all untouched -- and this
+     * carries the angle.  For a text-only prompt all three axes equal
+     * `positions` and the rope is bit-identical to the scalar one.
+     *
+     * Row-major and interleaved rather than three planes, because batched
+     * decode slices one row at a time with q4e_row(); a plane layout would
+     * make a row non-contiguous.  `mrope_rows` is a persistent view starting
+     * at token 0, i.e. past the DS4_Q4E_MROPE_BACK prefix that only
+     * q4e_idx_pool_kernel reaches into. */
+    ds4_gpu_tensor *mrope;
+    ds4_gpu_tensor *mrope_rows;
+    /* Batched decode only, int32 [T][DS4_Q4E_MROPE_BACK + 1][3].
+     *
+     * In batched mode row r is a different sequence's single frontier token, so
+     * the one shared prefix in `mrope` above is the wrong back window for every
+     * row but the first.  q4e_idx_pool_kernel is the only kernel that reaches
+     * backwards, so it gets a private per-row window and the other three keep
+     * using `mrope_rows`. */
+    ds4_gpu_tensor *mrope_batch;
 
     /* Residual and hyper-connection scratch. */
     ds4_gpu_tensor *embed;
@@ -55703,6 +55842,11 @@ struct ds4_q4e_graph {
     ds4_gpu_tensor *mtp_embed;
     ds4_gpu_tensor *mtp_tokens;
     ds4_gpu_tensor *mtp_positions;
+    /* The draft head writes KV through the same store_kv and ropes its query
+     * through the same q_norm_rope, at explicit and possibly non-contiguous
+     * positions, so it needs its own mRoPE table on the same layout. */
+    ds4_gpu_tensor *mtp_mrope;
+    ds4_gpu_tensor *mtp_mrope_rows;
     ds4_gpu_tensor *mtp_k_cache;   /* borrowed */
     /* The draft head's own indexer planes, paged like the target's: without
      * them its attention would be dense over the whole KV at every draft
@@ -65030,7 +65174,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->backend != DS4_BACKEND_METAL &&
             opt->backend != DS4_BACKEND_CUDA) {
             fprintf(stderr,
-                    "ds4: GLM-5.3 vision requires --metal, --cuda, or --rocm\n");
+                    "ds4: vision requires --metal, --cuda, or --rocm\n");
             free(e);
             *out = NULL;
             return 1;
@@ -65141,8 +65285,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
-        if (!ds4_model_is_glm53()) {
-            fprintf(stderr, "ds4: --vision requires a GLM-5.3 model\n");
+        if (!ds4_model_is_glm53() && !ds4_model_is_qwen4exp()) {
+            fprintf(stderr,
+                    "ds4: --vision requires a GLM-5.3 or Qwen3.8-Flash-Next model\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -65154,17 +65299,36 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
 #else
         model_open(&e->vision_model, opt->vision_path, true, false);
-        vision_weights_bind(&e->vision_weights, &e->vision_model);
-        e->vision_image_token = (int)required_u32(
-                &e->vision_model, "glm5-next-vision.image_token_id");
-        e->vision_start_token = (int)required_u32(
-                &e->vision_model, "glm5-next-vision.image_start_token_id");
-        e->vision_end_token = (int)required_u32(
-                &e->vision_model, "glm5-next-vision.image_end_token_id");
-        if (e->vision_image_token != 154854 ||
-            e->vision_start_token != 154830 ||
-            e->vision_end_token != 154831) {
-            ds4_die("unexpected GLM-5.3 vision token IDs");
+        e->vision_is_qwen3vl = ds4_model_is_qwen4exp();
+        if (e->vision_is_qwen3vl) {
+            qwen3vl_vision_weights_bind(&e->qwen3vl_vision_weights, &e->vision_model);
+            e->vision_image_token = (int)required_u32(
+                    &e->vision_model, "qwen38f-vision.image_token_id");
+            e->vision_start_token = (int)required_u32(
+                    &e->vision_model, "qwen38f-vision.image_start_token_id");
+            e->vision_end_token = (int)required_u32(
+                    &e->vision_model, "qwen38f-vision.image_end_token_id");
+            /* The main GGUF records the same id under qwen4exp.ple.image_token_id;
+             * disagreeing sidecar and backbone would scatter embeddings onto the
+             * wrong rows, so cross-check rather than trust either alone. */
+            if (e->vision_image_token != 248056 ||
+                e->vision_start_token != 248053 ||
+                e->vision_end_token != 248054) {
+                ds4_die("unexpected Qwen3.8-Flash-Next vision token IDs");
+            }
+        } else {
+            vision_weights_bind(&e->vision_weights, &e->vision_model);
+            e->vision_image_token = (int)required_u32(
+                    &e->vision_model, "glm5-next-vision.image_token_id");
+            e->vision_start_token = (int)required_u32(
+                    &e->vision_model, "glm5-next-vision.image_start_token_id");
+            e->vision_end_token = (int)required_u32(
+                    &e->vision_model, "glm5-next-vision.image_end_token_id");
+            if (e->vision_image_token != 154854 ||
+                e->vision_start_token != 154830 ||
+                e->vision_end_token != 154831) {
+                ds4_die("unexpected GLM-5.3 vision token IDs");
+            }
         }
         e->vision_ready = true;
 #endif
@@ -66397,9 +66561,13 @@ int ds4_chat_append_multimodal_message(
     }
     const bool tool = !strcmp(role, "tool") || !strcmp(role, "function");
     const bool user = !strcmp(role, "user");
-    if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA || (!tool && !user)) {
+    const bool family_ok = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA ||
+                           DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP;
+    if (!family_ok || (!tool && !user)) {
         if (error && error_cap)
-            snprintf(error, error_cap, "multimodal messages require a GLM user or tool role");
+            snprintf(error, error_cap,
+                     "multimodal messages require a user or tool role on a "
+                     "vision-capable model");
         return 0;
     }
     for (size_t i = 0; i < image_count; i++) {
@@ -66442,6 +66610,33 @@ int ds4_chat_append_multimodal_message(
     return 1;
 }
 
+/* Image token budget for the Qwen3-VL tower.
+ *
+ * The checkpoint's own preprocessor allows 64..16384 tokens (min_pixels 65536,
+ * max_pixels 16777216, at 1024 pixels per token).  The ceiling is not
+ * servable: ViT attention here is O(rows^2) with no flash path, and 16384
+ * tokens means 65536 patches, so the score matrix alone would be 4.3e9 entries
+ * per head.  Default to 1024 tokens -- about a 1024x1024 image -- and let the
+ * environment raise it for a machine willing to pay for it. */
+static uint32_t ds4_qwen3vl_token_budget(const char *env_name, uint32_t fallback) {
+    const char *env = getenv(env_name);
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long v = strtoul(env, &end, 10);
+        if (end && *end == 0 && v >= 4ul && v <= 16384ul) return (uint32_t)v;
+        fprintf(stderr, "ds4: ignoring %s=%s (want 4..16384)\n", env_name, env);
+    }
+    return fallback;
+}
+
+static uint32_t ds4_qwen3vl_min_image_tokens(void) {
+    return ds4_qwen3vl_token_budget("DS4_VISION_MIN_IMAGE_TOKENS", 64u);
+}
+
+static uint32_t ds4_qwen3vl_max_image_tokens(void) {
+    return ds4_qwen3vl_token_budget("DS4_VISION_MAX_IMAGE_TOKENS", 1024u);
+}
+
 static int ds4_engine_vision_encode_image(
         ds4_engine            *e,
         const ds4_image       *image,
@@ -66482,30 +66677,47 @@ static int ds4_engine_vision_encode_image(
     }
 #endif
     ds4_image_patches patches = {0};
-    if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
-                                    error, error_cap)) return 0;
+    /* Both towers emit one vector per LLM token, but the preprocessing and the
+     * projection width differ: Qwen resizes to exact multiples of 32 with its
+     * own smart_resize and mean/std 0.5, and projects to the LLM's 2560. */
+    const uint32_t embed_width = e->vision_is_qwen3vl ? 2560u : 4096u;
+    if (e->vision_is_qwen3vl) {
+        if (!ds4_image_preprocess_qwen3vl(&patches, image,
+                                          ds4_qwen3vl_min_image_tokens(),
+                                          ds4_qwen3vl_max_image_tokens(),
+                                          error, error_cap)) return 0;
+    } else if (!ds4_image_preprocess_glm53(&patches, image, 16u, 8000u,
+                                           error, error_cap)) {
+        return 0;
+    }
     float *embedding = malloc((size_t)patches.image_token_count *
-                              4096u * sizeof(float));
+                              embed_width * sizeof(float));
     if (!embedding) {
         ds4_image_patches_free(&patches);
         if (error && error_cap) snprintf(error, error_cap, "unable to allocate vision output");
         return 0;
     }
 #ifndef DS4_NO_GPU
-    int ok = ds4_gpu_glm53_vision_encode(
-            embedding, patches.patches, patches.grid_height, patches.grid_width,
-            e->vision_model.map, e->vision_model.size, &e->vision_weights);
+    int ok = e->vision_is_qwen3vl
+        ? ds4_gpu_qwen3vl_vision_encode(
+                embedding, patches.patches, patches.grid_height, patches.grid_width,
+                e->vision_model.map, e->vision_model.size, &e->qwen3vl_vision_weights)
+        : ds4_gpu_glm53_vision_encode(
+                embedding, patches.patches, patches.grid_height, patches.grid_width,
+                e->vision_model.map, e->vision_model.size, &e->vision_weights);
 #else
     int ok = 0;
 #endif
     if (!ok) {
         free(embedding);
         ds4_image_patches_free(&patches);
-        if (error && error_cap) snprintf(error, error_cap, "GLM-5.3 vision inference failed");
+        if (error && error_cap) snprintf(error, error_cap, "vision inference failed");
         return 0;
     }
     out->data = embedding;
     out->token_count = patches.image_token_count;
+    out->grid_h = patches.grid_height / 2u;   /* post-merge: spatial_merge_size 2 */
+    out->grid_w = patches.grid_width / 2u;
     out->width = image->width;
     out->height = image->height;
     out->content_width = patches.content_width;
@@ -66899,6 +67111,82 @@ static int q4e_trace_enabled(void) {
     return cached;
 }
 
+/* Fill the mRoPE table for [pos0, pos0+n), plus the DS4_Q4E_MROPE_BACK rows in
+ * front of it, in the interleaved [row][3] layout g->mrope expects.
+ *
+ * Text-only today: all three axes carry the scalar position, which is what
+ * makes q4e_rope_mrope reduce exactly to q4e_rope_neox and the whole mRoPE
+ * path a no-op for a text prompt.  An image span is where it stops being the
+ * identity -- its tokens take (base, base+row, base+col) and the text after it
+ * resumes at base+max(H,W) rather than base+H*W -- and when that lands, this
+ * function is the only place that changes.  It is deliberately a pure function
+ * of (positions, images): recomputing per chunk cannot desync, whereas an
+ * accumulated running offset would be a fourth thing to persist in a
+ * checkpoint and a fourth thing to be wrong after a resume.
+ *
+ * The back rows exist because q4e_idx_pool_kernel ropes a pooled key at
+ * (pos[0]/r)*r, which can precede the chunk; see DS4_Q4E_MROPE_BACK. */
+/* The (t, h, w) triple for one scalar position, mirroring HF get_rope_index.
+ *
+ * Text advances all three axes together.  An image of H x W merged tokens
+ * takes t = base, h = base + row, w = base + col over its grid, and the text
+ * after it resumes at base + max(H, W) -- NOT base + H*W.  So an image costs
+ * H*W KV slots but only max(H, W) of the position budget, which is the whole
+ * reason the rope angle and the cache slot had to be split apart.
+ *
+ * O(images) per call, and deliberately so: derived state cannot desync, while
+ * a running offset carried on the session would be one more thing to persist
+ * in a checkpoint and one more thing to be wrong after a resume. */
+static void q4e_mrope_at(const ds4_vision_span *img, size_t n_img, int32_t pos,
+                         int32_t *out_t, int32_t *out_h, int32_t *out_w) {
+    int32_t base = 0, p = 0;
+    for (size_t i = 0; i < n_img; i++) {
+        const int32_t start = (int32_t)img[i].token_start;
+        const int32_t count = (int32_t)img[i].embedding.token_count;
+        const uint32_t gh = img[i].embedding.grid_h;
+        const uint32_t gw = img[i].embedding.grid_w;
+        if (pos < start || gw == 0u || gh == 0u) break;
+        base += start - p;
+        p = start;
+        if (pos < start + count) {
+            const uint32_t k = (uint32_t)(pos - start);
+            *out_t = base;
+            *out_h = base + (int32_t)(k / gw);
+            *out_w = base + (int32_t)(k % gw);
+            return;
+        }
+        base += (int32_t)(gh > gw ? gh : gw);
+        p = start + count;
+    }
+    *out_t = *out_h = *out_w = base + (pos - p);
+}
+
+static void q4e_mrope_fill(int32_t *out, const int32_t *positions, uint32_t n,
+                           const ds4_vision_span *img, size_t n_img) {
+    if (!n) return;
+    for (uint32_t i = 0; i < DS4_Q4E_MROPE_BACK; i++) {
+        const int32_t back = (int32_t)DS4_Q4E_MROPE_BACK - (int32_t)i;
+        const int32_t p = (positions[0] > back) ? (positions[0] - back) : 0;
+        q4e_mrope_at(img, n_img, p, &out[3u * i], &out[3u * i + 1u], &out[3u * i + 2u]);
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t r = DS4_Q4E_MROPE_BACK + i;
+        q4e_mrope_at(img, n_img, positions[i],
+                     &out[3u * r], &out[3u * r + 1u], &out[3u * r + 2u]);
+    }
+}
+
+/* One batched-decode row's private window: rows 0..DS4_Q4E_MROPE_BACK hold
+ * positions p-DS4_Q4E_MROPE_BACK .. p, so the row index q4e_idx_pool_kernel
+ * computes for this row's block start lands inside it. */
+static void q4e_mrope_fill_batch_row(int32_t *out, int32_t p) {
+    for (uint32_t i = 0; i <= DS4_Q4E_MROPE_BACK; i++) {
+        const int32_t back = (int32_t)DS4_Q4E_MROPE_BACK - (int32_t)i;
+        const int32_t q = (p > back) ? (p - back) : 0;
+        out[3u * i] = out[3u * i + 1u] = out[3u * i + 2u] = q;
+    }
+}
+
 /* Tokens in the chunk being traced, so q4e_trace can find the last row. */
 static uint32_t g_q4e_trace_ntok = 1;
 
@@ -67172,6 +67460,28 @@ static void q4e_plan_locked(ds4_session *s, const ds4_tokens *prompt, q4e_plan *
     }
     q4e_tree_node *match =
         q4e_tree_walk(&c->tree, prompt->v, (uint32_t)prompt->len, &out->matched);
+    /* The tree keys on token ids, and every image token is the same id, so two
+     * DIFFERENT images with the same token count produce byte-identical key
+     * runs and would match each other -- reusing KV pages computed from the
+     * wrong picture, with no error and a plausible-looking answer.  The
+     * engine-wide q4e_cache makes that reachable across requests.
+     *
+     * Until the image fingerprints are folded into the node keys, refuse to
+     * match INTO an image: clamp to the first image's start.  The text before
+     * it (system prompt, prior turns) still reuses normally, which is where
+     * most of the win is; only the image span itself is re-prefilled.
+     *
+     * A text-only prompt cannot over-match past this point, because matching
+     * an image span requires carrying the same <|image_pad|> ids and the
+     * tokenizer never emits them from user text. */
+    for (size_t i = 0; i < s->sync_image_count; i++) {
+        const uint32_t start = s->sync_images[i].token_start;
+        if (out->matched > start) out->matched = start;
+    }
+    if (match && out->matched < match->start) {
+        match = match->parent;
+        out->matched = match ? match->end : 0u;
+    }
     q4e_tree_node *cn = q4e_tree_ckpt_below(match, out->matched);
     /* Resuming exactly at the prompt's end means answering from that
      * position's logits, which only a prompt-final checkpoint kept. */
@@ -68014,7 +68324,9 @@ static void q4e_scratch_free(ds4_engine *e) {
     ds4_q4e_graph *sc = e->q4e_scratch;
     if (!sc) return;
     ds4_gpu_tensor *const flat[] = {
-        sc->tokens, sc->positions, sc->embed, sc->res, sc->xn, sc->lora,
+        sc->mrope_rows, sc->mtp_mrope_rows,   /* views: free the wrapper, not the buffer */
+        sc->tokens, sc->positions, sc->mrope, sc->mrope_batch, sc->mtp_mrope,
+        sc->embed, sc->res, sc->xn, sc->lora,
         sc->up, sc->mixed, sc->inject, sc->blk_out, sc->gdn_qkv, sc->gdn_conv_out,
         sc->gdn_z, sc->gdn_alpha, sc->gdn_betap, sc->gdn_decay, sc->gdn_beta,
         sc->gdn_attn, sc->gdn_gated, sc->qsa_qfull, sc->qsa_q, sc->qsa_gate,
@@ -68132,6 +68444,9 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     ok = ok
       && q4e_alloc(&g->tokens, (uint64_t)T * sizeof(int32_t))
       && q4e_alloc(&g->positions, (uint64_t)T * sizeof(int32_t))
+      && q4e_alloc(&g->mrope, (uint64_t)(T + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t))
+      && q4e_alloc(&g->mrope_batch,
+                   (uint64_t)T * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t))
       && q4e_alloc(&g->embed, (uint64_t)T * DS4_N_EMBD * f)
       && q4e_alloc(&g->res, (uint64_t)T * Q4E_HC_DIM * f)
       && q4e_alloc(&g->xn, (uint64_t)T * Q4E_HC_DIM * f)
@@ -68196,12 +68511,29 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
              q4e_alloc(&g->idx_part, (uint64_t)qb * DS4_N_HEAD * 8u * 264u * f);
         g->idx_ready = ok;
     }
+    if (ok) {
+        /* Token 0 of the mRoPE table: everything but q4e_idx_pool_kernel wants
+         * this, not the buffer base, because only that kernel reaches back into
+         * the DS4_Q4E_MROPE_BACK prefix. */
+        g->mrope_rows = ds4_gpu_tensor_view(
+                g->mrope, (uint64_t)DS4_Q4E_MROPE_BACK * 3u * sizeof(int32_t),
+                (uint64_t)T * 3u * sizeof(int32_t));
+        ok = g->mrope_rows != NULL;
+    }
     if (ok && mtp) {
         ok = q4e_alloc(&g->mtp_res, (uint64_t)T * Q4E_HC_DIM * f)
           && q4e_alloc(&g->mtp_embed, (uint64_t)T * DS4_N_EMBD * f)
           && q4e_alloc(&g->mtp_tokens, (uint64_t)T * sizeof(int32_t))
           && q4e_alloc(&g->mtp_positions, (uint64_t)T * sizeof(int32_t))
+          && q4e_alloc(&g->mtp_mrope,
+                       (uint64_t)(T + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t))
           && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
+        if (ok) {
+            g->mtp_mrope_rows = ds4_gpu_tensor_view(
+                    g->mtp_mrope, (uint64_t)DS4_Q4E_MROPE_BACK * 3u * sizeof(int32_t),
+                    (uint64_t)T * 3u * sizeof(int32_t));
+            ok = g->mtp_mrope_rows != NULL;
+        }
     }
     if (!ok) {
         e->q4e_scratch = g;
@@ -68790,22 +69122,27 @@ static int q4e_qsa_store_step(ds4_q4e_graph *g, const ds4_model *m,
     if (!g->batch) {
         return ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], g->qsa_k, g->qsa_v,
                                         m->map, m->size, l->qsa_k_norm->abs_offset,
-                                        g->positions, g->kv_pages, DS4_N_HEAD_DIM,
+                                        g->positions, g->mrope_rows,
+                                        DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
+                                        g->kv_pages, DS4_N_HEAD_DIM,
                                         DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
                                         g->pool_slots, n_tok, DS4_RMS_EPS);
     }
     const uint64_t kv_b = (uint64_t)Q4E_KV_DIM * sizeof(float);
     for (uint32_t r = 0; r < n_tok; r++) {
-        ds4_gpu_tensor *v[3] = { q4e_row(g->qsa_k, r, kv_b),
+        ds4_gpu_tensor *v[4] = { q4e_row(g->qsa_k, r, kv_b),
                                  q4e_row(g->qsa_v, r, kv_b),
-                                 q4e_row(g->positions, r, sizeof(int32_t)) };
-        const int ok = v[0] && v[1] && v[2] &&
+                                 q4e_row(g->positions, r, sizeof(int32_t)),
+                                 q4e_row(g->mrope_rows, r, 3u * sizeof(int32_t)) };
+        const int ok = v[0] && v[1] && v[2] && v[3] &&
             ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], v[0], v[1],
                                      m->map, m->size, l->qsa_k_norm->abs_offset,
-                                     v[2], g->batch->seq[r]->kv_pages, DS4_N_HEAD_DIM,
+                                     v[2], v[3],
+                                     DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
+                                     g->batch->seq[r]->kv_pages, DS4_N_HEAD_DIM,
                                      DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
                                      g->pool_slots, 1u, DS4_RMS_EPS);
-        q4e_row_free(v, 3);
+        q4e_row_free(v, 4);
         if (!ok) return 0;
     }
     return 1;
@@ -68818,20 +69155,25 @@ static int q4e_idx_store_step(ds4_q4e_graph *g, const ds4_model *m,
         return ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], g->idx_k, g->positions,
                                        g->kv_pages, n_tok) &&
                ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
-                                    l->idx_k_norm->abs_offset, g->positions, g->kv_pages,
+                                    l->idx_k_norm->abs_offset, g->positions, g->mrope,
+                                    DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
+                                    g->kv_pages,
                                     n_tok, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
     }
     const uint64_t k_b = 128u * sizeof(float);
     for (uint32_t r = 0; r < n_tok; r++) {
         ds4_gpu_tensor *pages = g->batch->seq[r]->kv_pages;
-        ds4_gpu_tensor *v[2] = { q4e_row(g->idx_k, r, k_b),
-                                 q4e_row(g->positions, r, sizeof(int32_t)) };
-        const int ok = v[0] && v[1] &&
+        ds4_gpu_tensor *v[3] = { q4e_row(g->idx_k, r, k_b),
+                                 q4e_row(g->positions, r, sizeof(int32_t)),
+                                 q4e_row(g->mrope_batch, r,
+                                         (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t)) };
+        const int ok = v[0] && v[1] && v[2] &&
             ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], v[0], v[1], pages, 1u) &&
             ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
-                                 l->idx_k_norm->abs_offset, v[1], pages,
+                                 l->idx_k_norm->abs_offset, v[1], v[2],
+                                 DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W, pages,
                                  1u, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
-        q4e_row_free(v, 2);
+        q4e_row_free(v, 3);
         if (!ok) return 0;
     }
     return 1;
@@ -68868,7 +69210,9 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
      * this splits them and applies the norm and the partial RoPE to the query. */
     if (!ds4_gpu_q4e_qsa_q_norm_rope(g->qsa_q, g->qsa_gate, g->qsa_qfull,
                                      m->map, m->size, l->qsa_q_norm->abs_offset,
-                                     g->positions, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                     g->mrope_rows,
+                                     DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
+                                     DS4_N_HEAD_DIM, DS4_N_HEAD,
                                      DS4_N_ROT, DS4_ROPE_FREQ_BASE, n_tok,
                                      DS4_RMS_EPS)) return 0;
     if (!q4e_matmul(g->qsa_k, m, l->qsa_k, g->mixed, n_tok)) return 0;
@@ -68903,7 +69247,9 @@ static int q4e_qsa_layer(ds4_q4e_graph *g, const ds4_model *m,
         if (!g->batch && !pos_last) return 0;
         if (!q4e_matmul(g->idx_q, m, l->idx_q, g->mixed, n_tok)) return 0;
         if (!ds4_gpu_q4e_idx_q(g->idx_qn, g->idx_q, m->map, m->size, l->idx_q_norm->abs_offset,
-                               g->positions, DS4_N_INDEXER_HEAD, n_tok, DS4_N_ROT,
+                               g->mrope_rows,
+                               DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
+                               DS4_N_INDEXER_HEAD, n_tok, DS4_N_ROT,
                                DS4_ROPE_FREQ_BASE, DS4_RMS_EPS)) return 0;
         for (uint32_t r0 = 0; r0 < n_tok; r0 += qb) {
             const uint32_t nb = (n_tok - r0 < qb) ? (n_tok - r0) : qb;
@@ -69334,19 +69680,56 @@ static int q4e_forward(ds4_session *s, const int *history, uint32_t pos0, uint32
     g_q4e_trace_ntok = n_tok;
     int32_t *ids = xmalloc((size_t)n_tok * sizeof(int32_t));
     int32_t *pos = xmalloc((size_t)n_tok * sizeof(int32_t));
+    int32_t *mrope = xmalloc((size_t)(n_tok + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t));
     for (uint32_t i = 0; i < n_tok; i++) {
         ids[i] = history[pos0 + i];
         pos[i] = (int32_t)(pos0 + i);
     }
+    q4e_mrope_fill(mrope, pos, n_tok, s->sync_images, s->sync_image_count);
     const bool uploaded =
         ds4_gpu_tensor_write(g->tokens, 0, ids, (uint64_t)n_tok * sizeof(int32_t)) &&
-        ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n_tok * sizeof(int32_t));
+        ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n_tok * sizeof(int32_t)) &&
+        ds4_gpu_tensor_write(g->mrope, 0, mrope,
+                             (uint64_t)(n_tok + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t));
     free(ids);
     free(pos);
+    free(mrope);
     if (!uploaded) return 1;
 
     double tph = q4e_phase_begin();
     if (!q4e_embed(g->embed, g->tokens, m, w->token_embd, n_tok)) return 1;
+    /* Image tokens: overwrite the placeholder rows with the tower's output.
+     *
+     * The embedding lookup above ran over the <|image_pad|> ids like any other
+     * token and is simply clobbered here -- the same trick the GLM path uses,
+     * and cheaper than teaching the lookup to skip rows.  This sits before
+     * hc_init so one write per row covers all n_hc streams, rather than after
+     * it where each row would have to be written n_hc times.
+     *
+     * `s->sync_images` is populated only for the duration of
+     * ds4_session_sync_multimodal, which is exactly when prefill runs; decode
+     * never lands on an image token, so a NULL here is the normal case.
+     *
+     * Destination rows within a chunk are contiguous and so are the source
+     * rows, so each segment is one device-to-device copy and no scatter kernel
+     * is needed. */
+    if (s->sync_image_count > 0) {
+        glm_vision_overlay overlay = {0};
+        if (!glm_vision_overlay_prepare(&overlay, s->sync_images,
+                                        s->sync_image_count, pos0, n_tok,
+                                        DS4_N_EMBD)) return 1;
+        int ok = 1;
+        for (size_t i = 0; ok && i < overlay.count; i++) {
+            const glm_vision_overlay_segment *seg = &overlay.segments[i];
+            ok = ds4_gpu_tensor_copy(
+                    g->embed, (uint64_t)seg->dst_row * DS4_N_EMBD * sizeof(float),
+                    overlay.tensor,
+                    (uint64_t)seg->src_row * DS4_N_EMBD * sizeof(float),
+                    (uint64_t)seg->rows * DS4_N_EMBD * sizeof(float));
+        }
+        glm_vision_overlay_free(&overlay);
+        if (!ok) return 1;
+    }
     /* The residual starts as the embedding tiled across the streams. */
     if (!ds4_gpu_q4e_hc_init(g->res, g->embed, DS4_N_EMBD, DS4_N_HC, n_tok)) return 1;
     q4e_phase_end(Q4E_PH_EMBED, tph);
@@ -69475,6 +69858,12 @@ static int q4e_forward_batch(ds4_decode_item *items, uint32_t n,
     ds4_q4e_graph **seq = xmalloc((size_t)n * sizeof(*seq));
     int32_t *ids = xmalloc((size_t)n * sizeof(int32_t));
     int32_t *pos = xmalloc((size_t)n * sizeof(int32_t));
+    /* Row-major [n][3] for the three rope-only kernels, plus a private
+     * [n][DS4_Q4E_MROPE_BACK+1][3] window for the pooled indexer key, whose
+     * block start can precede this row's own token. */
+    int32_t *mrope = xmalloc((size_t)n * 3u * sizeof(int32_t));
+    int32_t *mrope_win =
+        xmalloc((size_t)n * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t));
     q4e_batch batch = { .seq = seq, .n = n };
     double tph = 0.0;
     uint32_t pushed = 0;
@@ -69505,8 +69894,16 @@ static int q4e_forward_batch(ds4_decode_item *items, uint32_t n,
     g->batch = &batch;
     g_q4e_trace_ntok = n;
 
+    for (uint32_t r = 0; r < n; r++) {
+        mrope[3u * r] = mrope[3u * r + 1u] = mrope[3u * r + 2u] = pos[r];
+        q4e_mrope_fill_batch_row(mrope_win + (size_t)r * (DS4_Q4E_MROPE_BACK + 1u) * 3u,
+                                 pos[r]);
+    }
     if (!ds4_gpu_tensor_write(g->tokens, 0, ids, (uint64_t)n * sizeof(int32_t)) ||
-        !ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n * sizeof(int32_t))) {
+        !ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->mrope_rows, 0, mrope, (uint64_t)n * 3u * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->mrope_batch, 0, mrope_win,
+                              (uint64_t)n * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t))) {
         if (err && errlen) snprintf(err, errlen, "decode batch upload failed");
         goto done;
     }
@@ -69592,6 +69989,8 @@ done:
     free(seq);
     free(ids);
     free(pos);
+    free(mrope);
+    free(mrope_win);
     if (rc != 0 && err && errlen && !err[0]) {
         snprintf(err, errlen, "qwen4exp batched decode failed");
     }
@@ -69664,6 +70063,8 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     d.embed = g->mtp_embed;
     d.tokens = g->mtp_tokens;
     d.positions = g->mtp_positions;
+    d.mrope = g->mtp_mrope;
+    d.mrope_rows = g->mtp_mrope_rows;
     d.logits = g->mtp_logits;
     d.k_cache[Q4E_MTP_SLOT] = g->mtp_k_cache;
     d.v_cache[Q4E_MTP_SLOT] = g->mtp_v_cache;
@@ -69680,10 +70081,24 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
                    (hi + 1u) / 4u > DS4_N_INDEXER_TOP_K / 4u;
     d.ctx_slot = -1;          /* it owns no execution-context slot */
 
-    if (!ds4_gpu_tensor_write(d.tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) ||
-        !ds4_gpu_tensor_write(d.positions, 0, positions, (uint64_t)n * sizeof(int32_t))) {
-        return 1;
-    }
+    /* The draft ropes through the same kernels as the target, at explicit and
+     * possibly non-contiguous positions, so it needs its own filled table --
+     * and it cannot take the shortcut of assuming a contiguous run, because
+     * q4e_mtp_after_prefill_chunk drafts rows from inside the prompt. */
+    int32_t *d_mrope =
+        xmalloc((size_t)(n + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t));
+    /* The draft head sees the same image geometry as the target: its rows can
+     * sit inside a prompt image (q4e_mtp_after_prefill_chunk drafts from inside
+     * the prompt), and a mismatched angle here would only cost acceptance --
+     * the target re-ropes and verifies -- but there is no reason to pay it. */
+    q4e_mrope_fill(d_mrope, positions, n, s->sync_images, s->sync_image_count);
+    const bool d_uploaded =
+        ds4_gpu_tensor_write(d.tokens, 0, tokens, (uint64_t)n * sizeof(int32_t)) &&
+        ds4_gpu_tensor_write(d.positions, 0, positions, (uint64_t)n * sizeof(int32_t)) &&
+        ds4_gpu_tensor_write(d.mrope, 0, d_mrope,
+                             (uint64_t)(n + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t));
+    free(d_mrope);
+    if (!d_uploaded) return 1;
 
     /* emb = fc_embedding(norm(embed(token))) -> g->mixed [n, n_embd] */
     if (!q4e_embed(d.embed, d.tokens, tm, e->weights.token_embd, n)) return 1;

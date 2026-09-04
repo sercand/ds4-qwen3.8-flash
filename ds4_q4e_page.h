@@ -34,4 +34,14 @@
 #define DS4_Q4E_PAGE_SHIFT  8u
 #define DS4_Q4E_PAGE_MASK   (DS4_Q4E_PAGE_TOKENS - 1u)
 
+/* Rows the mRoPE table carries in FRONT of a chunk's first token.
+ *
+ * Every rope site but one reads its position out of pos[]; q4e_idx_pool_kernel
+ * instead derives the pooled key's position as (pos[0] / r) * r, which rounds
+ * DOWN and so can name a position up to r-1 slots before the chunk starts.
+ * Those rows have to exist in the table, hence the prefix.  r is the indexer's
+ * compression ratio (Q4E_IDX_R on the device, n_indexer_compress on the host);
+ * 4 covers it with one row to spare. */
+#define DS4_Q4E_MROPE_BACK  4u
+
 #endif /* DS4_Q4E_PAGE_H */
