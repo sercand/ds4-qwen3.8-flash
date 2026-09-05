@@ -39302,9 +39302,12 @@ struct ds4_engine {
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
     ds4_qwen3vl_vision_weights qwen3vl_vision_weights;
-    /* Which tower the sidecar holds; the plumbing around it is family-neutral. */
-    bool vision_is_qwen3vl;
 #endif
+    /* Which tower the sidecar holds.  The plumbing around it is family-neutral
+     * -- image preprocessing and the projection width are picked from it on the
+     * CPU side -- so it stays out of the GPU guard with the other neutral
+     * vision fields, even though only a GPU build ever sets it. */
+    bool vision_is_qwen3vl;
     int vision_image_token;
     int vision_start_token;
     int vision_end_token;
@@ -79844,12 +79847,14 @@ static int ds4_sessions_eval_batch_cuda(ds4_decode_item *items, int count,
         return ds4_session_eval(items[0].session, items[0].token, err, errlen);
     }
 
+#ifndef DS4_NO_GPU
     /* qwen4exp runs its own batched pass: the sessions share one prefix cache
      * and one set of scratch buffers, so their rows can go through the
      * weights together instead of one graph after another. */
     if (ds4_session_is_qwen4exp(items[0].session)) {
         return q4e_forward_batch(items, (uint32_t)count, err, errlen);
     }
+#endif
 
     ds4_session *first = items[0].session;
     if (!first || !first->engine) {

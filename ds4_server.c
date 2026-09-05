@@ -6447,6 +6447,15 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
         ts = "<tool_calls>";   te = "</tool_calls>";
         is = "<invoke";        ie = "</invoke>";
         ps = "<parameter";     pe = "</parameter>";
+    } else if (strstr(scan_start, "<tool_call>")) {
+        /* Qwen: the singular block ds4 renders for qwen4exp, checked after the
+         * plural styles so "<tool_calls>" still wins.  A qwen call carries the
+         * whole payload as raw parameter text -- a file body in one write --
+         * so it is the style most likely to be cut off, and without this case
+         * the repair below is dead code for every qwen4exp tool call. */
+        ts = "<tool_call>";    te = "</tool_call>";
+        is = "<function=";     ie = "</function>";
+        ps = "<parameter=";    pe = "</parameter>";
     } else {
         return false; /* No recognizable DSML start tag */
     }
@@ -6476,6 +6485,15 @@ static bool try_repair_dsml(const char *s, size_t len, buf *out) {
     for (size_t i = 0; i < ios - ioe; i++) buf_puts(out, ie);
     for (size_t i = 0; i < tos - toe; i++) buf_puts(out, te);
     return true;
+}
+
+/* What an unterminated tool block should report.  A block the token budget cut
+ * off is a truncation, not a broken call: OpenAI clients read "length" as
+ * incomplete/max_tokens and stop, where an error reads as retryable and sends
+ * them round the same wall again.  Anything else -- the model ended its turn
+ * mid-block -- stays an error the caller must see. */
+static const char *unterminated_tool_call_finish(const char *finish) {
+    return finish && !strcmp(finish, "length") ? "length" : "error";
 }
 
 static const char *tool_parse_failure_recovery_finish(const char *finish) {
@@ -14038,7 +14056,33 @@ decode_again:
             tool_calls_free(&test_calls);
         }
         if (!completed_truncation) {
-            if (!j->req.stream && !dsml_recovery_attempted) {
+            /* The turn ended inside the block, so the tail is the only evidence
+             * for why the model never closed it.  Log it here: once finish is
+             * "error" the invalid-tool-call snippet log below is skipped, and
+             * the request leaves no trace of what the model actually wrote. */
+            const char *unterminated_start =
+                find_any_tool_start(text.ptr ? text.ptr : "");
+            const size_t tail_max = 400;
+            const size_t tail_len = text.len > tail_max ? tail_max : text.len;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: chat ctx=%s%s%s unterminated tool call stop=%s text_len=%zu start_off=%zd tail: %.*s",
+                       ctx_span,
+                       req_flags[0] ? " " : "",
+                       req_flags,
+                       finish,
+                       text.len,
+                       unterminated_start ? (ssize_t)(unterminated_start - text.ptr) :
+                                            (ssize_t)-1,
+                       (int)tail_len,
+                       text.ptr ? text.ptr + (text.len - tail_len) : "");
+            finish = unterminated_tool_call_finish(finish);
+            if (!strcmp(finish, "length")) {
+                /* Cut off by the budget: reported as truncation above.  A
+                 * tool-error continuation would only spend a second whole
+                 * budget on the same wall, so leave the turn to the client. */
+                trace_event(s, trace_id,
+                            "tool call cut off by max_tokens; reporting length");
+            } else if (!j->req.stream && !dsml_recovery_attempted) {
                 int recovery_tokens = 0;
                 char recovery_err[160] = {0};
                 server_log(DS4_LOG_WARNING,
@@ -14072,7 +14116,6 @@ decode_again:
                 snprintf(err, sizeof(err), "invalid tool call recovery failed: %s",
                          recovery_err[0] ? recovery_err : "unknown error");
             } else {
-                finish = "error";
                 snprintf(err, sizeof(err), "unterminated tool call");
             }
         }
@@ -18453,6 +18496,108 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     tool_schema_orders_free(&orders);
 }
 
+/* A tool block the budget cut off is a truncation the client can act on; a
+ * block the model abandoned mid-turn is not. */
+static void test_unterminated_tool_call_finish_preserves_length(void) {
+    TEST_ASSERT(!strcmp(unterminated_tool_call_finish("length"), "length"));
+    TEST_ASSERT(!strcmp(unterminated_tool_call_finish("stop"), "error"));
+    TEST_ASSERT(!strcmp(unterminated_tool_call_finish("tool_calls"), "error"));
+    TEST_ASSERT(!strcmp(unterminated_tool_call_finish("error"), "error"));
+    TEST_ASSERT(!strcmp(unterminated_tool_call_finish(NULL), "error"));
+}
+
+/* The qwen syntax ds4 renders for qwen4exp is the singular <tool_call> with
+ * <function=name>/<parameter=key> inside.  A long payload -- a whole file body
+ * in one write -- is exactly what gets cut off, so repair has to know this
+ * style too, or every truncated qwen call is unrecoverable. */
+static void test_qwen_tool_call_repair_produces_parseable_calls(void) {
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    buf repaired = {0};
+
+    /* === Missing </tool_call> === */
+    {
+        const char *broken =
+            "writing it out</think>\n\n"
+            "<tool_call>\n<function=write>\n"
+            "<parameter=path>\nplan.md\n</parameter>\n"
+            "<parameter=content>\n# Plan\n</parameter>\n"
+            "</function>\n";
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, repaired.ptr, false,
+            &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"plan.md\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === Missing </function> and </tool_call> === */
+    {
+        const char *broken =
+            "<tool_call>\n<function=write>\n"
+            "<parameter=path>\nplan.md\n</parameter>\n";
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, repaired.ptr, false,
+            &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"plan.md\"") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === Cut mid-payload: the real truncation, every closer missing === */
+    {
+        const char *broken =
+            "<tool_call>\n<function=write>\n"
+            "<parameter=path>\ndocs/plan.md\n</parameter>\n"
+            "<parameter=content>\n# shisu: ds4 to Rust\n\n- [ ] Step 1";
+
+        buf_free(&repaired);
+        TEST_ASSERT(try_repair_dsml(broken, strlen(broken), &repaired));
+        TEST_ASSERT(parse_generated_message_ex_for_syntax(
+            SERVER_MODEL_SYNTAX_QWEN, repaired.ptr, false,
+            &content, &reasoning, &calls));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "write"));
+        TEST_ASSERT(strstr(calls.v[0].arguments, "\"path\": \"docs/plan.md\"") != NULL);
+        TEST_ASSERT(strstr(calls.v[0].arguments, "Step 1") != NULL);
+        free(content); free(reasoning); tool_calls_free(&calls);
+    }
+
+    /* === Balanced, and an orphan close: not truncation, do not repair === */
+    {
+        const char *balanced =
+            "<tool_call>\n<function=write>\n"
+            "<parameter=path>\nplan.md\n</parameter>\n"
+            "</function>\n</tool_call>";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(balanced, strlen(balanced), &repaired));
+
+        const char *orphan = "here you go\n</function>\n</tool_call>";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(orphan, strlen(orphan), &repaired));
+    }
+
+    /* === DSML mentioned only inside reasoning is not executable === */
+    {
+        const char *quoted =
+            "<think>the format is <tool_call>\n<function=write>\n</think>\n"
+            "I will not call anything.";
+        buf_free(&repaired);
+        TEST_ASSERT(!try_repair_dsml(quoted, strlen(quoted), &repaired));
+    }
+
+    buf_free(&repaired);
+}
+
 /* Qwen3.8-Flash parameter values are raw text.  Plain strings must be quoted
  * into the arguments object; only a complete JSON literal goes out as one. */
 static void test_qwen_tool_call_string_params_are_quoted(void) {
@@ -21356,6 +21501,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_glm_tool_checkpoint_suffix_is_canonical();
     test_qwen_tool_call_string_params_are_quoted();
+    test_qwen_tool_call_repair_produces_parseable_calls();
+    test_unterminated_tool_call_finish_preserves_length();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
