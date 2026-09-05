@@ -6862,6 +6862,21 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     return ok;
 }
 
+typedef struct {
+    const char *tool_calls_start;
+    const char *tool_calls_end;
+    const char *invoke_start;
+    const char *invoke_end;
+    const char *param_start;
+    const char *param_end;
+    /* Qwen names its target inside the marker (<function=write>) instead of in
+     * a name= attribute, and its parameter values are raw text rather than
+     * DSML-escaped.  Both change how a wire projection reads a tag and a
+     * value, so they belong to the syntax rather than to each projection. */
+    bool inline_names;
+    bool raw_values;
+} dsml_syntax;
+
 typedef enum {
     OPENAI_STREAM_THINKING,
     OPENAI_STREAM_TEXT,
@@ -6882,6 +6897,7 @@ typedef enum {
  * OpenAI / Anthropic wire events while final parsing remains authoritative. */
 typedef struct {
     dsml_tool_stream_state state;
+    const dsml_syntax *syn;
     const char *tool_calls_end;
     const char *invoke_start;
     const char *invoke_end;
@@ -6894,6 +6910,14 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    /* A qwen value's JSON type is decided by the whole value, so a parameter
+     * the schema does not declare a string cannot start streaming: it is held
+     * from param_value_start until </parameter> and emitted in one piece. */
+    char *invoke_name;
+    char *param_name;
+    size_t param_value_start;
+    bool param_defer;
+    bool param_trim_lead;
     char **ids;
     int ids_cap;
 } openai_tool_stream;
@@ -6923,6 +6947,10 @@ static void openai_tool_stream_free(openai_tool_stream *ts) {
     free(ts->ids);
     ts->ids = NULL;
     ts->ids_cap = 0;
+    free(ts->invoke_name);
+    ts->invoke_name = NULL;
+    free(ts->param_name);
+    ts->param_name = NULL;
 }
 
 static void openai_stream_free(openai_stream *st) {
@@ -7067,32 +7095,43 @@ typedef enum {
     DSML_TRACK_DONE,
 } dsml_track_mode;
 
-typedef struct {
-    const char *tool_calls_start;
-    const char *tool_calls_end;
-    const char *invoke_start;
-    const char *invoke_end;
-    const char *param_start;
-    const char *param_end;
-} dsml_syntax;
-
 static const dsml_syntax dsml_syntaxes[] = {
     {
         DS4_TOOL_CALLS_START, DS4_TOOL_CALLS_END,
         DS4_INVOKE_START, DS4_INVOKE_END,
         DS4_PARAM_START, DS4_PARAM_END,
+        false, false,
     },
     {
         DS4_TOOL_CALLS_START_SHORT, DS4_TOOL_CALLS_END_SHORT,
         DS4_INVOKE_START_SHORT, DS4_INVOKE_END_SHORT,
         DS4_PARAM_START_SHORT, DS4_PARAM_END_SHORT,
+        false, false,
     },
     {
         "<tool_calls>", "</tool_calls>",
         "<invoke", "</invoke>",
         "<parameter", "</parameter>",
+        false, false,
+    },
+    {
+        "<tool_call>", "</tool_call>",
+        "<function=", "</function>",
+        "<parameter=", "</parameter>",
+        true, true,
     },
 };
+
+/* Read the target name out of an opening tag -- the whole tag, '>' included.
+ * Caller owns the result. */
+static char *dsml_tag_target_name(const dsml_syntax *syn, const char *tag) {
+    if (!syn || !syn->inline_names) return dsml_attr(tag, "name");
+    const char *eq = tag ? strchr(tag, '=') : NULL;
+    if (!eq) return NULL;
+    const char *end = strchr(eq + 1, '>');
+    if (!end || end == eq + 1) return NULL;
+    return xstrndup(eq + 1, (size_t)(end - (eq + 1)));
+}
 
 typedef struct {
     dsml_track_mode mode;
@@ -7480,7 +7519,10 @@ static bool openai_tool_emit_string_value(int fd, const request *r, const char *
                                           const char *text, size_t len) {
     if (len == 0) return true;
     char *raw = xstrndup(text, len);
-    char *unescaped = dsml_unescape_text(raw);
+    /* Qwen values are raw text: running the DSML entity decoder over a file
+     * body would rewrite an innocent &amp; the model meant literally. */
+    char *unescaped = ts->syn && ts->syn->raw_values ? xstrdup(raw)
+                                                     : dsml_unescape_text(raw);
     buf frag = {0};
     json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
     bool ok = openai_tool_emit_args_fragment(fd, r, id, ts, frag.ptr ? frag.ptr : "", frag.len);
@@ -7511,33 +7553,23 @@ static bool openai_tool_stream_init(openai_tool_stream *ts, const char *raw,
     ts->active = true;
     ts->state = DSML_TOOL_BETWEEN_INVOKES;
     ts->parse_pos = pos;
-    if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START)) {
-        ts->parse_pos += strlen(DS4_TOOL_CALLS_START);
-        ts->tool_calls_end = DS4_TOOL_CALLS_END;
-        ts->invoke_start = DS4_INVOKE_START;
-        ts->invoke_end = DS4_INVOKE_END;
-        ts->param_start = DS4_PARAM_START;
-        ts->param_end = DS4_PARAM_END;
-    } else if (raw_full_lit(raw, raw_len, pos, DS4_TOOL_CALLS_START_SHORT)) {
-        ts->parse_pos += strlen(DS4_TOOL_CALLS_START_SHORT);
-        ts->tool_calls_end = DS4_TOOL_CALLS_END_SHORT;
-        ts->invoke_start = DS4_INVOKE_START_SHORT;
-        ts->invoke_end = DS4_INVOKE_END_SHORT;
-        ts->param_start = DS4_PARAM_START_SHORT;
-        ts->param_end = DS4_PARAM_END_SHORT;
-    } else if (raw_full_lit(raw, raw_len, pos, "<tool_calls>")) {
-        ts->parse_pos += strlen("<tool_calls>");
-        ts->tool_calls_end = "</tool_calls>";
-        ts->invoke_start = "<invoke";
-        ts->invoke_end = "</invoke>";
-        ts->param_start = "<parameter";
-        ts->param_end = "</parameter>";
-    } else {
-        ts->active = false;
-        ts->state = DSML_TOOL_ERROR;
-        return false;
+    /* One list of syntaxes, walked here and by every other recognizer: a
+     * second copy is how the qwen block came to be streamed by none of them. */
+    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+        const dsml_syntax *syn = &dsml_syntaxes[i];
+        if (!raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) continue;
+        ts->parse_pos += strlen(syn->tool_calls_start);
+        ts->syn = syn;
+        ts->tool_calls_end = syn->tool_calls_end;
+        ts->invoke_start = syn->invoke_start;
+        ts->invoke_end = syn->invoke_end;
+        ts->param_start = syn->param_start;
+        ts->param_end = syn->param_end;
+        return true;
     }
-    return true;
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return false;
 }
 
 static bool openai_tool_stream_fail(openai_tool_stream *ts) {
@@ -7552,9 +7584,11 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
+    char *name = dsml_tag_target_name(ts->syn, tag);
     free(tag);
     if (!name) return openai_tool_stream_fail(ts);
+    free(ts->invoke_name);
+    ts->invoke_name = xstrdup(name);
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
@@ -7576,29 +7610,89 @@ static bool openai_tool_start_param(int fd, const request *r, const char *id,
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos, (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
+    char *name = dsml_tag_target_name(ts->syn, tag);
+    const bool inline_names = ts->syn && ts->syn->inline_names;
+    char *is_string = inline_names ? NULL : dsml_attr(tag, "string");
     free(tag);
-    if (!name || !is_string) {
+    if (!name || (!inline_names && !is_string)) {
         free(name);
         free(is_string);
         return openai_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
-    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
-    free(name);
+    /* DSML states the type in the tag.  Qwen does not, and its final parser
+     * decides from the whole value, so only a schema-declared string can be
+     * streamed as it arrives; the rest waits for the closing tag. */
+    bool string_value;
+    bool defer;
+    if (inline_names) {
+        const char *type = tool_schema_param_type(&r->tool_orders,
+                                                  ts->invoke_name, name);
+        string_value = type && !strcmp(type, "string");
+        defer = !string_value;
+    } else {
+        string_value = !strcmp(is_string, "true");
+        defer = false;
+    }
+    bool ok = defer ? true
+                    : openai_tool_emit_param_prefix(fd, r, id, ts, name, string_value);
     free(is_string);
-    if (!ok) return false;
+    if (!ok) {
+        free(name);
+        return false;
+    }
 
+    free(ts->param_name);
+    ts->param_name = name;
     ts->param_is_string = string_value;
+    ts->param_defer = defer;
+    ts->param_trim_lead = ts->syn && ts->syn->raw_values;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->param_value_start = ts->parse_pos;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
+}
+
+/* A qwen value the schema did not declare a string: its type is whatever the
+ * whole value turns out to be, decided here with the rule the final parser
+ * uses so the streamed arguments and the parsed arguments agree. */
+static bool openai_tool_emit_deferred_param(int fd, const request *r, const char *id,
+                                            openai_tool_stream *ts,
+                                            const char *raw, size_t value_end) {
+    size_t start = ts->param_value_start;
+    if (value_end < start) value_end = start;
+    char *value = xstrndup(raw + start, value_end - start);
+    const bool literal = qwen_param_value_is_json_literal(value);
+    bool ok = openai_tool_emit_param_prefix(fd, r, id, ts, ts->param_name, !literal);
+    if (ok) {
+        if (literal) {
+            ok = openai_tool_emit_args_fragment(fd, r, id, ts, value, strlen(value));
+        } else {
+            buf frag = {0};
+            json_escape_fragment_n(&frag, value, strlen(value));
+            ok = openai_tool_emit_args_fragment(fd, r, id, ts,
+                                                frag.ptr ? frag.ptr : "", frag.len);
+            buf_free(&frag);
+            if (ok) ok = openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1);
+        }
+    }
+    free(value);
+    return ok;
 }
 
 static bool openai_tool_finish_param(int fd, const request *r, const char *id,
                                      openai_tool_stream *ts,
                                      const char *raw, size_t value_end) {
+    const size_t close = value_end;
+    /* Qwen frames the value with a newline on each side; the parser treats
+     * both as framing, so the projection must drop them too. */
+    if (ts->syn && ts->syn->raw_values &&
+        value_end > ts->parse_pos && raw[value_end - 1] == '\n') value_end--;
+    if (ts->param_defer) {
+        if (!openai_tool_emit_deferred_param(fd, r, id, ts, raw, value_end)) return false;
+        ts->parse_pos = close + strlen(ts->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
@@ -7609,7 +7703,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     }
     if (ts->param_is_string &&
         !openai_tool_emit_args_fragment(fd, r, id, ts, "\"", 1)) return false;
-    ts->parse_pos = value_end + strlen(ts->param_end);
+    ts->parse_pos = close + strlen(ts->param_end);
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
@@ -7662,6 +7756,12 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
         }
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
+            const bool raw_values = ts->syn && ts->syn->raw_values;
+            if (ts->param_trim_lead && ts->parse_pos < raw_len) {
+                if (raw[ts->parse_pos] == '\n') ts->parse_pos++;
+                ts->param_value_start = ts->parse_pos;
+                ts->param_trim_lead = false;
+            }
             const char *end = find_lit_bounded(raw + ts->parse_pos,
                                                raw_len - ts->parse_pos,
                                                ts->param_end);
@@ -7670,9 +7770,13 @@ static bool openai_tool_stream_update(int fd, server *s, const request *r, const
                                               (size_t)(end - raw))) return false;
                 continue;
             }
+            if (ts->param_defer) return true;
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len, ts->param_end,
-                                                            ts->param_is_string);
+                                                            ts->param_is_string &&
+                                                            !raw_values);
+            /* Hold back what may still turn out to be the framing newline. */
+            if (raw_values && limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
             if (limit > ts->parse_pos) {
                 bool ok = ts->param_is_string ?
                     openai_tool_emit_string_value(fd, r, id, ts, raw + ts->parse_pos,
@@ -7872,9 +7976,43 @@ static void responses_random_id(char *dst, size_t dstlen, const char *prefix) {
     dst[pos] = '\0';
 }
 
+/* Item identity per tool call must be stable across added/done/completed. */
+typedef struct {
+    char fc_id[40];
+    char call_id[64];
+    bool is_custom;
+    int output_index;
+} responses_tool_item;
+
+/* Responses carries its own copy of the tool-block walk the OpenAI and
+ * Anthropic projections have, against the function_call lifecycle instead of
+ * their event shapes.  Without it a long payload -- a file body in one write --
+ * reached the client only as a single delta once the call closed, minutes of
+ * silence during which a harness gives up on the stream. */
+typedef struct {
+    dsml_tool_stream_state state;
+    const dsml_syntax *syn;
+    size_t parse_pos;
+    int index;
+    bool active;
+    bool emitted_any;
+    bool args_open;
+    bool first_param;
+    bool param_is_string;
+    char *invoke_name;
+    char *param_name;
+    size_t param_value_start;
+    bool param_defer;
+    bool param_trim_lead;
+    responses_tool_item *items;  /* identity of each call opened live */
+    int items_len;
+    buf args;                    /* arguments streamed for the open call */
+} responses_tool_stream;
+
 typedef enum {
     RESP_STREAM_THINKING,
     RESP_STREAM_TEXT,
+    RESP_STREAM_TOOL,
     RESP_STREAM_SUPPRESS,
 } responses_stream_mode;
 
@@ -7901,6 +8039,7 @@ typedef struct {
     int message_index;     /* output_index of the assistant message item */
     int next_output_index; /* monotonic counter for upcoming output items */
     int sequence;          /* monotonic per-event sequence_number Codex consumes */
+    responses_tool_stream tool;
 } responses_stream;
 
 static void responses_stream_init(const request *r, responses_stream *st) {
@@ -7913,10 +8052,23 @@ static void responses_stream_init(const request *r, responses_stream *st) {
     st->message_index = -1;
 }
 
+static void responses_tool_stream_free(responses_tool_stream *ts) {
+    if (!ts) return;
+    free(ts->invoke_name);
+    ts->invoke_name = NULL;
+    free(ts->param_name);
+    ts->param_name = NULL;
+    free(ts->items);
+    ts->items = NULL;
+    ts->items_len = 0;
+    buf_free(&ts->args);
+}
+
 static void responses_stream_free(responses_stream *st) {
     if (!st) return;
     buf_free(&st->reasoning_text);
     buf_free(&st->message_text);
+    responses_tool_stream_free(&st->tool);
 }
 
 /* Codex parses an explicit sequence_number on every Responses event for
@@ -8159,14 +8311,6 @@ static bool responses_sse_message_done(int fd, responses_stream *st,
     return ok;
 }
 
-/* Item identity per tool call must be stable across added/done/completed. */
-typedef struct {
-    char fc_id[40];
-    char call_id[64];
-    bool is_custom;
-    int output_index;
-} responses_tool_item;
-
 static bool responses_tool_call_is_tool_search(const tool_call *tc,
                                                const tool_schema_order *order) {
     return tc && tc->name && !strcmp(tc->name, "tool_search") &&
@@ -8267,6 +8411,37 @@ static bool responses_sse_function_call_event(int fd, responses_stream *st,
  * the whole DSML invoke as one unit before the worker decides which tool was
  * called. Clients that follow the OpenAI Responses lifecycle expect both
  * events between output_item.added (in_progress) and output_item.done. */
+/* The terminal arguments event.  The live projection has already sent the
+ * value in fragments and needs only this; the non-streaming path sends the
+ * whole value as one delta first. */
+static bool responses_sse_function_call_arguments_final(int fd, responses_stream *st,
+                                                        const tool_call *tc,
+                                                        const responses_tool_item *item,
+                                                        const tool_schema_orders *orders) {
+    const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
+    if (item->is_custom || responses_tool_call_is_tool_search(tc, order)) return true;
+    buf args = {0};
+    append_json_object_string(&args, tc->arguments);
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.function_call_arguments.done\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"name\":",
+        item->fc_id, item->output_index);
+    json_escape(&b, order && order->wire_name ? order->wire_name :
+                    (tc->name ? tc->name : ""));
+    if (order && order->namespace) {
+        buf_puts(&b, ",\"namespace\":");
+        json_escape(&b, order->namespace);
+    }
+    buf_puts(&b, ",\"arguments\":");
+    buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
+    buf_putc(&b, '}');
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    buf_free(&args);
+    return ok;
+}
+
 static bool responses_sse_function_call_arguments_done(int fd, responses_stream *st,
                                                        const tool_call *tc,
                                                        const responses_tool_item *item,
@@ -8290,23 +8465,8 @@ static bool responses_sse_function_call_arguments_done(int fd, responses_stream 
     }
 
     buf_free(&b);
-    buf_printf(&b,
-        "{\"type\":\"response.function_call_arguments.done\","
-        "\"item_id\":\"%s\",\"output_index\":%d,\"name\":",
-        item->fc_id, item->output_index);
-    json_escape(&b, order && order->wire_name ? order->wire_name :
-                    (tc->name ? tc->name : ""));
-    if (order && order->namespace) {
-        buf_puts(&b, ",\"namespace\":");
-        json_escape(&b, order->namespace);
-    }
-    buf_puts(&b, ",\"arguments\":");
-    buf_append(&b, args.ptr ? args.ptr : "\"\"", args.ptr ? args.len : 2);
-    buf_putc(&b, '}');
-    ok = responses_sse_emit_event(fd, st, b.ptr);
-    buf_free(&b);
     buf_free(&args);
-    return ok;
+    return responses_sse_function_call_arguments_final(fd, st, tc, item, orders);
 }
 
 static const char *responses_status_for_finish(const char *finish) {
@@ -8409,6 +8569,324 @@ static bool responses_sse_completed(int fd, const request *r,
  * consumes: <think>...</think> is reasoning, anything before the tool-call
  * marker is output text. Tool-call argument deltas are not surfaced because
  * Codex' SSE parser only ingests function_call items via output_item.done. */
+static bool responses_tool_stream_fail(responses_tool_stream *ts) {
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return true;
+}
+
+static bool responses_tool_stream_init(responses_tool_stream *ts, const char *raw,
+                                       size_t raw_len, size_t pos) {
+    responses_tool_stream_free(ts);
+    memset(ts, 0, sizeof(*ts));
+    ts->active = true;
+    ts->state = DSML_TOOL_BETWEEN_INVOKES;
+    for (size_t i = 0; i < sizeof(dsml_syntaxes) / sizeof(dsml_syntaxes[0]); i++) {
+        const dsml_syntax *syn = &dsml_syntaxes[i];
+        if (!raw_full_lit(raw, raw_len, pos, syn->tool_calls_start)) continue;
+        ts->syn = syn;
+        ts->parse_pos = pos + strlen(syn->tool_calls_start);
+        return true;
+    }
+    ts->active = false;
+    ts->state = DSML_TOOL_ERROR;
+    return false;
+}
+
+/* Every fragment goes out as a function_call_arguments.delta and is kept, so
+ * the terminal arguments event and output_item.done carry exactly what the
+ * client accumulated. */
+static bool responses_tool_emit_args_fragment(int fd, responses_stream *st,
+                                              const char *text, size_t len) {
+    responses_tool_stream *ts = &st->tool;
+    if (len == 0) return true;
+    buf_append(&ts->args, text, len);
+    if (ts->index >= ts->items_len) return true;
+    const responses_tool_item *item = &ts->items[ts->index];
+    buf esc = {0};
+    json_escape_fragment_n(&esc, text, len);
+    buf b = {0};
+    buf_printf(&b,
+        "{\"type\":\"response.function_call_arguments.delta\","
+        "\"item_id\":\"%s\",\"output_index\":%d,\"delta\":\"",
+        item->fc_id, item->output_index);
+    buf_append(&b, esc.ptr ? esc.ptr : "", esc.len);
+    buf_puts(&b, "\"}");
+    bool ok = responses_sse_emit_event(fd, st, b.ptr);
+    buf_free(&b);
+    buf_free(&esc);
+    return ok;
+}
+
+static bool responses_tool_emit_string_value(int fd, responses_stream *st,
+                                             const char *text, size_t len) {
+    if (len == 0) return true;
+    char *raw = xstrndup(text, len);
+    char *unescaped = st->tool.syn && st->tool.syn->raw_values ? xstrdup(raw)
+                                                               : dsml_unescape_text(raw);
+    buf frag = {0};
+    json_escape_fragment_n(&frag, unescaped, strlen(unescaped));
+    bool ok = responses_tool_emit_args_fragment(fd, st, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    free(unescaped);
+    free(raw);
+    return ok;
+}
+
+static bool responses_tool_emit_param_prefix(int fd, responses_stream *st,
+                                             const char *name, bool is_string) {
+    responses_tool_stream *ts = &st->tool;
+    buf frag = {0};
+    if (ts->first_param) ts->first_param = false;
+    else buf_putc(&frag, ',');
+    json_escape(&frag, name ? name : "");
+    buf_putc(&frag, ':');
+    if (is_string) buf_putc(&frag, '"');
+    bool ok = responses_tool_emit_args_fragment(fd, st, frag.ptr ? frag.ptr : "", frag.len);
+    buf_free(&frag);
+    return ok;
+}
+
+/* See openai_tool_emit_deferred_param. */
+static bool responses_tool_emit_deferred_param(int fd, responses_stream *st,
+                                               const char *raw, size_t value_end) {
+    responses_tool_stream *ts = &st->tool;
+    size_t start = ts->param_value_start;
+    if (value_end < start) value_end = start;
+    char *value = xstrndup(raw + start, value_end - start);
+    const bool literal = qwen_param_value_is_json_literal(value);
+    bool ok = responses_tool_emit_param_prefix(fd, st, ts->param_name, !literal);
+    if (ok) {
+        if (literal) {
+            ok = responses_tool_emit_args_fragment(fd, st, value, strlen(value));
+        } else {
+            buf frag = {0};
+            json_escape_fragment_n(&frag, value, strlen(value));
+            ok = responses_tool_emit_args_fragment(fd, st,
+                                                   frag.ptr ? frag.ptr : "", frag.len);
+            buf_free(&frag);
+            if (ok) ok = responses_tool_emit_args_fragment(fd, st, "\"", 1);
+        }
+    }
+    free(value);
+    return ok;
+}
+
+static bool responses_tool_start_invoke(int fd, const request *r, responses_stream *st,
+                                        const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos,
+                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_tag_target_name(ts->syn, tag);
+    free(tag);
+    if (!name) return responses_tool_stream_fail(ts);
+    free(ts->invoke_name);
+    ts->invoke_name = name;
+
+    /* The item identity is created here rather than at finish, because the
+     * client needs it to attach every delta that follows. */
+    ts->items = xrealloc(ts->items, (size_t)(ts->index + 1) * sizeof(*ts->items));
+    responses_tool_item *item = &ts->items[ts->index];
+    memset(item, 0, sizeof(*item));
+    responses_random_id(item->fc_id, sizeof(item->fc_id), "fc_");
+    responses_random_id(item->call_id, sizeof(item->call_id), "call_");
+    item->output_index = st->next_output_index++;
+    ts->items_len = ts->index + 1;
+
+    buf_free(&ts->args);
+    tool_call tc = {0};
+    tc.name = ts->invoke_name;
+    if (!responses_sse_function_call_event(fd, st, &tc, item, &r->tool_orders,
+                                           NULL, false)) return false;
+    if (!responses_tool_emit_args_fragment(fd, st, "{", 1)) return false;
+
+    ts->emitted_any = true;
+    ts->args_open = true;
+    ts->first_param = true;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool responses_tool_finish_invoke(int fd, const request *r, responses_stream *st) {
+    responses_tool_stream *ts = &st->tool;
+    if (ts->args_open && !responses_tool_emit_args_fragment(fd, st, "}", 1)) return false;
+    ts->args_open = false;
+    if (ts->index >= ts->items_len) return true;
+    tool_call tc = {0};
+    tc.name = ts->invoke_name;
+    tc.arguments = ts->args.ptr ? ts->args.ptr : (char *)"{}";
+    const responses_tool_item *item = &ts->items[ts->index];
+    if (!responses_sse_function_call_arguments_final(fd, st, &tc, item,
+                                                     &r->tool_orders)) return false;
+    return responses_sse_function_call_event(fd, st, &tc, item, &r->tool_orders,
+                                             "tool_calls", true);
+}
+
+static bool responses_tool_start_param(int fd, const request *r, responses_stream *st,
+                                       const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
+    if (!tag_end) return true;
+    char *tag = xstrndup(raw + ts->parse_pos,
+                         (size_t)(tag_end - (raw + ts->parse_pos) + 1));
+    char *name = dsml_tag_target_name(ts->syn, tag);
+    const bool inline_names = ts->syn && ts->syn->inline_names;
+    char *is_string = inline_names ? NULL : dsml_attr(tag, "string");
+    free(tag);
+    if (!name || (!inline_names && !is_string)) {
+        free(name);
+        free(is_string);
+        return responses_tool_stream_fail(ts);
+    }
+    bool string_value;
+    bool defer;
+    if (inline_names) {
+        const char *type = tool_schema_param_type(&r->tool_orders,
+                                                  ts->invoke_name, name);
+        string_value = type && !strcmp(type, "string");
+        defer = !string_value;
+    } else {
+        string_value = !strcmp(is_string, "true");
+        defer = false;
+    }
+    bool ok = defer ? true
+                    : responses_tool_emit_param_prefix(fd, st, name, string_value);
+    free(is_string);
+    if (!ok) {
+        free(name);
+        return false;
+    }
+
+    free(ts->param_name);
+    ts->param_name = name;
+    ts->param_is_string = string_value;
+    ts->param_defer = defer;
+    ts->param_trim_lead = ts->syn && ts->syn->raw_values;
+    ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->param_value_start = ts->parse_pos;
+    ts->state = DSML_TOOL_PARAM_VALUE;
+    return true;
+}
+
+static bool responses_tool_finish_param(int fd, responses_stream *st,
+                                        const char *raw, size_t value_end) {
+    responses_tool_stream *ts = &st->tool;
+    const size_t close = value_end;
+    if (ts->syn && ts->syn->raw_values &&
+        value_end > ts->parse_pos && raw[value_end - 1] == '\n') value_end--;
+    if (ts->param_defer) {
+        if (!responses_tool_emit_deferred_param(fd, st, raw, value_end)) return false;
+        ts->parse_pos = close + strlen(ts->syn->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
+    if (value_end > ts->parse_pos) {
+        bool ok = ts->param_is_string ?
+            responses_tool_emit_string_value(fd, st, raw + ts->parse_pos,
+                                             value_end - ts->parse_pos) :
+            responses_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
+                                              value_end - ts->parse_pos);
+        if (!ok) return false;
+    }
+    if (ts->param_is_string &&
+        !responses_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
+    ts->parse_pos = close + strlen(ts->syn->param_end);
+    ts->state = DSML_TOOL_BETWEEN_PARAMS;
+    return true;
+}
+
+static bool responses_tool_stream_update(int fd, const request *r, responses_stream *st,
+                                         const char *raw, size_t raw_len) {
+    responses_tool_stream *ts = &st->tool;
+    while (ts->active && ts->parse_pos < raw_len) {
+        if (ts->state == DSML_TOOL_BETWEEN_INVOKES) {
+            while (ts->parse_pos < raw_len &&
+                   isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->tool_calls_end)) {
+                ts->parse_pos += strlen(ts->syn->tool_calls_end);
+                ts->active = false;
+                ts->state = DSML_TOOL_DONE;
+                return true;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos,
+                                ts->syn->tool_calls_end, ts->syn->invoke_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_start)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!responses_tool_start_invoke(fd, r, st, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return responses_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_BETWEEN_PARAMS) {
+            while (ts->parse_pos < raw_len &&
+                   isspace((unsigned char)raw[ts->parse_pos])) ts->parse_pos++;
+            if (ts->parse_pos >= raw_len) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->invoke_end)) {
+                if (!responses_tool_finish_invoke(fd, r, st)) return false;
+                ts->parse_pos += strlen(ts->syn->invoke_end);
+                ts->index++;
+                ts->state = DSML_TOOL_BETWEEN_INVOKES;
+                continue;
+            }
+            if (raw_partial_any(raw, raw_len, ts->parse_pos,
+                                ts->syn->invoke_end, ts->syn->param_start)) return true;
+            if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
+                size_t before_pos = ts->parse_pos;
+                dsml_tool_stream_state before_state = ts->state;
+                if (!responses_tool_start_param(fd, r, st, raw, raw_len)) return false;
+                if (ts->parse_pos == before_pos && ts->state == before_state) return true;
+                continue;
+            }
+            return responses_tool_stream_fail(ts);
+        }
+
+        if (ts->state == DSML_TOOL_PARAM_VALUE) {
+            const bool raw_values = ts->syn && ts->syn->raw_values;
+            if (ts->param_trim_lead && ts->parse_pos < raw_len) {
+                if (raw[ts->parse_pos] == '\n') ts->parse_pos++;
+                ts->param_value_start = ts->parse_pos;
+                ts->param_trim_lead = false;
+            }
+            const char *end = find_lit_bounded(raw + ts->parse_pos,
+                                               raw_len - ts->parse_pos,
+                                               ts->syn->param_end);
+            if (end) {
+                if (!responses_tool_finish_param(fd, st, raw,
+                                                 (size_t)(end - raw))) return false;
+                continue;
+            }
+            if (ts->param_defer) return true;
+            size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
+                                                            raw_len,
+                                                            ts->syn->param_end,
+                                                            ts->param_is_string &&
+                                                            !raw_values);
+            /* Hold back what may still turn out to be the framing newline. */
+            if (raw_values && limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
+            if (limit > ts->parse_pos) {
+                bool ok = ts->param_is_string ?
+                    responses_tool_emit_string_value(fd, st, raw + ts->parse_pos,
+                                                     limit - ts->parse_pos) :
+                    responses_tool_emit_args_fragment(fd, st, raw + ts->parse_pos,
+                                                      limit - ts->parse_pos);
+                if (!ok) return false;
+                ts->parse_pos = limit;
+            }
+            return true;
+        }
+
+        return true;
+    }
+    return true;
+}
+
 static bool responses_sse_stream_update(int fd, const request *r,
                                         responses_stream *st,
                                         const char *raw, size_t raw_len,
@@ -8527,10 +9005,29 @@ static bool responses_sse_stream_update(int fd, const request *r,
 
         if (tool) {
             st->emit_pos = (size_t)(tool - raw);
-            st->mode = RESP_STREAM_SUPPRESS;
+            /* Close the message item before the first tool item opens, so the
+             * output_index order the client sees matches the order of items. */
+            if (st->message_item_opened && !st->message_item_closed) {
+                if (!responses_sse_message_done(fd, st, "tool_calls")) return false;
+                st->message_item_closed = true;
+            }
+            /* On a normal token update, project the block live.  On final
+             * catch-up from plain text, leave it to the finish emitter so the
+             * old non-incremental behaviour is unchanged. */
+            if (!final &&
+                responses_tool_stream_init(&st->tool, raw, raw_len, st->emit_pos)) {
+                st->mode = RESP_STREAM_TOOL;
+            } else {
+                st->mode = RESP_STREAM_SUPPRESS;
+            }
         } else if (final) {
             st->mode = RESP_STREAM_SUPPRESS;
         }
+    }
+
+    if (st->mode == RESP_STREAM_TOOL) {
+        if (!responses_tool_stream_update(fd, r, st, raw, raw_len)) return false;
+        if (!st->tool.active) st->mode = RESP_STREAM_SUPPRESS;
     }
     return true;
 }
@@ -8580,12 +9077,22 @@ static bool responses_sse_finish_live(int fd, const request *r,
         if (!responses_sse_message_done(fd, st, finish)) return false;
         st->message_item_closed = true;
     }
+    /* Calls the live projection already sent keep their identity and their
+     * events; only what it did not reach is emitted here. */
+    const int streamed = st->tool.emitted_any ? st->tool.items_len : 0;
     responses_tool_item *items = NULL;
     responses_tool_items_build(&items, calls, st->next_output_index);
-    if (items && calls) st->next_output_index += calls->len;
+    if (items && calls) {
+        const int reuse = streamed < calls->len ? streamed : calls->len;
+        for (int i = 0; i < reuse; i++) items[i] = st->tool.items[i];
+        for (int i = reuse; i < calls->len; i++) {
+            items[i].output_index = st->next_output_index++;
+        }
+    }
     bool ok = true;
     if (items && calls) {
         for (int i = 0; i < calls->len && ok; i++) {
+            if (i < streamed) continue;
             ok = responses_sse_function_call_event(fd, st, &calls->v[i], &items[i],
                                                    &r->tool_orders, finish, false);
             if (ok) ok = responses_sse_function_call_arguments_done(fd, st, &calls->v[i],
@@ -8843,6 +9350,14 @@ typedef struct {
     bool args_open;
     bool first_param;
     bool param_is_string;
+    /* Same rule as the OpenAI projection: a qwen value the schema does not
+     * declare a string is held until </parameter>, because only the whole
+     * value decides its JSON type. */
+    char *invoke_name;
+    char *param_name;
+    size_t param_value_start;
+    bool param_defer;
+    bool param_trim_lead;
     char **ids;
     int ids_cap;
 } anthropic_tool_stream;
@@ -8895,6 +9410,10 @@ static void anthropic_tool_stream_free(anthropic_tool_stream *ts) {
     free(ts->ids);
     ts->ids = NULL;
     ts->ids_cap = 0;
+    free(ts->invoke_name);
+    ts->invoke_name = NULL;
+    free(ts->param_name);
+    ts->param_name = NULL;
 }
 
 static void anthropic_stream_free(anthropic_stream *st) {
@@ -9061,6 +9580,7 @@ static bool anthropic_tool_emit_args_fragment(int fd, anthropic_stream *st,
     return anthropic_sse_tool_delta_live(fd, st, text, len);
 }
 
+/* See openai_tool_emit_string_value: qwen values are raw text. */
 static bool anthropic_tool_emit_string_value(int fd, anthropic_stream *st,
                                              const char *text, size_t len) {
     if (len == 0) return true;
@@ -9130,9 +9650,11 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
+    char *name = dsml_tag_target_name(ts->syn, tag);
     free(tag);
     if (!name) return anthropic_tool_stream_fail(ts);
+    free(ts->invoke_name);
+    ts->invoke_name = xstrdup(name);
 
     /* This id is already visible to the client.  After final parsing,
      * apply_anthropic_stream_tool_ids() copies it into the parsed tool_call
@@ -9152,36 +9674,90 @@ static bool anthropic_tool_start_invoke(int fd, server *s, anthropic_stream *st,
     return true;
 }
 
-static bool anthropic_tool_start_param(int fd, anthropic_stream *st,
+static bool anthropic_tool_start_param(int fd, const request *r,
+                                       anthropic_stream *st,
                                        const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
     const char *tag_end = memchr(raw + ts->parse_pos, '>', raw_len - ts->parse_pos);
     if (!tag_end) return true;
     char *tag = xstrndup(raw + ts->parse_pos,
                          (size_t)(tag_end - (raw + ts->parse_pos) + 1));
-    char *name = dsml_attr(tag, "name");
-    char *is_string = dsml_attr(tag, "string");
+    char *name = dsml_tag_target_name(ts->syn, tag);
+    const bool inline_names = ts->syn && ts->syn->inline_names;
+    char *is_string = inline_names ? NULL : dsml_attr(tag, "string");
     free(tag);
-    if (!name || !is_string) {
+    if (!name || (!inline_names && !is_string)) {
         free(name);
         free(is_string);
         return anthropic_tool_stream_fail(ts);
     }
-    bool string_value = !strcmp(is_string, "true");
-    bool ok = anthropic_tool_emit_param_prefix(fd, st, name, string_value);
-    free(name);
+    bool string_value;
+    bool defer;
+    if (inline_names) {
+        const char *type = tool_schema_param_type(&r->tool_orders,
+                                                  ts->invoke_name, name);
+        string_value = type && !strcmp(type, "string");
+        defer = !string_value;
+    } else {
+        string_value = !strcmp(is_string, "true");
+        defer = false;
+    }
+    bool ok = defer ? true
+                    : anthropic_tool_emit_param_prefix(fd, st, name, string_value);
     free(is_string);
-    if (!ok) return false;
+    if (!ok) {
+        free(name);
+        return false;
+    }
 
+    free(ts->param_name);
+    ts->param_name = name;
     ts->param_is_string = string_value;
+    ts->param_defer = defer;
+    ts->param_trim_lead = ts->syn && ts->syn->raw_values;
     ts->parse_pos = (size_t)(tag_end - raw) + 1;
+    ts->param_value_start = ts->parse_pos;
     ts->state = DSML_TOOL_PARAM_VALUE;
     return true;
+}
+
+/* See openai_tool_emit_deferred_param. */
+static bool anthropic_tool_emit_deferred_param(int fd, anthropic_stream *st,
+                                               const char *raw, size_t value_end) {
+    anthropic_tool_stream *ts = &st->tool;
+    size_t start = ts->param_value_start;
+    if (value_end < start) value_end = start;
+    char *value = xstrndup(raw + start, value_end - start);
+    const bool literal = qwen_param_value_is_json_literal(value);
+    bool ok = anthropic_tool_emit_param_prefix(fd, st, ts->param_name, !literal);
+    if (ok) {
+        if (literal) {
+            ok = anthropic_tool_emit_args_fragment(fd, st, value, strlen(value));
+        } else {
+            buf frag = {0};
+            json_escape_fragment_n(&frag, value, strlen(value));
+            ok = anthropic_tool_emit_args_fragment(fd, st,
+                                                   frag.ptr ? frag.ptr : "", frag.len);
+            buf_free(&frag);
+            if (ok) ok = anthropic_tool_emit_args_fragment(fd, st, "\"", 1);
+        }
+    }
+    free(value);
+    return ok;
 }
 
 static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
                                         const char *raw, size_t value_end) {
     anthropic_tool_stream *ts = &st->tool;
+    const size_t close = value_end;
+    if (ts->syn && ts->syn->raw_values &&
+        value_end > ts->parse_pos && raw[value_end - 1] == '\n') value_end--;
+    if (ts->param_defer) {
+        if (!anthropic_tool_emit_deferred_param(fd, st, raw, value_end)) return false;
+        ts->parse_pos = close + strlen(ts->syn->param_end);
+        ts->state = DSML_TOOL_BETWEEN_PARAMS;
+        return true;
+    }
     if (value_end > ts->parse_pos) {
         bool ok = ts->param_is_string ?
             anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
@@ -9192,13 +9768,13 @@ static bool anthropic_tool_finish_param(int fd, anthropic_stream *st,
     }
     if (ts->param_is_string &&
         !anthropic_tool_emit_args_fragment(fd, st, "\"", 1)) return false;
-    ts->parse_pos = value_end + strlen(ts->syn->param_end);
+    ts->parse_pos = close + strlen(ts->syn->param_end);
     ts->state = DSML_TOOL_BETWEEN_PARAMS;
     return true;
 }
 
-static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
-                                         anthropic_stream *st,
+static bool anthropic_tool_stream_update(int fd, server *s, const request *r,
+                                         const char *id, anthropic_stream *st,
                                          const char *raw, size_t raw_len) {
     anthropic_tool_stream *ts = &st->tool;
     while (ts->active && ts->parse_pos < raw_len) {
@@ -9241,7 +9817,7 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
             if (raw_full_lit(raw, raw_len, ts->parse_pos, ts->syn->param_start)) {
                 size_t before_pos = ts->parse_pos;
                 dsml_tool_stream_state before_state = ts->state;
-                if (!anthropic_tool_start_param(fd, st, raw, raw_len)) return false;
+                if (!anthropic_tool_start_param(fd, r, st, raw, raw_len)) return false;
                 if (ts->parse_pos == before_pos && ts->state == before_state) return true;
                 continue;
             }
@@ -9249,6 +9825,12 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
         }
 
         if (ts->state == DSML_TOOL_PARAM_VALUE) {
+            const bool raw_values = ts->syn && ts->syn->raw_values;
+            if (ts->param_trim_lead && ts->parse_pos < raw_len) {
+                if (raw[ts->parse_pos] == '\n') ts->parse_pos++;
+                ts->param_value_start = ts->parse_pos;
+                ts->param_trim_lead = false;
+            }
             const char *end = find_lit_bounded(raw + ts->parse_pos,
                                                raw_len - ts->parse_pos,
                                                ts->syn->param_end);
@@ -9257,10 +9839,14 @@ static bool anthropic_tool_stream_update(int fd, server *s, const char *id,
                                                  (size_t)(end - raw))) return false;
                 continue;
             }
+            if (ts->param_defer) return true;
             size_t limit = tool_param_value_stream_safe_len(raw, ts->parse_pos,
                                                             raw_len,
                                                             ts->syn->param_end,
-                                                            ts->param_is_string);
+                                                            ts->param_is_string &&
+                                                            !raw_values);
+            /* Hold back what may still turn out to be the framing newline. */
+            if (raw_values && limit > ts->parse_pos && raw[limit - 1] == '\n') limit--;
             if (limit > ts->parse_pos) {
                 bool ok = ts->param_is_string ?
                     anthropic_tool_emit_string_value(fd, st, raw + ts->parse_pos,
@@ -9447,7 +10033,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
     }
 
     if (st->mode == ANTH_STREAM_TOOL) {
-        if (!anthropic_tool_stream_update(fd, s, id, st, raw, raw_len)) return false;
+        if (!anthropic_tool_stream_update(fd, s, r, id, st, raw, raw_len)) return false;
         if (!st->tool.active) st->mode = ANTH_STREAM_SUPPRESS;
     }
     return true;
@@ -10315,6 +10901,21 @@ static void apply_openai_stream_tool_ids(tool_calls *calls,
     for (int i = 0; i < n; i++) {
         if (calls->v[i].id && calls->v[i].id[0]) continue;
         if (st->tool.ids[i] && st->tool.ids[i][0]) calls->v[i].id = xstrdup(st->tool.ids[i]);
+    }
+}
+
+/* The call_id the live projection already put on the wire has to become the
+ * parsed call's id, or the next tool_result would name an id the client never
+ * saw. */
+static void apply_responses_stream_tool_ids(tool_calls *calls,
+                                            const responses_stream *st) {
+    if (!calls || !st || !st->tool.emitted_any) return;
+    int n = calls->len < st->tool.items_len ? calls->len : st->tool.items_len;
+    for (int i = 0; i < n; i++) {
+        if (calls->v[i].id) continue;
+        if (st->tool.items[i].call_id[0]) {
+            calls->v[i].id = xstrdup(st->tool.items[i].call_id);
+        }
     }
 }
 
@@ -14275,6 +14876,8 @@ decode_again:
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             if (j->req.api == API_ANTHROPIC && j->req.stream)
                 apply_anthropic_stream_tool_ids(&parsed_calls, &anthropic_live);
+            if (responses_live_chat)
+                apply_responses_stream_tool_ids(&parsed_calls, &responses_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
@@ -17128,6 +17731,216 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&calls);
+    openai_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* The qwen block ds4 renders for qwen4exp has to stream like every other
+ * syntax: a schema-declared string parameter -- a whole file body in one
+ * write -- must reach the client as it is sampled, not in a single delta after
+ * minutes of silence on the socket. */
+static tool_schema_orders make_write_order(void) {
+    tool_schema_orders orders = {0};
+    tool_schema_orders_add_json(&orders,
+        "{\"name\":\"write\",\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"path\":{\"type\":\"string\"},"
+        "\"content\":{\"type\":\"string\"}}}}");
+    return orders;
+}
+
+/* The Anthropic projection streams the same qwen block as input_json_delta,
+ * and a parameter the schema leaves untyped is held back until its closing
+ * tag and then typed the way the final parser types it. */
+static void test_anthropic_qwen_tool_stream_sends_live_tool_use(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_ANTHROPIC;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_write_order();
+
+    anthropic_stream st;
+    TEST_ASSERT(anthropic_sse_start_live(sv[0], &r, "msg_qwen_tool", 7, &st));
+
+    const char *raw =
+        "Before.\n\n"
+        "<tool_call>\n<function=write>\n"
+        "<parameter=content>\n# shisu";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_qwen_tool", &st,
+                                            raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        "<tool_call>\n<function=write>\n"
+        "<parameter=content>\n# shisu plan\n</parameter>\n"
+        "<parameter=retries>\n2\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(anthropic_sse_stream_update(sv[0], NULL, &r, "msg_qwen_tool", &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    TEST_ASSERT(strstr(out, "\"name\":\"write\"") != NULL);
+    const char *partial = strstr(out, "# shisu");
+    const char *rest = strstr(out, " plan");
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(partial < rest);
+    /* Untyped and numeric: held to the close, then emitted unquoted. */
+    TEST_ASSERT(strstr(out, "retries") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"retries\\\":") != NULL);
+    TEST_ASSERT(strstr(out, "\\\"retries\\\":\\\"") == NULL);
+    /* The framing newlines around a value are not part of it. */
+    TEST_ASSERT(strstr(out, "shisu plan\\n") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+
+    free(out);
+    anthropic_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* Responses is the protocol an agent harness drives, and the one that used to
+ * send a single delta once the call closed.  A file body must arrive as
+ * function_call_arguments.delta while it is being sampled. */
+static void test_responses_qwen_tool_stream_sends_partial_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_RESPONSES;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_write_order();
+
+    responses_stream st;
+    responses_stream_init(&r, &st);
+    st.active = true;
+
+    const char *raw =
+        "Before.\n\n"
+        "<tool_call>\n<function=write>\n"
+        "<parameter=path>\ndocs/plan.md\n</parameter>\n"
+        "<parameter=content>\n# shisu";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st, raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        "<tool_call>\n<function=write>\n"
+        "<parameter=path>\ndocs/plan.md\n</parameter>\n"
+        "<parameter=content>\n# shisu plan\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(responses_sse_stream_update(sv[0], &r, &st,
+                                            raw_complete, strlen(raw_complete), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* The item opens with the name before any argument byte is known. */
+    const char *added = strstr(out, "\"type\":\"response.output_item.added\"");
+    const char *fn = strstr(out, "\"name\":\"write\"");
+    const char *first = strstr(out, "\"response.function_call_arguments.delta\"");
+    const char *partial = strstr(out, "# shisu");
+    const char *rest = strstr(out, " plan");
+    const char *done = strstr(out, "\"response.function_call_arguments.done\"");
+    TEST_ASSERT(added != NULL);
+    TEST_ASSERT(fn != NULL);
+    TEST_ASSERT(first != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(done != NULL);
+    TEST_ASSERT(added < first);
+    TEST_ASSERT(first < partial);
+    TEST_ASSERT(partial < rest);
+    /* The body streamed before the call closed -- the whole point. */
+    TEST_ASSERT(rest < done);
+    TEST_ASSERT(strstr(out, "\"type\":\"response.output_item.done\"") != NULL);
+    /* Raw protocol bytes never reach the client. */
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
+    responses_stream_free(&st);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_openai_qwen_tool_stream_sends_partial_arguments(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.stream = true;
+    r.think_mode = DS4_THINK_NONE;
+    r.has_tools = true;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.tool_orders = make_write_order();
+
+    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_qwen_tool", NULL, NULL));
+
+    openai_stream st;
+    openai_stream_start(&r, &st);
+    const char *raw =
+        "Before.\n\n"
+        "<tool_call>\n<function=write>\n"
+        "<parameter=path>\ndocs/plan.md\n</parameter>\n"
+        "<parameter=content>\n# shisu";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                         raw, strlen(raw), false));
+
+    const char *raw_complete =
+        "Before.\n\n"
+        "<tool_call>\n<function=write>\n"
+        "<parameter=path>\ndocs/plan.md\n</parameter>\n"
+        "<parameter=content>\n# shisu plan\n</parameter>\n"
+        "</function>\n</tool_call>";
+    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_qwen_tool", &st,
+                                         raw_complete, strlen(raw_complete), false));
+
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+
+    /* The name, then the file body in two deltas -- the second could only be
+     * sent because the first went out before the value was complete. */
+    const char *name = strstr(out, "\"name\":\"write\"");
+    /* Key and value land in different deltas -- that is the point. */
+    const char *path = strstr(out, "\\\"path\\\":\\\"");
+    const char *path_value = strstr(out, "docs/plan.md");
+    const char *partial = strstr(out, "\"arguments\":\"# shisu\"");
+    const char *rest = strstr(out, "\"arguments\":\" plan\"");
+    TEST_ASSERT(name != NULL);
+    TEST_ASSERT(path != NULL);
+    TEST_ASSERT(partial != NULL);
+    TEST_ASSERT(rest != NULL);
+    TEST_ASSERT(path_value != NULL);
+    TEST_ASSERT(name < path);
+    TEST_ASSERT(path < path_value);
+    TEST_ASSERT(path_value < partial);
+    TEST_ASSERT(partial < rest);
+    /* Raw protocol bytes never reach the client. */
+    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
+    TEST_ASSERT(strstr(out, "<parameter=") == NULL);
+
+    free(out);
     openai_stream_free(&st);
     request_free(&r);
     close(sv[0]);
@@ -21482,6 +22295,9 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
+    test_openai_qwen_tool_stream_sends_partial_arguments();
+    test_responses_qwen_tool_stream_sends_partial_arguments();
+    test_anthropic_qwen_tool_stream_sends_live_tool_use();
     test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
