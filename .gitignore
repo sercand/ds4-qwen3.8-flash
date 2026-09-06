@@ -49,3 +49,4 @@ __pycache__/
 .*.swp
 .DS_Store
 /.worktrees/
+docs/superpowers/plans/
