@@ -190,6 +190,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
             opt(fp, c, "--mtp", "Enable model-embedded MTP speculation.");
             opt(fp, c, "--mtp-model FILE", "External MTP or DSpark support GGUF.");
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
+            opt(fp, c, "--mtp-vocab FILE", "qwen4exp: token-frequency file; drafts over the most frequent vocabulary blocks only.");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
             opt(fp, c, "--mtp-timing", "Enable embedded MTP and print acceptance/timing counters.");
             opt(fp, c, "--dspark", "Enable DSpark using the support GGUF passed with --mtp-model.");

@@ -39290,6 +39290,24 @@ typedef struct {
 typedef struct q4e_cache q4e_cache;
 typedef struct ds4_q4e_graph ds4_q4e_graph;
 
+/* Reduced-vocabulary drafting (--mtp-vocab).  The MTP draft is greedy, so
+ * only the argmax of its vocabulary projection matters, and most of the
+ * 248k rows never win it.  The head is sliced to the 128-row blocks that
+ * carry most of a corpus's token mass -- blocks, not rows, because the EXL3
+ * output Hadamard couples every 128 consecutive rows -- and the draft
+ * projects through the slice, mapping the argmax back to a vocabulary id.
+ * The target verifies every draft against its own full head, so a token
+ * outside the slice is a draft that is never proposed, never a wrong token.
+ * Built lazily on the first draft, once the head's weights are resident. */
+typedef struct {
+    char       *path;        /* the frequency file (gguf-tools/qwen4exp_draft_vocab.py) */
+    int32_t    *ids;         /* sliced row -> vocabulary id */
+    uint32_t    n_sel;
+    void       *dev;         /* device payload for ds4_gpu_q4e_exl3_matmul_dev */
+    uint32_t    bits;
+    bool        failed;      /* declined or failed: draft through the full head */
+} ds4_q4e_head_slice;
+
 struct ds4_engine {
     ds4_model model;
     ds4_model mtp_model;
@@ -39298,6 +39316,7 @@ struct ds4_engine {
     ds4_weights weights;
     ds4_mtp_weights mtp_weights;
     ds4_q4e_mtp_weights q4e_mtp_weights;
+    ds4_q4e_head_slice q4e_head_slice;
     ds4_dspark_weights dspark_weights;
 #ifndef DS4_NO_GPU
     ds4_glm53_vision_weights vision_weights;
@@ -39937,10 +39956,52 @@ static glm4_char_info glm4_char_at(const char *s, uint64_t len, uint64_t pos) {
     return info;
 }
 
+/* qwen35's classes, exactly as the checkpoint's `regex`-based pre-tokenizer
+ * defines them (ds4_qwen4exp_unicode.inc): \p{L} and \p{M} both extend a
+ * letter run, \p{N} is every Unicode number (superscripts, fractions, roman
+ * numerals included, one per piece), \s the regex module's space set.  The
+ * hand-written GLM approximation above misfiles those, and a wrong split does
+ * not crash -- the model just sees a stream it was never trained on. */
+#include "ds4_qwen4exp_unicode.inc"
+#include "ds4_nfc.inc"
+
+static bool q4e_urange_has(const q4e_urange *r, size_t n, uint32_t cp) {
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        const size_t mid = (lo + hi) / 2;
+        if (cp < r[mid].lo) hi = mid;
+        else if (cp > r[mid].hi) lo = mid + 1;
+        else return true;
+    }
+    return false;
+}
+#define Q4E_UCLASS(name_, cp_) \
+    q4e_urange_has(q4e_##name_##_ranges, sizeof(q4e_##name_##_ranges) / sizeof(q4e_urange), (cp_))
+
+static glm4_char_info q4e_char_at(const char *s, uint64_t len, uint64_t pos) {
+    glm4_char_info info;
+    memset(&info, 0, sizeof(info));
+    if (pos >= len) return info;
+    info.valid = true;
+    info.cp = utf8_peek_one(s, len, pos, &info.next);
+    if (info.cp < 128) {
+        info.is_whitespace = ascii_space((uint8_t)info.cp);
+        info.is_number = ascii_digit((uint8_t)info.cp);
+        info.is_letter = ascii_alpha((uint8_t)info.cp);
+        return info;
+    }
+    info.is_whitespace = Q4E_UCLASS(space, info.cp);
+    info.is_number = Q4E_UCLASS(number, info.cp);
+    info.is_letter = Q4E_UCLASS(letter, info.cp) || Q4E_UCLASS(mark, info.cp);
+    return info;
+}
+
 static uint32_t ascii_tolower_cp(uint32_t cp) {
     if (cp >= 'A' && cp <= 'Z') return cp + ('a' - 'A');
     return cp;
 }
+
+typedef glm4_char_info (*bpe_char_classifier)(const char *s, uint64_t len, uint64_t pos);
 
 /* The llama3-style pre-tokenization shape, shared by two of the three
  * families here:
@@ -39956,18 +40017,19 @@ static uint32_t ascii_tolower_cp(uint32_t cp) {
  * digit per piece.  That single difference is the whole reason this is
  * parameterized rather than copied. */
 static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *text,
-                                          token_vec *out, int max_digit_run) {
+                                          token_vec *out, int max_digit_run,
+                                          bpe_char_classifier at) {
     const uint64_t len = strlen(text);
     uint64_t pos = 0;
 
     while (pos < len) {
         uint64_t start = pos;
-        glm4_char_info cur = glm4_char_at(text, len, pos);
+        glm4_char_info cur = at(text, len, pos);
 
         if (!cur.valid) break;
 
         if (cur.cp == '\'' && cur.next < len) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
+            glm4_char_info next = at(text, len, cur.next);
             uint32_t n1 = ascii_tolower_cp(next.cp);
             if (n1 == 's' || n1 == 't' || n1 == 'm' || n1 == 'd') {
                 pos = next.next;
@@ -39975,7 +40037,7 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
                 continue;
             }
             if (next.valid && next.next < len) {
-                glm4_char_info next2 = glm4_char_at(text, len, next.next);
+                glm4_char_info next2 = at(text, len, next.next);
                 uint32_t n2 = ascii_tolower_cp(next2.cp);
                 if ((n1 == 'r' && n2 == 'e') ||
                     (n1 == 'v' && n2 == 'e') ||
@@ -39988,11 +40050,11 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
         }
 
         if (!(cur.cp == '\r' || cur.cp == '\n' || cur.is_number)) {
-            glm4_char_info next = glm4_char_at(text, len, cur.next);
+            glm4_char_info next = at(text, len, cur.next);
             if (cur.is_letter || next.is_letter) {
                 pos = cur.next;
                 while (pos < len) {
-                    glm4_char_info scan = glm4_char_at(text, len, pos);
+                    glm4_char_info scan = at(text, len, pos);
                     if (!scan.valid || !scan.is_letter) break;
                     pos = scan.next;
                 }
@@ -40004,7 +40066,7 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
         if (cur.is_number) {
             int ndigits = 0;
             while (pos < len && ndigits < max_digit_run) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
+                glm4_char_info scan = at(text, len, pos);
                 if (!scan.valid || !scan.is_number) break;
                 pos = scan.next;
                 ndigits++;
@@ -40017,7 +40079,7 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
         uint64_t punct_pos = pos;
         if (cur.cp == ' ') {
             punct_pos = cur.next;
-            punct = glm4_char_at(text, len, punct_pos);
+            punct = at(text, len, punct_pos);
         }
         if (punct.valid &&
             !punct.is_whitespace &&
@@ -40025,7 +40087,7 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
             !punct.is_number) {
             pos = punct_pos;
             while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
+                glm4_char_info scan = at(text, len, pos);
                 if (!scan.valid ||
                     scan.is_whitespace ||
                     scan.is_letter ||
@@ -40035,7 +40097,7 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
                 pos = scan.next;
             }
             while (pos < len) {
-                glm4_char_info scan = glm4_char_at(text, len, pos);
+                glm4_char_info scan = at(text, len, pos);
                 if (!scan.valid || !(scan.cp == '\r' || scan.cp == '\n')) break;
                 pos = scan.next;
             }
@@ -40049,7 +40111,7 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
             uint64_t last_ws_start = pos;
             int nspace = 0;
             while (p < len) {
-                glm4_char_info scan = glm4_char_at(text, len, p);
+                glm4_char_info scan = at(text, len, p);
                 if (!scan.valid || !scan.is_whitespace) break;
                 last_ws_start = p;
                 if (scan.cp == '\r' || scan.cp == '\n') last_newline_end = scan.next;
@@ -40093,14 +40155,19 @@ static void bpe_tokenize_text_llama3_like(const ds4_vocab *vocab, const char *te
  */
 static void bpe_tokenize_text(const ds4_vocab *vocab, const char *text, token_vec *out) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {
-        bpe_tokenize_text_llama3_like(vocab, text, out, 3);
+        bpe_tokenize_text_llama3_like(vocab, text, out, 3, glm4_char_at);
         return;
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_QWEN4EXP) {
         /* tokenizer.ggml.pre = "qwen35": the glm4 shape with one digit per
-         * piece.  Feeding this model the JoyAI split below instead silently
+         * piece and the exact Unicode classes, on NFC-normalized text -- the
+         * checkpoint's tokenizer.json declares an NFC normalizer ahead of its
+         * regex.  Feeding this model the JoyAI split below instead silently
          * changes the token stream for every number and contraction. */
-        bpe_tokenize_text_llama3_like(vocab, text, out, 1);
+        uint64_t nlen = 0;
+        char *nfc = nfc_normalize(text, strlen(text), &nlen);
+        bpe_tokenize_text_llama3_like(vocab, nfc ? nfc : text, out, 1, q4e_char_at);
+        free(nfc);
         return;
     }
 
@@ -55739,6 +55806,10 @@ struct ds4_q4e_graph {
     ds4_gpu_tensor *embed;
     ds4_gpu_tensor *res;
     ds4_gpu_tensor *xn;
+    /* xn and up are stored as fp16 when every hyper-connection GEMM they feed
+     * is an fp16 tensor (EXL3 repack); see q4e_hc_weights_f16.  The residual
+     * `res` is fp32 either way. */
+    bool hc_f16;
     ds4_gpu_tensor *lora;
     ds4_gpu_tensor *up;
     ds4_gpu_tensor *mixed;
@@ -65753,6 +65824,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         opt->mtp_path,
                         e->q4e_mtp_weights.eh_split ? "shared nextn" : "sidecar",
                         e->mtp_draft_tokens);
+                if (opt->mtp_vocab_path && opt->mtp_vocab_path[0]) {
+                    e->q4e_head_slice.path = strdup(opt->mtp_vocab_path);
+                }
             }
         } else if (e->support_kind == DS4_SUPPORT_DSPARK) {
             dspark_weights_bind_optional(&e->dspark_weights,
@@ -66928,6 +67002,12 @@ void ds4_engine_close(ds4_engine *e) {
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
+#ifndef DS4_NO_GPU
+    if (e->q4e_head_slice.dev) ds4_gpu_q4e_head_slice_free(e->q4e_head_slice.dev);
+#endif
+    free(e->q4e_head_slice.ids);
+    free(e->q4e_head_slice.path);
+    memset(&e->q4e_head_slice, 0, sizeof(e->q4e_head_slice));
     if (e->q4e_mtp_weights.eh_split) {
         munmap(e->q4e_mtp_weights.eh_split, (size_t)e->q4e_mtp_weights.eh_split_bytes);
         e->q4e_mtp_weights.eh_split = NULL;
@@ -68389,6 +68469,33 @@ static void q4e_scratch_free(ds4_engine *e) {
  * the graph test create theirs one after another -- so the first-caller check
  * above cannot race.  A future caller that creates sessions concurrently must
  * serialize this (and q4e_cache_open, which has the same shape). */
+/* The normed residual xn is read by the hyper-connection down and inject
+ * GEMMs and by the stream mix; up by the mix alone.  When those GEMMs are fp16
+ * tensors they convert xn to fp16 anyway, so holding xn and up as fp16 costs
+ * nothing the model does not already pay and halves the widest traffic of an
+ * island (2048 tokens x 40 KiB per pass).  Quantized hyper-connection weights
+ * (the UD-Q4_K_XL GGUF) keep the fp32 buffers and the generic dispatch. */
+static bool q4e_hc_weights_f16(const ds4_engine *e) {
+    const ds4_weights *w = &e->weights;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (l->hc_attn_down->type != DS4_TENSOR_F16 || l->hc_attn_up->type != DS4_TENSOR_F16 ||
+            l->hc_attn_inject->type != DS4_TENSOR_F16 || l->hc_ffn_down->type != DS4_TENSOR_F16 ||
+            l->hc_ffn_up->type != DS4_TENSOR_F16 || l->hc_ffn_inject->type != DS4_TENSOR_F16) return false;
+    }
+    if (!w->output_mix_down || !w->output_mix_up ||
+        w->output_mix_down->type != DS4_TENSOR_F16 || w->output_mix_up->type != DS4_TENSOR_F16) return false;
+    if (e->mtp_ready && e->support_kind == DS4_SUPPORT_QWEN4EXP_MTP && e->q4e_mtp_weights.ready) {
+        const ds4_q4e_mtp_weights *mw = &e->q4e_mtp_weights;
+        const ds4_layer_weights *l = &mw->block;
+        if (l->hc_attn_down->type != DS4_TENSOR_F16 || l->hc_attn_up->type != DS4_TENSOR_F16 ||
+            l->hc_attn_inject->type != DS4_TENSOR_F16 || l->hc_ffn_down->type != DS4_TENSOR_F16 ||
+            l->hc_ffn_up->type != DS4_TENSOR_F16 || l->hc_ffn_inject->type != DS4_TENSOR_F16 ||
+            mw->hc_down->type != DS4_TENSOR_F16 || mw->hc_up->type != DS4_TENSOR_F16) return false;
+    }
+    return getenv("DS4_QWEN4EXP_HC_F32") == NULL;
+}
+
 static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     if (e->q4e_scratch) {
         if (ctx_size > e->q4e_scratch->ctx_size) {
@@ -68473,6 +68580,7 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
     g->logit_rows = 1u + g->spec_k;
     if (g->logit_rows < Q4E_CTX_MAX) g->logit_rows = Q4E_CTX_MAX;
     g->mtp_ready = mtp;      /* the scratch's copy: what it allocated for */
+    g->hc_f16 = q4e_hc_weights_f16(e);
 
     qwen4exp_ple_params(&g->ple_params, &e->model, e->weights.ple_table, e->weights.ple_bias);
     g->ple_bias_offset = e->weights.ple_bias ? e->weights.ple_bias->abs_offset : 0u;
@@ -68972,6 +69080,22 @@ static int q4e_hc_mix(ds4_q4e_graph *g, const ds4_model *m,
     /* `norm` NULL means the residual update that closed the previous block
      * already produced this mix's normed input in the same pass over the
      * residual (see the island chain below). */
+    if (g->hc_f16) {
+        /* xn and up in fp16: the GEMMs read and write them without the
+         * conversion passes the generic path makes (q4e_hc_weights_f16). */
+        if (norm && !ds4_gpu_q4e_hc_norm_f16(g->xn, g->res, m->map, m->size, norm->abs_offset,
+                                             DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
+        if (!ds4_gpu_q4e_matmul_f16_xh(g->lora, m->map, m->size, down->abs_offset,
+                                       down->dim[0], down->dim[1], g->xn, n_tok)) return 0;
+        if (!ds4_gpu_q4e_scale_silu(g->lora, 1.0f / (float)DS4_N_HC,
+                                    (uint64_t)n_tok * DS4_N_HC_LOWRANK)) return 0;
+        if (!ds4_gpu_q4e_matmul_f16_oh(g->up, m->map, m->size, up->abs_offset,
+                                       up->dim[0], up->dim[1], g->lora, n_tok)) return 0;
+        if (!ds4_gpu_q4e_hc_collapse_f16(g->mixed, g->xn, g->up, DS4_N_EMBD, DS4_N_HC, n_tok)) return 0;
+        if (!inject) return 1;
+        return ds4_gpu_q4e_matmul_f16_xh(g->inject, m->map, m->size, inject->abs_offset,
+                                         inject->dim[0], inject->dim[1], g->xn, n_tok);
+    }
     if (norm && !ds4_gpu_q4e_hc_norm(g->xn, g->res, m->map, m->size, norm->abs_offset,
                                      DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
     if (!q4e_matmul(g->lora, m, down, g->xn, n_tok)) return 0;
@@ -69517,8 +69641,7 @@ static int q4e_encode_attn_island(ds4_q4e_graph *g, const ds4_model *m,
     t = q4e_phase_begin();
     if (!ds4_gpu_q4e_hc_combine(g->res, g->xn, g->blk_out, g->inject,
                                 m->map, m->size,
-                                next_norm ? next_norm->abs_offset : 0u,
-                                next_norm != NULL,
+                                next_norm ? next_norm->abs_offset : 0u, next_norm != NULL, g->hc_f16 ? 1 : 0,
                                 DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
     q4e_phase_end(Q4E_PH_HC_COMBINE, t);
     q4e_trace("hc_combine", (int)il, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
@@ -69541,8 +69664,7 @@ static int q4e_encode_ffn_island(ds4_q4e_graph *g, const ds4_model *m,
     t = q4e_phase_begin();
     if (!ds4_gpu_q4e_hc_combine(g->res, g->xn, g->blk_out, g->inject,
                                 m->map, m->size,
-                                next_norm ? next_norm->abs_offset : 0u,
-                                next_norm != NULL,
+                                next_norm ? next_norm->abs_offset : 0u, next_norm != NULL, g->hc_f16 ? 1 : 0,
                                 DS4_N_EMBD, DS4_N_HC, n_tok, DS4_RMS_EPS)) return 0;
     q4e_phase_end(Q4E_PH_HC_COMBINE, t);
     q4e_trace("l_last", (int)il, g->res, (uint64_t)n_tok * Q4E_HC_DIM);
@@ -70069,6 +70191,88 @@ static bool q4e_draft_dense_enabled(void) {
     return cached != 0;
 }
 
+/* Slice the draft head; see ds4_q4e_head_slice.  Any failure leaves the
+ * draft on the full head with a note: speculation is an optimization. */
+typedef struct { double mass; uint32_t idx; } q4e_block_mass;
+static int q4e_block_mass_desc(const void *a, const void *b) {
+    const double x = ((const q4e_block_mass *)a)->mass, y = ((const q4e_block_mass *)b)->mass;
+    return x < y ? 1 : (x > y ? -1 : 0);
+}
+static int q4e_u32_asc(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : (x > y ? 1 : 0);
+}
+static void q4e_head_slice_build(ds4_engine *e) {
+    ds4_q4e_head_slice *hs = &e->q4e_head_slice;
+    if (hs->dev || hs->failed || !hs->path) return;
+    hs->failed = true;                       /* until proven otherwise */
+    const ds4_tensor *out = e->weights.output;
+    if (!out || !tensor_type_is_exl3(out->type) || out->ndim < 2 || (out->dim[1] % 128u) != 0u) {
+        fprintf(stderr, "ds4: --mtp-vocab needs an EXL3 vocabulary head in whole 128-row blocks; "
+                        "drafting through the full head\n");
+        return;
+    }
+    const uint32_t n_vocab = (uint32_t)out->dim[1], k = (uint32_t)out->dim[0];
+    const uint32_t n_blocks = n_vocab / 128u;
+    FILE *f = fopen(hs->path, "r");
+    if (!f) {
+        fprintf(stderr, "ds4: --mtp-vocab: cannot open %s\n", hs->path);
+        return;
+    }
+    q4e_block_mass *blocks = xcalloc(n_blocks, sizeof(*blocks));
+    for (uint32_t b = 0; b < n_blocks; b++) blocks[b].idx = b;
+    double total = 0.0;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '#') continue;
+        long id = -1;
+        double c = 1.0;
+        if (sscanf(line, "%ld %lf", &id, &c) < 1 || id < 0 || id >= (long)n_vocab) continue;
+        blocks[id / 128].mass += c;
+        total += c;
+    }
+    fclose(f);
+    const char *env = getenv("DS4_QWEN4EXP_MTP_VOCAB_SIZE");
+    long target = (env && env[0]) ? strtol(env, NULL, 10) : 65536;
+    if (target < 128) target = 128;
+    uint32_t want = (uint32_t)((target + 127) / 128);
+    if (total <= 0.0 || want >= n_blocks) {
+        fprintf(stderr, "ds4: --mtp-vocab: %s selects the whole vocabulary (%u blocks); nothing to slice\n",
+                hs->path, n_blocks);
+        free(blocks);
+        return;
+    }
+    qsort(blocks, n_blocks, sizeof(*blocks), q4e_block_mass_desc);
+    double covered = 0.0;
+    uint32_t *sel = xmalloc((size_t)want * sizeof(uint32_t));
+    for (uint32_t i = 0; i < want; i++) { sel[i] = blocks[i].idx; covered += blocks[i].mass; }
+    free(blocks);
+    qsort(sel, want, sizeof(uint32_t), q4e_u32_asc);
+    const uint32_t n_sel = want * 128u;
+    int32_t *ids = xmalloc((size_t)n_sel * sizeof(int32_t));
+    for (uint32_t i = 0; i < n_sel; i++) ids[i] = (int32_t)(sel[i >> 7] * 128u + (i & 127u));
+    void *dev = NULL;
+    if (!ds4_gpu_q4e_exl3_head_slice(e->model.map, e->model.size, out->abs_offset, out->bytes,
+                                     exl3_type_bits(out->type), k, n_vocab,
+                                     (const int32_t *)sel, want, &dev)) {
+        fprintf(stderr, "ds4: --mtp-vocab: could not build the head slice on the device; "
+                        "drafting through the full head\n");
+        free(sel);
+        free(ids);
+        return;
+    }
+    free(sel);
+    hs->ids = ids;
+    hs->n_sel = n_sel;
+    hs->dev = dev;
+    hs->bits = exl3_type_bits(out->type);
+    hs->failed = false;
+    fprintf(stderr, "ds4: qwen4exp draft head sliced to %u of %u rows (%u blocks of 128, %.2f%% of "
+                    "the corpus mass, %.0f MB of %.0f)\n",
+            n_sel, n_vocab, want, 100.0 * covered / total,
+            (double)((uint64_t)k * n_sel * hs->bits / 8u) / 1e6, (double)out->bytes / 1e6);
+}
+
 /* One draft pass over n rows.  `hidden` is [n, hc * n_embd]: target residual
  * rows on the first step, the previous draft step's residual afterwards.
  * tokens[i] is the token at positions[i] + 1.  When out_logits is set the last
@@ -70153,14 +70357,17 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
      * projection is then the same 2560x2560 matrix on every stream, i.e. a
      * matmul over n * hc rows. */
     q4e_trace("mtp_hidden_in", -1, hidden, (uint64_t)n * Q4E_HC_DIM);
-    if (!ds4_gpu_q4e_hc_norm(g->xn, hidden, mm->map, mm->size,
+    /* Through the PLE block's scratch, not xn/up: those may be fp16
+     * (hc_f16) and this projection wants fp32 in and out; the PLE buffers are
+     * idle whenever the draft runs. */
+    if (!ds4_gpu_q4e_hc_norm(g->ple_q, hidden, mm->map, mm->size,
                              mw->pre_fc_norm_hidden->abs_offset,
                              Q4E_HC_DIM, 1u, n, DS4_RMS_EPS)) return 1;
-    q4e_trace("mtp_hidden_norm", -1, g->xn, (uint64_t)n * Q4E_HC_DIM);
-    if (!q4e_matmul_at(g->up, mw->fc_map, mw->fc_map_size,
-                       mw->fc_hidden, g->xn, n * DS4_N_HC)) return 1;
-    q4e_trace("mtp_fc_hidden", -1, g->up, (uint64_t)n * Q4E_HC_DIM);
-    if (!ds4_gpu_q4e_hc_init_add(d.res, g->mixed, g->up, DS4_N_EMBD, DS4_N_HC, n)) return 1;
+    q4e_trace("mtp_hidden_norm", -1, g->ple_q, (uint64_t)n * Q4E_HC_DIM);
+    if (!q4e_matmul_at(g->ple_gv, mw->fc_map, mw->fc_map_size,
+                       mw->fc_hidden, g->ple_q, n * DS4_N_HC)) return 1;
+    q4e_trace("mtp_fc_hidden", -1, g->ple_gv, (uint64_t)n * Q4E_HC_DIM);
+    if (!ds4_gpu_q4e_hc_init_add(d.res, g->mixed, g->ple_gv, DS4_N_EMBD, DS4_N_HC, n)) return 1;
     q4e_trace("mtp_res_init", -1, d.res, (uint64_t)n * Q4E_HC_DIM);
 
     /* The pending-row flush runs 1 + accepted rows; with verify graphs on,
@@ -70216,17 +70423,26 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     if (!out_argmax) return 0;
 
     /* The collapsing mixer has no inject; the vocabulary head is the
-     * target's, shared with the draft exactly as the embedding is. */
+     * target's, shared with the draft exactly as the embedding is -- or its
+     * slice (ds4_q4e_head_slice), which the trace and dump paths skip because
+     * they want the full logit row. */
     if (!q4e_hc_mix(&d, mm, mw->hc_norm, mw->hc_down, mw->hc_up, NULL, n)) return 1;
     q4e_trace("mtp_result_norm", -1, g->mixed, (uint64_t)n * DS4_N_EMBD);
     ds4_gpu_tensor *last = ds4_gpu_tensor_view(
             g->mixed, (uint64_t)(n - 1u) * DS4_N_EMBD * sizeof(float),
             (uint64_t)DS4_N_EMBD * sizeof(float));
     if (!last) return 1;
-    const int projected = q4e_matmul(d.logits, tm, e->weights.output, last, 1u);
+    ds4_q4e_head_slice *hs = &e->q4e_head_slice;
+    if (hs->path && !hs->dev && !hs->failed && !g->mtp_dump_fp && !q4e_trace_enabled()) {
+        q4e_head_slice_build(e);
+    }
+    const bool sliced = hs->dev && !g->mtp_dump_fp && !q4e_trace_enabled();
+    const int projected = sliced
+        ? ds4_gpu_q4e_exl3_matmul_dev(d.logits, hs->dev, hs->bits, DS4_N_EMBD, hs->n_sel, last, 1u)
+        : q4e_matmul(d.logits, tm, e->weights.output, last, 1u);
     ds4_gpu_tensor_free(last);
     if (!projected) return 1;
-    q4e_trace("mtp_result_output", -1, d.logits, (uint64_t)DS4_N_VOCAB);
+    if (!sliced) q4e_trace("mtp_result_output", -1, d.logits, (uint64_t)DS4_N_VOCAB);
     if (g->mtp_dump_fp) {
         float *lg = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
         (void)ds4_gpu_synchronize();
@@ -70238,10 +70454,11 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
         g->mtp_dump_fp = NULL;
     }
     /* Greedy drafts need the argmax alone: 4 bytes back instead of 1 MB. */
-    if (!ds4_gpu_q4e_argmax_rows(g->argmax_dev, d.logits, DS4_N_VOCAB, 1u)) return 1;
+    if (!ds4_gpu_q4e_argmax_rows(g->argmax_dev, d.logits, sliced ? hs->n_sel : DS4_N_VOCAB, 1u)) return 1;
     if (!ds4_gpu_synchronize()) return 1;
     int32_t pick = -1;
     if (!ds4_gpu_tensor_read(g->argmax_dev, 0, &pick, sizeof(pick))) return 1;
+    if (sliced && pick >= 0 && (uint32_t)pick < hs->n_sel) pick = hs->ids[pick];
     *out_argmax = (int)pick;
     return 0;
 }

@@ -6,6 +6,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ds4_exl3.h"
@@ -14,6 +15,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemm_kernel.cuh"
 #include "exl3_reconstruct.cuh"
 #include "exl3_moe_kernel.cuh"
+#include "exl3_moe_ws.cuh"
 
 /* Only the mul1 codebook (cb 2) and fp32 outputs are instantiated: the
  * qwen4exp checkpoint is mul1 throughout, K = 4 for routed experts and the
@@ -56,6 +58,8 @@ struct exl3_stream_ctx {
     uint64_t     had_halfs;
     uint8_t     *moe;          /* fused MoE staging (prefill only, never captured) */
     uint64_t     moe_bytes;
+    uint8_t     *ws;           /* weight-stationary MoE staging (prefill only) */
+    uint64_t     ws_bytes;
 };
 static exl3_stream_ctx g_ctx[DS4_EXL3_MAX_STREAMS];
 static int g_n_ctx = 0;
@@ -384,4 +388,98 @@ extern "C" int ds4_exl3_moe(const float *x, float *slot_out, uint32_t n_tok, uin
                                                   dim3(group_size, 1, num_groups),
                                                   dim3(DS4_EXL3_MOE_BLOCK_DIM), args, SMEM_MAX, stream),
                       "moe launch");
+}
+
+/* Weight-stationary routed block; see exl3_moe_ws.cuh.  The staging holds the
+ * two fp16 gate/up inputs and the fp16 down input for every assignment row. */
+#define DS4_WS_STAGES 3
+template <int bits>
+static bool exl3_moe_ws_optin(void) {
+    static bool done = false;
+    if (done) return true;
+    if (exl3_fail(cudaFuncSetAttribute((const void *)exl3_moe_ws_gateup<bits, 2, DS4_WS_STAGES>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       WsSmem<bits, true, DS4_WS_STAGES>::total), "moe ws gateup smem") ||
+        exl3_fail(cudaFuncSetAttribute((const void *)exl3_moe_ws_down<bits, 2, DS4_WS_STAGES>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       WsSmem<bits, false, DS4_WS_STAGES>::total), "moe ws down smem"))
+        return false;
+    done = true;
+    return true;
+}
+
+template <int bits>
+static int exl3_moe_ws_launch(const float *x, float *slot_out, uint32_t n_tok, uint32_t hidden, uint32_t inter,
+                              const uint16_t *gt, const half *gs, const half *gv,
+                              const uint16_t *ut, const half *us, const half *uv,
+                              const uint16_t *dt, const half *ds, const half *dv,
+                              const int32_t *bounds, const int32_t *slot_sorted,
+                              uint32_t n_expert, uint32_t n_used, cudaStream_t stream, exl3_stream_ctx *c) {
+    if (!exl3_moe_ws_optin<bits>()) return 0;
+    const uint32_t n_rows = n_tok * n_used;
+    const uint64_t need = (uint64_t)n_rows * (2u * hidden + inter) * sizeof(half);
+    if (c->ws_bytes < need) {
+        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+        (void)cudaStreamIsCapturing(stream, &cap);
+        if (cap != cudaStreamCaptureStatusNone) {
+            fprintf(stderr, "ds4: exl3 moe ws: cannot allocate staging during graph capture\n");
+            return 0;
+        }
+        if (exl3_fail(cudaStreamSynchronize(stream), "moe ws staging drain")) return 0;
+        if (c->ws) (void)cudaFree(c->ws);
+        c->ws = NULL;
+        c->ws_bytes = 0;
+        if (exl3_fail(cudaMalloc((void **)&c->ws, need), "moe ws staging")) return 0;
+        c->ws_bytes = need;
+    }
+    half *a_g = (half *)c->ws;
+    half *a_u = a_g + (size_t)n_rows * hidden;
+    half *act = a_u + (size_t)n_rows * hidden;
+
+    const int prep_tasks = (int)n_rows * (int)(hidden / 128u);
+    exl3_moe_ws_prep<<<(prep_tasks + WS_THREADS / 32 - 1) / (WS_THREADS / 32), WS_THREADS, 0, stream>>>(
+            x, a_g, a_u, gs, us, bounds, slot_sorted, (int)n_rows, (int)n_expert, (int)n_used, (int)hidden);
+    if (exl3_fail(cudaGetLastError(), "moe ws prep")) return 0;
+    /* One block per (expert, tile): a second dimension would share an
+     * expert's passes between blocks, which measured slower (see the header). */
+    const dim3 ggrid(n_expert * (inter / 128u), 1);
+    exl3_moe_ws_gateup<bits, 2, DS4_WS_STAGES><<<ggrid, WS_THREADS, WsSmem<bits, true, DS4_WS_STAGES>::total, stream>>>(
+            a_g, a_u, act, gt, gv, ut, uv, ds, bounds, (int)hidden, (int)inter);
+    if (exl3_fail(cudaGetLastError(), "moe ws gate/up")) return 0;
+    const dim3 dgrid(n_expert * (hidden / 128u), 1);
+    exl3_moe_ws_down<bits, 2, DS4_WS_STAGES><<<dgrid, WS_THREADS, WsSmem<bits, false, DS4_WS_STAGES>::total, stream>>>(
+            act, slot_out, dt, dv, bounds, slot_sorted, (int)hidden, (int)inter);
+    return !exl3_fail(cudaGetLastError(), "moe ws down");
+}
+
+extern "C" int ds4_exl3_moe_ws(const float *x, float *slot_out, uint32_t n_tok, uint32_t hidden, uint32_t inter,
+                               const void *gate_tiles, const void *gate_suh, const void *gate_svh,
+                               const void *up_tiles, const void *up_suh, const void *up_svh,
+                               const void *down_tiles, const void *down_suh, const void *down_svh,
+                               uint32_t bits, const int32_t *expert_bounds, const int32_t *slot_sorted,
+                               uint32_t n_expert, uint32_t n_used, cudaStream_t stream) {
+    if (!x || !slot_out || !gate_tiles || !gate_suh || !gate_svh || !up_tiles || !up_suh || !up_svh ||
+        !down_tiles || !down_suh || !down_svh || !expert_bounds || !slot_sorted ||
+        n_tok == 0 || n_expert == 0 || n_used == 0) return 0;
+    /* K in 64-wide stages, N in 128-wide tiles, on both projections' shapes. */
+    if (!exl3_check_shape(hidden, inter, bits, "moe ws") || (hidden % 128u) != 0u || (inter % 64u) != 0u) {
+        fprintf(stderr, "ds4: exl3 moe ws: unsupported shape hidden=%u inter=%u\n", hidden, inter);
+        return 0;
+    }
+    exl3_stream_ctx *c = exl3_ctx(stream, 0);
+    if (!c) return 0;
+    const uint16_t *gt = (const uint16_t *)gate_tiles, *ut = (const uint16_t *)up_tiles,
+                   *dt = (const uint16_t *)down_tiles;
+    const half *gs = (const half *)gate_suh, *gv = (const half *)gate_svh,
+               *us = (const half *)up_suh, *uv = (const half *)up_svh,
+               *ds = (const half *)down_suh, *dv = (const half *)down_svh;
+    switch (bits) {
+    case 4: return exl3_moe_ws_launch<4>(x, slot_out, n_tok, hidden, inter, gt, gs, gv, ut, us, uv, dt, ds, dv,
+                                         expert_bounds, slot_sorted, n_expert, n_used, stream, c);
+    case 5: return exl3_moe_ws_launch<5>(x, slot_out, n_tok, hidden, inter, gt, gs, gv, ut, us, uv, dt, ds, dv,
+                                         expert_bounds, slot_sorted, n_expert, n_used, stream, c);
+    case 6: return exl3_moe_ws_launch<6>(x, slot_out, n_tok, hidden, inter, gt, gs, gv, ut, us, uv, dt, ds, dv,
+                                         expert_bounds, slot_sorted, n_expert, n_used, stream, c);
+    default: return 0;
+    }
 }

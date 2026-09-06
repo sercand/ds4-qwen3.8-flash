@@ -64,6 +64,19 @@ int ds4_exl3_moe(const float *x, float *slot_out, uint32_t n_tok, uint32_t hidde
                  uint32_t bits, const int32_t *expert_bounds, const int32_t *slot_sorted,
                  uint32_t n_expert, uint32_t n_used, cudaStream_t stream);
 
+/* The same routed block as ds4_exl3_moe, weight-stationary: three ordinary
+ * launches (input prep, gate+up with the fused SiLU epilogue, down) where each
+ * block owns one (expert, 128-column tile) and decodes every weight once per
+ * 64 rows of that expert instead of once per 16.  Same inputs, same per-slot
+ * output layout; the staging (fp16 gate/up inputs and down input, sized by
+ * n_tok * n_used rows) lives beside the fused kernel's on the stream. */
+int ds4_exl3_moe_ws(const float *x, float *slot_out, uint32_t n_tok, uint32_t hidden, uint32_t inter,
+                    const void *gate_tiles, const void *gate_suh, const void *gate_svh,
+                    const void *up_tiles, const void *up_suh, const void *up_svh,
+                    const void *down_tiles, const void *down_suh, const void *down_svh,
+                    uint32_t bits, const int32_t *expert_bounds, const int32_t *slot_sorted,
+                    uint32_t n_expert, uint32_t n_used, cudaStream_t stream);
+
 /* Expand a trellis tensor to fp16 W[k][n] in the original basis
  * (diag(suh) . H128 . W_hat . H128 . diag(svh)), so that y = x @ W on the raw
  * activations equals ds4_exl3_gemm up to fp16 rounding.  For prefill: past a

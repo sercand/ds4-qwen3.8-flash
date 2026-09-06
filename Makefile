@@ -306,7 +306,7 @@ test-mxfp4-cuda: tests/test_mxfp4_cuda
 	./tests/test_mxfp4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_ple_stream.h ds4_distributed.h ds4_gpu.h ds4_q4e_page.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_ple_stream.h ds4_distributed.h ds4_gpu.h ds4_q4e_page.h ds4_qwen4exp_unicode.inc ds4_nfc.inc ds4_unicode_nfc.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -380,7 +380,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_ple_stream.h ds4_distributed.h ds4_gpu.h ds4_q4e_page.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_ple_stream.h ds4_distributed.h ds4_gpu.h ds4_q4e_page.h ds4_qwen4exp_unicode.inc ds4_nfc.inc ds4_unicode_nfc.inc
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -462,7 +462,7 @@ ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_glm53_vision_gpu.cuh ds4_qw
 
 # EXL3 GEMM kernels: cooperative-launch templates over K = 4, 5, 6 and four
 # tile shapes, in their own TU like the mmq pieces.
-cuda/exl3/ds4_exl3.o: cuda/exl3/ds4_exl3.cu cuda/exl3/ds4_exl3.h cuda/exl3/exl3_gemm_kernel.cuh cuda/exl3/exl3_reconstruct.cuh cuda/exl3/exl3_moe_kernel.cuh cuda/exl3/exl3_moe_common.cuh cuda/exl3/exl3_gemm_inner.cuh cuda/exl3/exl3_dq.cuh cuda/exl3/codebook.cuh cuda/exl3/hadamard_inner.cuh cuda/exl3/exl3_kernel_map.cuh cuda/exl3/exl3_devctx.cuh cuda/exl3/ptx.cuh cuda/exl3/util.cuh cuda/exl3/compat.cuh
+cuda/exl3/ds4_exl3.o: cuda/exl3/ds4_exl3.cu cuda/exl3/ds4_exl3.h cuda/exl3/exl3_moe_ws.cuh cuda/exl3/exl3_gemm_kernel.cuh cuda/exl3/exl3_reconstruct.cuh cuda/exl3/exl3_moe_kernel.cuh cuda/exl3/exl3_moe_common.cuh cuda/exl3/exl3_gemm_inner.cuh cuda/exl3/exl3_dq.cuh cuda/exl3/codebook.cuh cuda/exl3/hadamard_inner.cuh cuda/exl3/exl3_kernel_map.cuh cuda/exl3/exl3_devctx.cuh cuda/exl3/ptx.cuh cuda/exl3/util.cuh cuda/exl3/compat.cuh
 	$(NVCC) $(NVCC_BASE_FLAGS) $(EXL3_ARCH_FLAGS) -std=c++17 -c -o $@ $<
 
 # Vendored mmq pieces (see cuda/mmq/VENDOR.md).  ds4_mmq.cu transitively
@@ -578,6 +578,9 @@ tests/test_qwen4exp_exl3.o: tests/test_qwen4exp_exl3.c ds4.h
 
 tests/test_qwen4exp_exl3: tests/test_qwen4exp_exl3.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_nfc: tests/test_nfc.c ds4_nfc.inc ds4_unicode_nfc.inc
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_nfc.c
 
 tests/test_qwen4exp_tokenizer.o: tests/test_qwen4exp_tokenizer.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<

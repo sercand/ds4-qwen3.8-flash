@@ -50,3 +50,5 @@ __pycache__/
 .DS_Store
 /.worktrees/
 docs/superpowers/plans/
+tests/test_nfc
+/tests/test_qwen4exp_exl3
