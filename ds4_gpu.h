@@ -3187,6 +3187,9 @@ int ds4_gpu_q4e_matmul_f16( ds4_gpu_tensor *out, const void *model_map, uint64_t
 /* EXL3 trellis weights (cuda/exl3).  `bytes` is the whole payload -- tiles
  * followed by the suh/svh scale vectors -- and `bits` the K of the tensor. */
 int ds4_gpu_q4e_matmul_exl3( ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t bytes, uint32_t bits, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
+int ds4_gpu_q4e_exl3_head_slice( const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t bytes, uint32_t bits, uint64_t k, uint64_t n, const int32_t *blocks_host, uint32_t n_blocks, void **dev_out);
+void ds4_gpu_q4e_head_slice_free(void *dev);
+int ds4_gpu_q4e_exl3_matmul_dev( ds4_gpu_tensor *out, const void *dev, uint32_t bits, uint64_t k, uint64_t n_sel, const ds4_gpu_tensor *x, uint32_t n_tok);
 int ds4_gpu_q4e_matmul_exl3_pair( ds4_gpu_tensor *out, ds4_gpu_tensor *out2, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t weight_offset2, uint64_t bytes, uint32_t bits, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
 
 int ds4_gpu_q4e_hc_init( ds4_gpu_tensor *res, const ds4_gpu_tensor *embed, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
@@ -3199,7 +3202,11 @@ int ds4_gpu_q4e_scale_silu(ds4_gpu_tensor *x, float inv_scale, uint64_t n);
 
 int ds4_gpu_q4e_hc_collapse( ds4_gpu_tensor *out, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *up, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
 
-int ds4_gpu_q4e_hc_combine( ds4_gpu_tensor *res, ds4_gpu_tensor *xn, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *inject, const void *model_map, uint64_t model_size, uint64_t next_norm_offset, int fuse_norm, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
+int ds4_gpu_q4e_hc_combine( ds4_gpu_tensor *res, ds4_gpu_tensor *xn, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *inject, const void *model_map, uint64_t model_size, uint64_t next_norm_offset, int fuse_norm, int xn_f16, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
+int ds4_gpu_q4e_hc_norm_f16( ds4_gpu_tensor *out, const ds4_gpu_tensor *res, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps);
+int ds4_gpu_q4e_hc_collapse_f16( ds4_gpu_tensor *out, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *up, uint32_t n_embd, uint32_t n_hc, uint32_t n_tok);
+int ds4_gpu_q4e_matmul_f16_xh( ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x_h, uint32_t n_tok);
+int ds4_gpu_q4e_matmul_f16_oh( ds4_gpu_tensor *out_h, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint32_t n_tok);
 
 int ds4_gpu_q4e_moe_route( ds4_gpu_tensor *ids, ds4_gpu_tensor *weights, const ds4_gpu_tensor *logits, uint32_t n_expert, uint32_t n_used, uint32_t n_tok);
 

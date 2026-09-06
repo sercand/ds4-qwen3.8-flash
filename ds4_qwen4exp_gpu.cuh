@@ -88,13 +88,23 @@ __global__ static void q4e_hc_init_add_kernel(
 /* Grouped RMSNorm: the mean square is taken over one n_embd stream, but the
  * affine vector spans all hc * n_embd.  Normalizing over the full width
  * instead is a common and silent mistake. */
+__device__ __forceinline__ static void q4e_store(float *p, float v) { *p = v; }
+__device__ __forceinline__ static void q4e_store(__half *p, float v) { *p = __float2half_rn(v); }
+__device__ __forceinline__ static float q4e_load(const float *p) { return *p; }
+__device__ __forceinline__ static float q4e_load(const __half *p) { return __half2float(*p); }
+
+/* The normed residual `xn` may be stored as fp16 (OUT = __half): its only
+ * readers are the fp16 hyper-connection GEMMs, which convert it to fp16
+ * anyway, and the four-term stream mix, so the rounding lands where the
+ * model already rounds; the residual itself stays fp32.  See hc_f16 in ds4.c. */
+template <typename OUT>
 __global__ static void q4e_hc_norm_kernel(
-        float *out, const float *res, const float *w,
+        OUT *out, const float *res, const float *w,
         uint32_t n_embd, uint32_t n_hc, float eps) {
     const uint32_t group = blockIdx.x;            /* one (token, stream) pair */
     const uint32_t h = group % n_hc;
     const float *src = res + (uint64_t)group * n_embd;
-    float *dst = out + (uint64_t)group * n_embd;
+    OUT *dst = out + (uint64_t)group * n_embd;
     const float *wh = w + (uint64_t)h * n_embd;
 
     float sum = 0.0f;
@@ -105,7 +115,7 @@ __global__ static void q4e_hc_norm_kernel(
     sum = q4e_block_sum(sum);
     const float scale = rsqrtf(sum / (float)n_embd + eps);
     for (uint32_t i = threadIdx.x; i < n_embd; i += blockDim.x) {
-        dst[i] = src[i] * scale * wh[i];
+        q4e_store(dst + i, src[i] * scale * wh[i]);
     }
 }
 
@@ -119,20 +129,21 @@ __global__ static void q4e_scale_silu_kernel(float *x, float inv_hc, uint64_t n)
 }
 
 /* Collapse the gated streams into the block input: mean over hc, not sum. */
+template <typename XT>
 __global__ static void q4e_hc_collapse_kernel(
-        float *out, const float *xn, const float *up,
+        float *out, const XT *xn, const XT *up,
         uint32_t n_embd, uint32_t n_hc) {
     const uint32_t t = blockIdx.x;
     const float inv = 1.0f / (float)n_hc;
-    const float *xn_t = xn + (uint64_t)t * n_hc * n_embd;
-    const float *up_t = up + (uint64_t)t * n_hc * n_embd;
+    const XT *xn_t = xn + (uint64_t)t * n_hc * n_embd;
+    const XT *up_t = up + (uint64_t)t * n_hc * n_embd;
     float *out_t = out + (uint64_t)t * n_embd;
     for (uint32_t e = threadIdx.x; e < n_embd; e += blockDim.x) {
         float acc = 0.0f;
         for (uint32_t h = 0; h < n_hc; h++) {
             const uint32_t o = h * n_embd + e;
-            const float g = 1.0f / (1.0f + __expf(-up_t[o]));
-            acc += xn_t[o] * g;
+            const float g = 1.0f / (1.0f + __expf(-q4e_load(up_t + o)));
+            acc += q4e_load(xn_t + o) * g;
         }
         out_t[e] = acc * inv;
     }
@@ -164,8 +175,9 @@ __global__ static void q4e_hc_collapse_kernel(
  * pass (the last layer) or something else reads the residual in between (the
  * PLE block); then this is the residual update alone and the mix norms its
  * own input. */
+template <typename XN>
 __global__ static void q4e_hc_combine_norm_kernel(
-        float *res, float *xn, const float *block_out, const float *inject,
+        float *res, XN *xn, const float *block_out, const float *inject,
         const float *w, uint32_t n_embd, uint32_t n_hc, float eps) {
     const uint32_t t = blockIdx.x;
     const float *src = block_out + (uint64_t)t * n_embd;
@@ -206,11 +218,11 @@ __global__ static void q4e_hc_combine_norm_kernel(
         sum = q4e_block_sum(sum);
         const float scale = rsqrtf(sum / (float)n_embd + eps);
         const float *wh = w + (uint64_t)h * n_embd;
-        float *out = xn + ((uint64_t)t * n_hc + h) * n_embd;
+        XN *out = xn + ((uint64_t)t * n_hc + h) * n_embd;
 #pragma unroll
         for (uint32_t n = 0; n < Q4E_HC_FUSE_MAX; n++) {
             const uint32_t i = threadIdx.x + n * blockDim.x;
-            if (i < n_embd) out[i] = vv[n] * scale * wh[i];
+            if (i < n_embd) q4e_store(out + i, vv[n] * scale * wh[i]);
         }
     }
 }
@@ -1225,9 +1237,26 @@ extern "C" int ds4_gpu_q4e_matmul_bf16_rows(
  * per row alone left most of the GPU idle; partials are split-major and a
  * second pass adds them, so at one split the kernel writes the final layout.
  * Above 16 rows (prefill) cuBLAS. */
-template <int NT>
+__device__ __forceinline__ static void q4e_load8(const float *p, float *v) {
+    const float4 *xp = (const float4 *)p;
+    const float4 xa = xp[0], xb = xp[1];
+    v[0] = xa.x; v[1] = xa.y; v[2] = xa.z; v[3] = xa.w;
+    v[4] = xb.x; v[5] = xb.y; v[6] = xb.z; v[7] = xb.w;
+}
+__device__ __forceinline__ static void q4e_load8(const __half *p, float *v) {
+    const uint4 raw = *(const uint4 *)p;
+    const __half2 *h2 = (const __half2 *)&raw;
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const float2 f = __half22float2(h2[j]);
+        v[2 * j] = f.x;
+        v[2 * j + 1] = f.y;
+    }
+}
+
+template <int NT, typename XT, typename OT>
 __global__ static void q4e_matmul_f16_rows_kernel(
-        float *out, const __half *w, const float *x,
+        OT *out, const __half *w, const XT *x,
         uint32_t in_dim, uint32_t out_dim, uint32_t chunk) {
     const uint32_t lane = threadIdx.x & 31u;
     const uint32_t row = blockIdx.x * (blockDim.x >> 5u) + (threadIdx.x >> 5u);
@@ -1250,28 +1279,32 @@ __global__ static void q4e_matmul_f16_rows_kernel(
         }
 #pragma unroll
         for (int t = 0; t < NT; t++) {
-            const float4 *xp = (const float4 *)(x + (uint64_t)t * in_dim + i);
-            const float4 xa = xp[0], xb = xp[1];
-            acc[t] = fmaf(wv[0], xa.x, acc[t]);
-            acc[t] = fmaf(wv[1], xa.y, acc[t]);
-            acc[t] = fmaf(wv[2], xa.z, acc[t]);
-            acc[t] = fmaf(wv[3], xa.w, acc[t]);
-            acc[t] = fmaf(wv[4], xb.x, acc[t]);
-            acc[t] = fmaf(wv[5], xb.y, acc[t]);
-            acc[t] = fmaf(wv[6], xb.z, acc[t]);
-            acc[t] = fmaf(wv[7], xb.w, acc[t]);
+            float xv[8];
+            q4e_load8(x + (uint64_t)t * in_dim + i, xv);
+#pragma unroll
+            for (int j = 0; j < 8; j++) acc[t] = fmaf(wv[j], xv[j], acc[t]);
         }
     }
-    float *dst = out + (uint64_t)blockIdx.y * NT * out_dim;
+    OT *dst = out + (uint64_t)blockIdx.y * NT * out_dim;
 #pragma unroll
     for (int t = 0; t < NT; t++) {
         const float v = warp_sum_f32(acc[t]);
-        if (lane == 0u) dst[(uint64_t)t * out_dim + row] = v;
+        if (lane == 0u) q4e_store(dst + (uint64_t)t * out_dim + row, v);
     }
 }
 
 __global__ static void q4e_matvec_f32_combine_kernel(
         float *out, const float *partial, uint32_t out_dim, uint32_t n_split);
+/* The K-split partials are fp32 whatever the output type. */
+template <typename OT>
+__global__ static void q4e_matvec_combine_t_kernel(
+        OT *out, const float *partial, uint32_t out_dim, uint32_t n_split) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < n_split; s++) acc += partial[(uint64_t)s * out_dim + row];
+    q4e_store(out + row, acc);
+}
 
 /* Splits until the warps number about a thousand, as long as each keeps at
  * least one full 256-wide pass; every partial row set then fits the 2048 x
@@ -1279,30 +1312,39 @@ __global__ static void q4e_matvec_f32_combine_kernel(
  * regrown by the surrounding matmuls, and a grow would free it from under
  * the graph that captured this launch (see ds4_gpu_q4e_matvec_f32). */
 #define Q4E_F16_PARTIAL_FLOATS (2048u * 16u)
-template <int NT>
-static int q4e_matmul_f16_rows_launch(float *out, const __half *w, const float *x,
-                                      uint32_t in_dim, uint32_t out_dim) {
+static float *q4e_f16_partial(void) {
+    static float *g_partial = NULL;
+    if (!g_partial &&
+        cudaMalloc((void **)&g_partial, Q4E_F16_PARTIAL_FLOATS * sizeof(float)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        g_partial = NULL;
+    }
+    return g_partial;
+}
+template <int NT, typename XT, typename OT>
+static int q4e_matmul_f16_rows_launch_t(OT *out, const __half *w, const XT *x,
+                                        uint32_t in_dim, uint32_t out_dim) {
     uint32_t n_split = 1u;
     while (out_dim * (uint64_t)n_split < 1024u && in_dim / (n_split * 2u) >= 256u) n_split *= 2u;
     const uint32_t chunk = ((in_dim + n_split - 1u) / n_split + 255u) & ~255u;
-    float *dst = out;
-    if (n_split > 1u) {
-        static float *g_partial = NULL;
-        if (!g_partial &&
-            cudaMalloc((void **)&g_partial, Q4E_F16_PARTIAL_FLOATS * sizeof(float)) != cudaSuccess) {
-            (void)cudaGetLastError();
-            return 0;
-        }
-        dst = g_partial;
+    if (n_split == 1u) {
+        q4e_matmul_f16_rows_kernel<NT, XT, OT><<<dim3((out_dim + 7u) / 8u, 1), 256, 0, cuda_decode_stream()>>>(
+                out, w, x, in_dim, out_dim, chunk);
+        return cuda_ok(cudaGetLastError(), "qwen4exp f16 rows matmul");
     }
-    q4e_matmul_f16_rows_kernel<NT><<<dim3((out_dim + 7u) / 8u, n_split), 256, 0, cuda_decode_stream()>>>(
-            dst, w, x, in_dim, out_dim, chunk);
-    if (n_split > 1u) {
-        const uint32_t n = NT * out_dim;
-        q4e_matvec_f32_combine_kernel<<<(n + 127u) / 128u, 128, 0, cuda_decode_stream()>>>(
-                out, dst, n, n_split);
-    }
+    float *partial = q4e_f16_partial();
+    if (!partial) return 0;
+    q4e_matmul_f16_rows_kernel<NT, XT, float><<<dim3((out_dim + 7u) / 8u, n_split), 256, 0, cuda_decode_stream()>>>(
+            partial, w, x, in_dim, out_dim, chunk);
+    const uint32_t n = NT * out_dim;
+    q4e_matvec_combine_t_kernel<OT><<<(n + 127u) / 128u, 128, 0, cuda_decode_stream()>>>(
+            out, partial, n, n_split);
     return cuda_ok(cudaGetLastError(), "qwen4exp f16 rows matmul");
+}
+template <int NT>
+static int q4e_matmul_f16_rows_launch(float *out, const __half *w, const float *x,
+                                      uint32_t in_dim, uint32_t out_dim) {
+    return q4e_matmul_f16_rows_launch_t<NT, float, float>(out, w, x, in_dim, out_dim);
 }
 
 __global__ static void q4e_f32_to_f16_kernel(__half *out, const float *in, uint64_t n) {
@@ -1364,6 +1406,73 @@ extern "C" int ds4_gpu_q4e_matmul_f16(
             w, CUDA_R_16F, (int)in_dim, xh, CUDA_R_16F, (int)in_dim, &beta,
             o, CUDA_R_32F, (int)out_dim, CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
     return cublas_ok(st, "qwen4exp f16 matmul");
+}
+
+/* The same fp16-weight matmul on an fp16 activation (x_h, out f32) or with an
+ * fp16 result (x f32, out_h): the hyper-connection GEMMs when xn and up are
+ * kept in fp16 (hc_f16).  Up to 16 rows the warp kernel; above, cuBLAS with
+ * no conversion pass for the fp16 input. */
+template <typename XT, typename OT>
+static int q4e_matmul_f16_t(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                            uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                            const ds4_gpu_tensor *x, uint32_t n_tok, cudaDataType_t x_type,
+                            cudaDataType_t out_type) {
+    if (!out || !x || !model_map || n_tok == 0u) return 0;
+    if ((in_dim & 7u) != 0u || in_dim == 0u || out_dim == 0u || out_dim > UINT32_MAX) return 0;
+    const uint64_t weight_bytes = out_dim * in_dim * 2u;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (x->bytes < (uint64_t)n_tok * in_dim * sizeof(XT) ||
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(OT)) return 0;
+    const int tier = ds4_tensor_device_idx(out);
+    const __half *w = (const __half *)cuda_resolve_weight_ptr(
+            model_map, weight_offset, weight_bytes, tier, "q4e_f16");
+    if (!w) return 0;
+    OT *o = (OT *)out->ptr;
+    const XT *xp = (const XT *)x->ptr;
+    switch (n_tok) {
+#define Q4E_F16_T_CASE(n) case n##u: return q4e_matmul_f16_rows_launch_t<n, XT, OT>(o, w, xp, (uint32_t)in_dim, (uint32_t)out_dim);
+    Q4E_F16_T_CASE(1) Q4E_F16_T_CASE(2) Q4E_F16_T_CASE(3) Q4E_F16_T_CASE(4)
+    Q4E_F16_T_CASE(5) Q4E_F16_T_CASE(6) Q4E_F16_T_CASE(7) Q4E_F16_T_CASE(8)
+    Q4E_F16_T_CASE(9) Q4E_F16_T_CASE(10) Q4E_F16_T_CASE(11) Q4E_F16_T_CASE(12)
+    Q4E_F16_T_CASE(13) Q4E_F16_T_CASE(14) Q4E_F16_T_CASE(15) Q4E_F16_T_CASE(16)
+#undef Q4E_F16_T_CASE
+    default: break;
+    }
+    if (!g_cublas_ready) return 0;
+    const void *xin = xp;
+    if (x_type == CUDA_R_32F) {
+        /* fp32 activation: convert once for the GEMM. */
+        const uint64_t n_in = (uint64_t)n_tok * in_dim;
+        __half *xh = (__half *)cuda_tmp_alloc_on(tier, n_in * sizeof(__half), "q4e f16 activations");
+        if (!xh) return 0;
+        q4e_f32_to_f16_kernel<<<(unsigned)((n_in + 255u) / 256u), 256, 0, cuda_decode_stream()>>>(
+                xh, (const float *)xp, n_in);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp f16 activation conversion")) return 0;
+        xin = xh;
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasGemmEx(
+            cuda_cublas_for_tier(tier), CUBLAS_OP_T, CUBLAS_OP_N,
+            (int)out_dim, (int)n_tok, (int)in_dim, &alpha,
+            w, CUDA_R_16F, (int)in_dim, xin, CUDA_R_16F, (int)in_dim, &beta,
+            o, out_type, (int)out_dim, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+    return cublas_ok(st, "qwen4exp f16 matmul");
+}
+
+extern "C" int ds4_gpu_q4e_matmul_f16_xh(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x_h, uint32_t n_tok) {
+    return q4e_matmul_f16_t<__half, float>(out, model_map, model_size, weight_offset, in_dim, out_dim,
+                                           x_h, n_tok, CUDA_R_16F, CUDA_R_32F);
+}
+
+extern "C" int ds4_gpu_q4e_matmul_f16_oh(
+        ds4_gpu_tensor *out_h, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint32_t n_tok) {
+    return q4e_matmul_f16_t<float, __half>(out_h, model_map, model_size, weight_offset, in_dim, out_dim,
+                                           x, n_tok, CUDA_R_32F, CUDA_R_16F);
 }
 
 /* EXL3 trellis weights.  The payload is the tiles followed by suh[k] and
@@ -1438,6 +1547,102 @@ extern "C" int ds4_gpu_q4e_matmul_exl3(
     }
     return ds4_exl3_gemm((const float *)x->ptr, tiles, suh, svh, (float *)out->ptr,
                          n_tok, (uint32_t)in_dim, (uint32_t)out_dim, bits, cuda_decode_stream());
+}
+
+/* Draft-head slice (see q4e_head_slice in ds4.c).  The selected 128-row
+ * blocks of an EXL3 vocabulary head are gathered into a payload with the
+ * layout of a (k, n_sel) tensor -- tiles, then suh[k], then svh[n_sel] -- so
+ * ds4_exl3_gemm runs it as any dense EXL3 tensor.  Blocks of 128 rather than
+ * single rows because the output Hadamard mixes every 128 consecutive output
+ * columns: a logit depends on all eight n16 tiles of its block, and only whole
+ * blocks can be lifted out intact. */
+__global__ static void q4e_exl3_slice_tiles_kernel(
+        uint8_t *dst, const uint8_t *src, const int32_t *blocks, uint32_t n_blocks,
+        uint32_t src_blocks_n, uint32_t tile_bytes, uint64_t n_pieces) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_pieces) return;
+    const uint32_t per_tile = tile_bytes / 16u;
+    const uint64_t tile = i / per_tile, piece = i - tile * per_tile;
+    const uint32_t row = (uint32_t)(tile / ((uint64_t)n_blocks * 8u));     /* k16 block */
+    const uint32_t rem = (uint32_t)(tile - (uint64_t)row * n_blocks * 8u);
+    const uint32_t b = rem >> 3u, j = rem & 7u;
+    const uint64_t s = ((uint64_t)row * src_blocks_n + (uint64_t)blocks[b] * 8u + j) * tile_bytes;
+    ((uint4 *)(dst + tile * tile_bytes))[piece] = ((const uint4 *)(src + s))[piece];
+}
+
+__global__ static void q4e_exl3_slice_svh_kernel(
+        __half *dst, const __half *src, const int32_t *blocks, uint32_t n_blocks) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_blocks * 128u) return;
+    dst[i] = src[(uint64_t)blocks[i >> 7u] * 128u + (i & 127u)];
+}
+
+extern "C" int ds4_gpu_q4e_exl3_head_slice(
+        const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t bytes,
+        uint32_t bits, uint64_t k, uint64_t n, const int32_t *blocks_host, uint32_t n_blocks,
+        void **dev_out) {
+    if (!dev_out || !blocks_host || !n_blocks || (k % 16u) != 0u || (n % 128u) != 0u) return 0;
+    const uint64_t tile_bytes = 256u * bits / 8u;
+    if (bytes != k * n * bits / 8u + 2u * (k + n)) return 0;
+    const uint8_t *src = (const uint8_t *)cuda_resolve_weight_ptr(model_map, weight_offset, bytes, 0,
+                                                                  "q4e head slice source");
+    if (!src) return 0;
+    const uint64_t n_sel = (uint64_t)n_blocks * 128u;
+    const uint64_t tiles_bytes = k * n_sel * bits / 8u;
+    const uint64_t total = tiles_bytes + 2u * (k + n_sel);
+    uint8_t *dst = NULL;
+    int32_t *blocks = NULL;
+    if (cudaMalloc((void **)&dst, total) != cudaSuccess ||
+        cudaMalloc((void **)&blocks, (size_t)n_blocks * sizeof(int32_t)) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (dst) (void)cudaFree(dst);
+        return 0;
+    }
+    cudaStream_t st = cuda_decode_stream();
+    bool ok = cudaMemcpyAsync(blocks, blocks_host, (size_t)n_blocks * sizeof(int32_t),
+                              cudaMemcpyHostToDevice, st) == cudaSuccess;
+    const uint64_t n_pieces = tiles_bytes / 16u;
+    if (ok) {
+        q4e_exl3_slice_tiles_kernel<<<(unsigned)((n_pieces + 255u) / 256u), 256, 0, st>>>(
+                dst, src, blocks, n_blocks, (uint32_t)(n / 16u), (uint32_t)tile_bytes, n_pieces);
+        ok = cuda_ok(cudaGetLastError(), "qwen4exp head slice tiles");
+    }
+    /* suh is per input and copies whole; svh is per output and follows the blocks. */
+    if (ok) ok = cudaMemcpyAsync(dst + tiles_bytes, src + k * n * bits / 8u, (size_t)k * 2u,
+                                 cudaMemcpyDeviceToDevice, st) == cudaSuccess;
+    if (ok) {
+        q4e_exl3_slice_svh_kernel<<<(unsigned)((n_sel + 255u) / 256u), 256, 0, st>>>(
+                (__half *)(dst + tiles_bytes + 2u * k),
+                (const __half *)(src + k * n * bits / 8u + 2u * k), blocks, n_blocks);
+        ok = cuda_ok(cudaGetLastError(), "qwen4exp head slice svh");
+    }
+    if (ok) ok = cudaStreamSynchronize(st) == cudaSuccess;
+    (void)cudaFree(blocks);
+    if (!ok) {
+        (void)cudaGetLastError();
+        (void)cudaFree(dst);
+        return 0;
+    }
+    *dev_out = dst;
+    return 1;
+}
+
+extern "C" void ds4_gpu_q4e_head_slice_free(void *dev) {
+    if (dev) (void)cudaFree(dev);
+}
+
+/* logits[n_tok][n_sel] = x @ slice, on the decode stream like the full head. */
+extern "C" int ds4_gpu_q4e_exl3_matmul_dev(
+        ds4_gpu_tensor *out, const void *dev, uint32_t bits, uint64_t k, uint64_t n_sel,
+        const ds4_gpu_tensor *x, uint32_t n_tok) {
+    if (!out || !dev || !x || !n_tok) return 0;
+    if (x->bytes < (uint64_t)n_tok * k * sizeof(float) ||
+        out->bytes < (uint64_t)n_tok * n_sel * sizeof(float)) return 0;
+    const uint8_t *tiles = (const uint8_t *)dev;
+    const uint8_t *suh = tiles + k * n_sel * bits / 8u;
+    const uint8_t *svh = suh + 2u * k;
+    return ds4_exl3_gemm((const float *)x->ptr, tiles, suh, svh, (float *)out->ptr,
+                         n_tok, (uint32_t)k, (uint32_t)n_sel, bits, cuda_decode_stream());
 }
 
 /* Rows of x replicated once per routing slot: mgemm reads one input slab per
@@ -1558,10 +1763,18 @@ extern "C" int ds4_gpu_q4e_moe_exl3_fused(
     ds4_mmq_moe_map map;
     if (ds4_mmq_moe_map_build(&map, (const int32_t *)ids->ptr, (int)n_tok, (int)n_expert,
                               (int)n_used, cuda_decode_stream()) != 0) return 0;
-    if (!ds4_exl3_moe((const float *)x->ptr, (float *)down->ptr, n_tok, n_embd, ff_dim,
-                      gt, gs, gv, ut, us, uv, dt, ds, dv, bits,
-                      map.expert_bounds, map.ids_dst, n_expert, n_used, cuda_decode_stream()))
-        return -1;
+    /* The weight-stationary path (exl3_moe_ws.cuh) reads each expert's tiles
+     * once per 64 of its rows instead of once per 16 and runs as plain grids;
+     * DS4_QWEN4EXP_MOE_FUSED=1 keeps exllamav3's cooperative kernel for A/B. */
+    static const bool vendored = getenv("DS4_QWEN4EXP_MOE_FUSED") != NULL;
+    const int ok = vendored
+        ? ds4_exl3_moe((const float *)x->ptr, (float *)down->ptr, n_tok, n_embd, ff_dim,
+                       gt, gs, gv, ut, us, uv, dt, ds, dv, bits,
+                       map.expert_bounds, map.ids_dst, n_expert, n_used, cuda_decode_stream())
+        : ds4_exl3_moe_ws((const float *)x->ptr, (float *)down->ptr, n_tok, n_embd, ff_dim,
+                          gt, gs, gv, ut, us, uv, dt, ds, dv, bits,
+                          map.expert_bounds, map.ids_dst, n_expert, n_used, cuda_decode_stream());
+    if (!ok) return -1;
     return ds4_gpu_q4e_moe_combine(out, down, weights, n_embd, n_used, n_tok) ? 1 : -1;
 }
 
@@ -1725,9 +1938,23 @@ extern "C" int ds4_gpu_q4e_hc_norm(
                                 (uint64_t)n_embd * n_hc * sizeof(float), out,
                                 "qwen4exp hc norm");
     if (!w) return 0;
-    q4e_hc_norm_kernel<<<(unsigned)(n_tok * n_hc), 256, 0, cuda_decode_stream()>>>(
+    q4e_hc_norm_kernel<float><<<(unsigned)(n_tok * n_hc), 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr, (const float *)res->ptr, w, n_embd, n_hc, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp hc norm");
+}
+
+extern "C" int ds4_gpu_q4e_hc_norm_f16(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *res,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps) {
+    if (!out || !res || !n_tok) return 0;
+    const float *w = q4e_weight(model_map, model_size, weight_offset,
+                                (uint64_t)n_embd * n_hc * sizeof(float), out,
+                                "qwen4exp hc norm");
+    if (!w) return 0;
+    q4e_hc_norm_kernel<__half><<<(unsigned)(n_tok * n_hc), 256, 0, cuda_decode_stream()>>>(
+            (__half *)out->ptr, (const float *)res->ptr, w, n_embd, n_hc, eps);
+    return cuda_ok(cudaGetLastError(), "qwen4exp hc norm f16");
 }
 
 extern "C" int ds4_gpu_q4e_scale_silu(ds4_gpu_tensor *x, float inv_scale, uint64_t n) {
@@ -1741,9 +1968,18 @@ extern "C" int ds4_gpu_q4e_hc_collapse(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *up,
         uint32_t n_embd, uint32_t n_hc, uint32_t n_tok) {
     if (!out || !xn || !up || !n_tok) return 0;
-    q4e_hc_collapse_kernel<<<(unsigned)n_tok, 256, 0, cuda_decode_stream()>>>(
+    q4e_hc_collapse_kernel<float><<<(unsigned)n_tok, 256, 0, cuda_decode_stream()>>>(
             (float *)out->ptr, (const float *)xn->ptr, (const float *)up->ptr, n_embd, n_hc);
     return cuda_ok(cudaGetLastError(), "qwen4exp hc collapse");
+}
+
+extern "C" int ds4_gpu_q4e_hc_collapse_f16(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *xn, const ds4_gpu_tensor *up,
+        uint32_t n_embd, uint32_t n_hc, uint32_t n_tok) {
+    if (!out || !xn || !up || !n_tok) return 0;
+    q4e_hc_collapse_kernel<__half><<<(unsigned)n_tok, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (const __half *)xn->ptr, (const __half *)up->ptr, n_embd, n_hc);
+    return cuda_ok(cudaGetLastError(), "qwen4exp hc collapse f16");
 }
 
 /* res += block_out (x) 2*sigmoid(inject / n_hc) per stream, and, when a norm
@@ -1754,7 +1990,7 @@ extern "C" int ds4_gpu_q4e_hc_collapse(
 extern "C" int ds4_gpu_q4e_hc_combine(
         ds4_gpu_tensor *res, ds4_gpu_tensor *xn, const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *inject, const void *model_map, uint64_t model_size,
-        uint64_t next_norm_offset, int fuse_norm,
+        uint64_t next_norm_offset, int fuse_norm, int xn_f16,
         uint32_t n_embd, uint32_t n_hc, uint32_t n_tok, float eps) {
     if (!res || !block_out || !inject || !n_tok) return 0;
     const unsigned threads = 256u;
@@ -1772,10 +2008,17 @@ extern "C" int ds4_gpu_q4e_hc_combine(
      * below that, one block per (token, stream) so a decode step's four
      * groups run at once instead of in sequence. */
     const dim3 grid(n_tok, n_tok >= 256u ? 1u : n_hc, 1);
-    q4e_hc_combine_norm_kernel<<<grid, threads, 0, cuda_decode_stream()>>>(
-            (float *)res->ptr, xn ? (float *)xn->ptr : NULL,
-            (const float *)block_out->ptr, (const float *)inject->ptr,
-            w, n_embd, n_hc, eps);
+    if (xn_f16) {
+        q4e_hc_combine_norm_kernel<__half><<<grid, threads, 0, cuda_decode_stream()>>>(
+                (float *)res->ptr, xn ? (__half *)xn->ptr : NULL,
+                (const float *)block_out->ptr, (const float *)inject->ptr,
+                w, n_embd, n_hc, eps);
+    } else {
+        q4e_hc_combine_norm_kernel<float><<<grid, threads, 0, cuda_decode_stream()>>>(
+                (float *)res->ptr, xn ? (float *)xn->ptr : NULL,
+                (const float *)block_out->ptr, (const float *)inject->ptr,
+                w, n_embd, n_hc, eps);
+    }
     return cuda_ok(cudaGetLastError(), "qwen4exp hc combine");
 }
 
@@ -2922,12 +3165,122 @@ __global__ static void __launch_bounds__(256) q4e_idx_score_kernel(
     }
 }
 
+/* The same scores on tensor cores: a block owns 16 rows x 128 key blocks; for
+ * each of the four indexer heads warp w forms S_h = Q_h K^T for its 16 key
+ * blocks (two n8 fragments, eight k16 steps over the 128 dims) and folds
+ * relu(S_h) into the fp32 total.  Q and K tiles are [row][128] fp16 in shared
+ * memory with the 16-byte chunk index XORed by (row & 7) so ldmatrix is
+ * conflict free.  Same inputs and masks as the fmaf kernel above; only the
+ * summation order inside each dot differs. */
+#define Q4E_IDX_TC_BT 128u
+#define Q4E_IDX_TC_SMEM ((16u * 4u + Q4E_IDX_TC_BT) * Q4E_IDX_DIM * 2u)
+__device__ __forceinline__ static uint32_t q4e_idx_tc_off(uint32_t row, uint32_t chunk) {
+    return (row * 16u + (chunk ^ (row & 7u))) * 16u;
+}
+__global__ static void __launch_bounds__(256) q4e_idx_score_tc_kernel(
+        float *score, const __half *qn, const __half *pooled, const int32_t *pos,
+        const int32_t *pages, uint32_t n_tok, uint32_t n_blocks_stride, const int32_t *pos_last) {
+    constexpr uint32_t NH = 4u, BT = Q4E_IDX_TC_BT;
+    const uint32_t n_blocks = ((uint32_t)pos_last[0] + 1u) / Q4E_IDX_R;
+    const uint32_t t0 = blockIdx.y * Q4E_IDX_QT;
+    const uint32_t b0 = blockIdx.x * BT;
+    if (b0 >= n_blocks) return;
+    extern __shared__ __align__(16) uint8_t q4e_idx_tc_smem[];
+    uint8_t *s_q = q4e_idx_tc_smem;                       /* [h][16][128] f16 */
+    uint8_t *s_k = s_q + 16u * NH * Q4E_IDX_DIM * 2u;     /* [128][128] f16 */
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t n_q = (n_tok - t0 < Q4E_IDX_QT) ? (n_tok - t0) : Q4E_IDX_QT;
+    const uint32_t n_b = (n_blocks - b0 < BT) ? (n_blocks - b0) : BT;
+
+    /* Q rows: qn is [t][h][128]; rows past n_q are zero. */
+    for (uint32_t i = tid; i < 16u * NH * 16u; i += 256u) {
+        const uint32_t row = i >> 4u, c = i & 15u;           /* row = qi * NH + h */
+        const uint32_t qi = row / NH, h = row - qi * NH;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (qi < n_q) v = ((const uint4 *)(qn + ((uint64_t)(t0 + qi) * NH + h) * Q4E_IDX_DIM))[c];
+        *(uint4 *)(s_q + q4e_idx_tc_off(h * 16u + qi, c)) = v;
+    }
+    /* K rows: the tile's pooled keys are contiguous inside one page (the tile
+     * is half a page); rows past n_b are zero. */
+    const uint32_t brow = q4e_kv_row(pages, b0 * Q4E_IDX_R) / Q4E_IDX_R;
+    for (uint32_t i = tid; i < BT * 16u; i += 256u) {
+        const uint32_t bi = i >> 4u, c = i & 15u;
+        uint4 v = make_uint4(0u, 0u, 0u, 0u);
+        if (bi < n_b) v = ((const uint4 *)(pooled + (uint64_t)(brow + bi) * Q4E_IDX_DIM))[c];
+        *(uint4 *)(s_k + q4e_idx_tc_off(bi, c)) = v;
+    }
+    __syncthreads();
+
+    float total[2][4];
+#pragma unroll
+    for (int f = 0; f < 2; f++) { total[f][0] = total[f][1] = total[f][2] = total[f][3] = 0.0f; }
+#pragma unroll
+    for (uint32_t h = 0; h < NH; h++) {
+        float acc[2][4];
+#pragma unroll
+        for (int f = 0; f < 2; f++) { acc[f][0] = acc[f][1] = acc[f][2] = acc[f][3] = 0.0f; }
+#pragma unroll
+        for (uint32_t ks = 0; ks < Q4E_IDX_DIM / 16u; ks++) {
+            uint32_t a[4];
+            tt_ldmatrix_x4_addr(a, tt_smem_addr(s_q + q4e_idx_tc_off(h * 16u + (lane & 15u),
+                                                                      ks * 2u + (lane >> 4u))));
+#pragma unroll
+            for (uint32_t f = 0; f < 2; f++) {
+                uint32_t b[2];
+                const uint32_t brow_s = warp * 16u + f * 8u + (lane & 7u);
+                tt_ldmatrix_x2_addr(b, tt_smem_addr(s_k + q4e_idx_tc_off(brow_s, ks * 2u + ((lane >> 3u) & 1u))));
+                tt_mma_m16n8k16_f16_f32(acc[f], a, b);
+            }
+        }
+#pragma unroll
+        for (int f = 0; f < 2; f++) {
+            total[f][0] += fmaxf(acc[f][0], 0.0f); total[f][1] += fmaxf(acc[f][1], 0.0f);
+            total[f][2] += fmaxf(acc[f][2], 0.0f); total[f][3] += fmaxf(acc[f][3], 0.0f);
+        }
+    }
+    /* C layout: rows lane/4 and lane/4 + 8, columns 2 * (lane % 4), +1. */
+#pragma unroll
+    for (int half_ = 0; half_ < 2; half_++) {
+        const uint32_t qi = (lane >> 2u) + 8u * (uint32_t)half_;
+        if (qi >= n_q) continue;
+        const uint32_t t = t0 + qi;
+        const uint32_t p = (uint32_t)pos[t];
+        float *row = score + (uint64_t)t * n_blocks_stride;
+#pragma unroll
+        for (uint32_t f = 0; f < 2; f++) {
+#pragma unroll
+            for (uint32_t j = 0; j < 2; j++) {
+                const uint32_t bi = warp * 16u + f * 8u + 2u * (lane & 3u) + j;
+                const uint32_t b = b0 + bi;
+                const bool vis = bi < n_b && b * Q4E_IDX_R + Q4E_IDX_R - 1u <= p;
+                row[b] = vis ? total[f][2 * half_ + j] : -INFINITY;
+            }
+        }
+    }
+}
+
 extern "C" int ds4_gpu_q4e_idx_score(ds4_gpu_tensor *score, const ds4_gpu_tensor *qn,
                                      const ds4_gpu_tensor *pooled, const ds4_gpu_tensor *pos,
                                      const ds4_gpu_tensor *pos_last, const ds4_gpu_tensor *pages,
                                      uint32_t n_head, uint32_t n_tok, uint32_t max_blocks) {
     if (!score || !qn || !pooled || !pos || !pos_last || !pages || !n_tok || !max_blocks) return 0;
     const uint32_t n_blocks = max_blocks;
+    static const bool scalar = getenv("DS4_QWEN4EXP_IDX_SCALAR") != NULL;
+    static int tc_ready = -1;
+    if (tc_ready < 0) {
+        tc_ready = (!scalar && n_head == 4u &&
+                    cudaFuncSetAttribute(q4e_idx_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         (int)Q4E_IDX_TC_SMEM) == cudaSuccess) ? 1 : 0;
+        (void)cudaGetLastError();
+    }
+    if (tc_ready && n_head == 4u) {
+        const dim3 grid((n_blocks + Q4E_IDX_TC_BT - 1u) / Q4E_IDX_TC_BT, (n_tok + Q4E_IDX_QT - 1u) / Q4E_IDX_QT, 1);
+        q4e_idx_score_tc_kernel<<<grid, 256, Q4E_IDX_TC_SMEM, cuda_decode_stream()>>>(
+                (float *)score->ptr, (const __half *)qn->ptr, (const __half *)pooled->ptr,
+                (const int32_t *)pos->ptr, (const int32_t *)pages->ptr, n_tok, max_blocks,
+                (const int32_t *)pos_last->ptr);
+        return cuda_ok(cudaGetLastError(), "qwen4exp idx score tc");
+    }
     const size_t smem = ((size_t)Q4E_IDX_QT * n_head + Q4E_IDX_BT) * Q4E_IDX_DIM * sizeof(__half);
     static bool opted = false;
     if (!opted) {
@@ -3231,6 +3584,258 @@ q4e_qsa_attention_gather_kernel(
     }
 }
 
+/* Tensor-core attention over a per-row key list (or, with tokens == NULL, the
+ * dense causal range 0..pos[t]), replacing the fmaf inner loops of the gather
+ * kernel above: at a 2048-token chunk those ran ~37 ms per layer, about 1.4
+ * TFLOPS, for what is 51 GFLOP of GEMM.
+ *
+ * A block owns one row t, one kv head and one slice of that row's key list.
+ * The MMA's M dimension is the kv group -- the twelve query heads that share
+ * the head's K and V, padded to 16 with zero rows -- so both products are
+ * ordinary m16n8k16 fp16 GEMMs with fp32 accumulation: S = Q K^T over 64-key
+ * tiles (warp w scores keys 8w..8w+7 of the tile against all 16 rows), and
+ * O += P V with warp w owning 32 of the 256 output dims.  K, V and Q tiles
+ * sit in shared memory as [row][256] fp16 with the 16-byte chunk index XORed
+ * with (row & 7), which keeps both the gather stores and every ldmatrix
+ * conflict free; V is read with ldmatrix.trans so the same [key][dim] tile
+ * serves as the col-major B operand.  The softmax is the online form per row,
+ * done by the warp that owns rows 2w and 2w+1 once the tile's scores are in
+ * shared memory; P goes back as fp16 and the per-row rescale factors with it.
+ *
+ * Numerics: scores and the running max/sum are fp32; P is rounded to fp16
+ * before the PV product where the scalar kernel kept it fp32 -- the same
+ * rounding a Flash-style kernel makes, ~1e-3 relative on the output, below
+ * the fp16 K/V cache's own quantization.  Partials go to `part` in the layout
+ * q4e_qsa_attention_combine_kernel merges; with one split the normalized
+ * result is written to `out` directly. */
+#define Q4E_TC_KT 64u
+#define Q4E_TC_HD 256u
+#define Q4E_TC_CH (Q4E_TC_HD / 8u)          /* 16-byte chunks per row */
+#define Q4E_TC_SMEM ((16u + 2u * Q4E_TC_KT) * Q4E_TC_HD * 2u + 16u * Q4E_TC_KT * 4u + 16u * Q4E_TC_KT * 2u + 16u * 4u)
+__device__ __forceinline__ static uint32_t q4e_tc_off(uint32_t row, uint32_t chunk) {
+    return (row * Q4E_TC_CH + (chunk ^ (row & 7u))) * 16u;
+}
+__global__ static void __launch_bounds__(256)
+q4e_qsa_attention_tc_kernel(
+        float *out, float *part, const __half *k_cache, const __half *v_cache, const float *q,
+        const int32_t *tokens, const int32_t *n_sel, const int32_t *pos, const int32_t *pages,
+        uint32_t width, uint32_t n_head, uint32_t n_head_kv, uint32_t n_splits) {
+    constexpr uint32_t KT = Q4E_TC_KT, HD = Q4E_TC_HD, CH = Q4E_TC_CH;
+    const uint32_t tid = threadIdx.x, lane = tid & 31u, warp = tid >> 5u;
+    const uint32_t t = blockIdx.z, hkv = blockIdx.y, split = blockIdx.x;
+    const uint32_t G = n_head / n_head_kv;
+    const float scale = rsqrtf((float)HD);
+
+    extern __shared__ __align__(16) uint8_t q4e_tc_smem[];
+    uint8_t *s_q = q4e_tc_smem;                          /* [16][256] f16 */
+    uint8_t *s_k = s_q + 16u * HD * 2u;                  /* [64][256] f16 */
+    uint8_t *s_v = s_k + KT * HD * 2u;                   /* [64][256] f16 */
+    float   *s_s = (float *)(s_v + KT * HD * 2u);        /* [16][64] f32 scores */
+    __half  *s_p = (__half *)(s_s + 16u * KT);           /* [16][64] f16, chunk-swizzled */
+    float   *s_corr = (float *)(s_p + 16u * KT);         /* [16] */
+    __shared__ int32_t s_idx[Q4E_TC_KT];
+    __shared__ float s_m[16], s_l[16];
+
+    const int32_t *list = tokens ? tokens + (uint64_t)t * width : NULL;
+    const uint32_t n_list = tokens ? (uint32_t)n_sel[t] : (uint32_t)pos[t] + 1u;
+    const uint32_t n_tiles = (n_list + KT - 1u) / KT;
+    const uint32_t tiles_per_split = (n_tiles + n_splits - 1u) / n_splits;
+    const uint32_t l_begin = split * tiles_per_split * KT;
+    uint32_t l_end = l_begin + tiles_per_split * KT;
+    if (l_end > n_list) l_end = n_list;
+
+    /* Q: the group's heads as rows, pre-scaled, rows G..15 zero. */
+    for (uint32_t i = tid; i < 16u * CH; i += 256u) {
+        const uint32_t r = i / CH, c = i % CH;
+        union { uint4 u; __half2 h2[4]; } pk;
+        if (r < G) {
+            const float4 *src = (const float4 *)(q + ((uint64_t)t * n_head + hkv * G + r) * HD + 8u * c);
+            const float4 v0 = src[0], v1 = src[1];
+            pk.h2[0] = __floats2half2_rn(v0.x * scale, v0.y * scale);
+            pk.h2[1] = __floats2half2_rn(v0.z * scale, v0.w * scale);
+            pk.h2[2] = __floats2half2_rn(v1.x * scale, v1.y * scale);
+            pk.h2[3] = __floats2half2_rn(v1.z * scale, v1.w * scale);
+        } else {
+            pk.u = make_uint4(0u, 0u, 0u, 0u);
+        }
+        *(uint4 *)(s_q + q4e_tc_off(r, c)) = pk.u;
+    }
+    float m_r[2] = { -INFINITY, -INFINITY }, l_r[2] = { 0.0f, 0.0f };
+    float o[4][4];
+#pragma unroll
+    for (int f = 0; f < 4; f++) { o[f][0] = o[f][1] = o[f][2] = o[f][3] = 0.0f; }
+
+    /* The next tile's K and V rows are fetched into registers (eight 16-byte
+     * pieces of each per thread) before the current tile is computed, so the
+     * gather's latency overlaps the MMAs instead of serializing with them; a
+     * block holds 78 KB of shared memory, so it is alone on its SM and has
+     * nothing else to hide behind.  Keys past the list are zero so their
+     * (masked, zero-weight) columns stay finite. */
+    constexpr uint32_t PF = KT * CH / 256u;
+    uint4 pk[PF], pv[PF];
+    auto fetch = [&](uint32_t p0) {
+        const uint32_t n_k = (l_end - p0 < KT) ? (l_end - p0) : KT;
+        if (tid < KT) {
+            s_idx[tid] = tid < n_k
+                ? (int32_t)q4e_kv_row(pages, tokens ? (uint32_t)list[p0 + tid] : p0 + tid) : -1;
+        }
+        __syncthreads();
+#pragma unroll
+        for (uint32_t j = 0; j < PF; j++) {
+            const uint32_t i = tid + 256u * j;
+            const uint32_t key = i / CH, c = i % CH;
+            const int32_t row = s_idx[key];
+            if (row >= 0) {
+                const uint64_t base = ((uint64_t)row * n_head_kv + hkv) * HD + 8u * c;
+                pk[j] = *(const uint4 *)(k_cache + base);
+                pv[j] = *(const uint4 *)(v_cache + base);
+            } else {
+                pk[j] = make_uint4(0u, 0u, 0u, 0u);
+                pv[j] = pk[j];
+            }
+        }
+    };
+    if (l_begin < l_end) fetch(l_begin);
+    __syncthreads();
+
+    for (uint32_t p0 = l_begin; p0 < l_end; p0 += KT) {
+        const uint32_t n_k = (l_end - p0 < KT) ? (l_end - p0) : KT;
+#pragma unroll
+        for (uint32_t j = 0; j < PF; j++) {
+            const uint32_t i = tid + 256u * j;
+            const uint32_t key = i / CH, c = i % CH;
+            *(uint4 *)(s_k + q4e_tc_off(key, c)) = pk[j];
+            *(uint4 *)(s_v + q4e_tc_off(key, c)) = pv[j];
+        }
+        __syncthreads();
+        if (p0 + KT < l_end) fetch(p0 + KT);
+
+        /* S[16][8w..8w+8) = Q K^T over the 256 dims. */
+        float sacc[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+#pragma unroll 4
+        for (uint32_t ks = 0; ks < HD / 16u; ks++) {
+            uint32_t a[4], b[2];
+            tt_ldmatrix_x4_addr(a, tt_smem_addr(s_q + q4e_tc_off(lane & 15u, ks * 2u + (lane >> 4u))));
+            tt_ldmatrix_x2_addr(b, tt_smem_addr(s_k + q4e_tc_off(warp * 8u + (lane & 7u),
+                                                                 ks * 2u + ((lane >> 3u) & 1u))));
+            tt_mma_m16n8k16_f16_f32(sacc, a, b);
+        }
+        {
+            const uint32_t r0 = lane >> 2u, c0 = warp * 8u + 2u * (lane & 3u);
+            s_s[r0 * KT + c0] = sacc[0];
+            s_s[r0 * KT + c0 + 1u] = sacc[1];
+            s_s[(r0 + 8u) * KT + c0] = sacc[2];
+            s_s[(r0 + 8u) * KT + c0 + 1u] = sacc[3];
+        }
+        __syncthreads();
+
+        /* Online softmax for rows 2w and 2w+1: lane covers keys lane, lane + 32. */
+#pragma unroll
+        for (int rr = 0; rr < 2; rr++) {
+            const uint32_t r = warp * 2u + (uint32_t)rr;
+            const float v0 = lane < n_k ? s_s[r * KT + lane] : -INFINITY;
+            const float v1 = lane + 32u < n_k ? s_s[r * KT + lane + 32u] : -INFINITY;
+            float mx = fmaxf(v0, v1);
+            for (int off = 16; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, off));
+            float corr = 1.0f, p0f = 0.0f, p1f = 0.0f;
+            if (mx != -INFINITY) {
+                const float m_new = fmaxf(m_r[rr], mx);
+                corr = __expf(m_r[rr] - m_new);
+                p0f = v0 == -INFINITY ? 0.0f : __expf(v0 - m_new);
+                p1f = v1 == -INFINITY ? 0.0f : __expf(v1 - m_new);
+                float sum = p0f + p1f;
+                for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+                l_r[rr] = l_r[rr] * corr + sum;
+                m_r[rr] = m_new;
+            }
+            s_p[r * KT + ((lane >> 3u) ^ (r & 7u)) * 8u + (lane & 7u)] = __float2half_rn(p0f);
+            s_p[r * KT + (((lane + 32u) >> 3u) ^ (r & 7u)) * 8u + (lane & 7u)] = __float2half_rn(p1f);
+            if (lane == 0u) s_corr[r] = corr;
+        }
+        __syncthreads();
+
+        /* O[16][32w..32w+32) = corr * O + P V. */
+        {
+            const float c_lo = s_corr[lane >> 2u], c_hi = s_corr[(lane >> 2u) + 8u];
+#pragma unroll
+            for (int f = 0; f < 4; f++) {
+                o[f][0] *= c_lo; o[f][1] *= c_lo; o[f][2] *= c_hi; o[f][3] *= c_hi;
+            }
+        }
+#pragma unroll
+        for (uint32_t ks = 0; ks < KT / 16u; ks++) {
+            uint32_t a[4];
+            {
+                const uint32_t r = lane & 15u, c = ks * 2u + (lane >> 4u);
+                tt_ldmatrix_x4_addr(a, tt_smem_addr(s_p + r * KT + (c ^ (r & 7u)) * 8u));
+            }
+            const uint32_t key = ks * 16u + (lane & 7u) + 8u * ((lane >> 3u) & 1u);
+#pragma unroll
+            for (uint32_t f = 0; f < 4; f++) {
+                uint32_t b[2];
+                tt_ldmatrix_x2_trans_addr(b, tt_smem_addr(s_v + q4e_tc_off(key, warp * 4u + f)));
+                tt_mma_m16n8k16_f16_f32(o[f], a, b);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0u) {
+        s_m[warp * 2u] = m_r[0]; s_m[warp * 2u + 1u] = m_r[1];
+        s_l[warp * 2u] = l_r[0]; s_l[warp * 2u + 1u] = l_r[1];
+    }
+    __syncthreads();
+#pragma unroll
+    for (int half_ = 0; half_ < 2; half_++) {
+        const uint32_t r = (lane >> 2u) + 8u * (uint32_t)half_;
+        if (r >= G) continue;
+        const uint64_t qg = (uint64_t)t * n_head + hkv * G + r;
+        const uint32_t d0 = warp * 32u + 2u * (lane & 3u);
+        if (part) {
+            float *prow = part + (qg * n_splits + split) * Q4E_ATTN_PART_STRIDE;
+            if (warp == 0u && (lane & 3u) == 0u) { prow[0] = s_m[r]; prow[1] = s_l[r]; }
+#pragma unroll
+            for (uint32_t f = 0; f < 4; f++) {
+                prow[8u + d0 + 8u * f] = o[f][2 * half_];
+                prow[8u + d0 + 8u * f + 1u] = o[f][2 * half_ + 1];
+            }
+        } else {
+            const float inv = s_l[r] > 0.0f ? 1.0f / s_l[r] : 0.0f;
+            float *orow = out + qg * HD;
+#pragma unroll
+            for (uint32_t f = 0; f < 4; f++) {
+                orow[d0 + 8u * f] = o[f][2 * half_] * inv;
+                orow[d0 + 8u * f + 1u] = o[f][2 * half_ + 1] * inv;
+            }
+        }
+    }
+}
+
+static bool q4e_tc_attention_ready(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached != 0;
+    if (getenv("DS4_QWEN4EXP_ATTN_SCALAR") != NULL) { cached = 0; return false; }
+    int dev = 0, optin = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) != cudaSuccess ||
+        (size_t)optin < Q4E_TC_SMEM ||
+        cudaFuncSetAttribute(q4e_qsa_attention_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             (int)Q4E_TC_SMEM) != cudaSuccess) {
+        (void)cudaGetLastError();
+        cached = 0;
+        return false;
+    }
+    cached = 1;
+    return true;
+}
+
+/* Splits per (row, kv head): one when the chunk already fills the GPU, eight
+ * for decode-sized batches.  Depends on n_tok alone, which every captured
+ * graph already keys on, so a replay never sees a different geometry. */
+static uint32_t q4e_tc_splits(uint32_t n_tok, uint32_t n_head_kv) {
+    return n_tok * n_head_kv >= 64u ? 1u : Q4E_ATTN_GSPLITS;
+}
+
 extern "C" int ds4_gpu_q4e_qsa_attention_sparse(
         ds4_gpu_tensor *out, ds4_gpu_tensor *part,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q,
@@ -3241,6 +3846,20 @@ extern "C" int ds4_gpu_q4e_qsa_attention_sparse(
     if (head_dim != Q4E_ATTN_SPLIT_HD || n_head_kv == 0u || (n_head % n_head_kv) != 0u ||
         n_head / n_head_kv > Q4E_ATTN_QG) return 0;
     if (part->bytes < (uint64_t)n_tok * n_head * Q4E_ATTN_GSPLITS * Q4E_ATTN_PART_STRIDE * sizeof(float)) return 0;
+    if (q4e_tc_attention_ready()) {
+        const uint32_t splits = q4e_tc_splits(n_tok, n_head_kv);
+        const dim3 grid(splits, n_head_kv, n_tok);
+        q4e_qsa_attention_tc_kernel<<<grid, 256, Q4E_TC_SMEM, cuda_decode_stream()>>>(
+                splits == 1u ? (float *)out->ptr : NULL, splits == 1u ? NULL : (float *)part->ptr,
+                (const __half *)k_cache->ptr, (const __half *)v_cache->ptr, (const float *)q->ptr,
+                (const int32_t *)tokens->ptr, (const int32_t *)n_sel->ptr, NULL,
+                (const int32_t *)pages->ptr, width, n_head, n_head_kv, splits);
+        if (!cuda_ok(cudaGetLastError(), "qwen4exp qsa attention tc")) return 0;
+        if (splits == 1u) return 1;
+        q4e_qsa_attention_combine_kernel<<<n_head * n_tok, Q4E_ATTN_SPLIT_HD, 0, cuda_decode_stream()>>>(
+                (float *)out->ptr, (const float *)part->ptr, splits);
+        return cuda_ok(cudaGetLastError(), "qwen4exp qsa attention tc combine");
+    }
     const size_t smem = (size_t)Q4E_ATTN_SPLIT_HD * Q4E_ATTN_KT * sizeof(__half) * 2u +
                         (size_t)Q4E_ATTN_QG * Q4E_ATTN_SPLIT_HD * sizeof(__half) +
                         (size_t)Q4E_ATTN_TILE_WARPS * Q4E_ATTN_KT * sizeof(float);
@@ -3329,6 +3948,17 @@ extern "C" int ds4_gpu_q4e_qsa_attention(
      * identical to the per-query kernel.  DS4_QWEN4EXP_NO_TILED_ATTN=1 falls
      * back to that kernel for A/B. */
     static const int tiled_off = getenv("DS4_QWEN4EXP_NO_TILED_ATTN") != NULL;
+    /* A prefill chunk: the tensor-core kernel over the dense causal range,
+     * one block per (row, kv head), the result written directly. */
+    if (!tiled_off && n_tok >= Q4E_ATTN_QT && head_dim == Q4E_TC_HD && n_head_kv != 0u &&
+        (n_head % n_head_kv) == 0u && n_head / n_head_kv <= 16u && q4e_tc_attention_ready()) {
+        const dim3 grid(1, n_head_kv, n_tok);
+        q4e_qsa_attention_tc_kernel<<<grid, 256, Q4E_TC_SMEM, cuda_decode_stream()>>>(
+                (float *)out->ptr, NULL, (const __half *)k_cache->ptr, (const __half *)v_cache->ptr,
+                (const float *)q->ptr, NULL, NULL, (const int32_t *)pos->ptr,
+                (const int32_t *)pages->ptr, 0u, n_head, n_head_kv, 1u);
+        if (cuda_ok(cudaGetLastError(), "qwen4exp qsa attention tc dense")) return 1;
+    }
     if (!tiled_off && n_tok >= Q4E_ATTN_QT && (head_dim % 32u) == 0u) {
         const size_t smem = 2u * (size_t)head_dim * Q4E_ATTN_KT * sizeof(__half) +
                             (size_t)Q4E_ATTN_QT * head_dim * sizeof(float) +

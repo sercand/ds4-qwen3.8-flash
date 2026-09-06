@@ -36,7 +36,8 @@
  * DS4_QWEN4EXP_EXL3_ORACLE (default misc/qwen4exp-oracle/exl3),
  * DS4_QWEN4EXP_EXL3_PROMPTS (comma list of toy,gate,long; default toy,gate),
  * DS4_QWEN4EXP_EXL3_IDS (ids26k.txt; default the path in run_gate.sh),
- * DS4_QWEN4EXP_MTP (sidecar: the speculative stream must equal greedy). */
+ * DS4_QWEN4EXP_MTP (sidecar: the speculative stream must equal greedy),
+ * DS4_QWEN4EXP_MTP_VOCAB (frequency file for the sliced draft head). */
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,7 +247,10 @@ static int run_prompt(ds4_engine *engine, const char *name, const int *ids, int 
             const double t1 = now();
             while (got_len < n_greedy) {
                 int toks[17];
-                const int first = ds4_session_argmax(spec);
+                /* The first token is the same oracle seed the greedy stream
+                 * took: at a near-tied prompt end the two runs may pick
+                 * differently, and this compares the streams, not the tie. */
+                const int first = got_len == 0 ? greedy[0] : ds4_session_argmax(spec);
                 const int n = ds4_session_eval_speculative_argmax(spec, first, n_greedy - got_len, eos,
                                                                   toks, 17, err, sizeof(err));
                 if (n <= 0) { printf("  [%s] FAIL: speculative step %d: %s\n", name, steps, err); fail = 1; break; }
@@ -316,6 +320,10 @@ int main(void) {
     opt.power_percent = 100;
     const char *mtp = getenv("DS4_QWEN4EXP_MTP");
     if (mtp && mtp[0]) opt.mtp_path = mtp;
+    /* DS4_QWEN4EXP_MTP_VOCAB: the token-frequency file that slices the draft
+     * head; the speculative stream must still equal greedy. */
+    const char *mtp_vocab = getenv("DS4_QWEN4EXP_MTP_VOCAB");
+    if (mtp_vocab && mtp_vocab[0]) opt.mtp_vocab_path = mtp_vocab;
 
     sm_clock();
     ds4_engine *engine = NULL;

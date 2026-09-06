@@ -134,6 +134,10 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    /* qwen4exp: token-frequency file (gguf-tools/qwen4exp_draft_vocab.py) that
+     * slices the MTP draft head to the vocabulary blocks carrying most of the
+     * mass; drafts outside it are simply never proposed. */
+    const char *mtp_vocab_path;
     const char *vision_path;
     ds4_backend backend;
     int n_threads;
