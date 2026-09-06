@@ -11769,11 +11769,17 @@ static double server_cache_hit_rate(const server_cache_report *rep) {
 /* `source` is the reuse label for this request: the engine's source when the
  * engine answered, otherwise the server matcher that supplied the prefix. */
 static void server_cache_note_request(server *s, const char *source,
-                                      int reused, int prefilled) {
+                                      int reused, int prefilled, int matched) {
     if (!s) return;
+    /* `matched` is the prefix whose KV the engine's tree holds (p_kv), which is
+     * not what the prefill can resume from -- that is `reused`, the deepest
+     * checkpoint at or below it.  Both are needed to read a cache miss: a
+     * matched that stalls at the same position while the prompt grows says the
+     * client's prompt diverges there, and one that tracks the previous prompt's
+     * end while reused lags behind says the checkpoint store is the limit. */
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: cache request source=%s reused=%d prefilled=%d",
-               source, reused, prefilled);
+               "ds4-server: cache request source=%s reused=%d matched=%d prefilled=%d",
+               source, reused, matched, prefilled);
     pthread_mutex_lock(&s->mu);
     s->cache_requests++;
     if (reused > 0) s->cache_hits++;
@@ -13950,7 +13956,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     request_reuse_label(reuse_label, sizeof(reuse_label), &reuse, cache_source,
                         cached);
     server_cache_note_request(s, reuse_label, j->req.cache_read_tokens,
-                              j->req.cache_write_tokens);
+                              j->req.cache_write_tokens, reuse.matched_tokens);
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,

@@ -67642,11 +67642,14 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
         q4e_tree_node *n = q4e_tree_add(&c->tree, g->node, tok, g->node->end, q,
                                         &g->kv_table, now);
         if (!n) {
-            /* The span could not join the tree (see q4e_tree_add).  The
-             * context keeps its pages and the cache simply does not learn
-             * this path; nothing is wrong with the request. */
+            /* The span could not join the tree (see q4e_tree_add): a sibling
+             * already carries this first token, or the page table does not
+             * reach the frontier.  The context keeps its pages and the request
+             * is fine -- but every later turn of this conversation then walks
+             * no further than this parent and re-prefills the whole tail, so
+             * the caller says so rather than losing it silently. */
             pthread_mutex_unlock(&c->mu);
-            return 0;
+            return 2;
         }
         q4e_tree_mark_live(n, g->node, +1);
         g->node = n;
@@ -67682,6 +67685,36 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
     }
     pthread_mutex_unlock(&c->mu);
     return 0;
+}
+
+/* Admission rule 5: the frontier a cancelled prefill reached.
+ *
+ * The prefill loop only ever gives up at a chunk boundary, where g->pos, the
+ * session checkpoint and the page table all agree and the recurrent state is
+ * exactly what a commit at that position would have taken anyway -- so the
+ * work is admissible, and throwing it away is a choice, not a constraint.
+ *
+ * Throwing it away is what turns a prompt whose prefill outlives the client's
+ * timeout into a conversation that can never advance again.  The retry starts
+ * from the same checkpoint the cancelled attempt did, takes at least as long,
+ * and is cancelled at the same deadline: measured on this server, a 78395-token
+ * prefill was re-run more than twenty times in forty minutes -- 1.8M tokens of
+ * prefill -- without one of them completing.  Keeping the frontier makes each attempt
+ * resume where the last one stopped, so the retries converge instead.
+ *
+ * The position earns a slot rather than filling a spare one (chunk_only is
+ * false): it stands the whole cancelled prefill above the checkpoint below it,
+ * which is exactly what q4e_ckpt_utility prices, and with the store full there
+ * is no spare slot to fill.  Only a frontier that produced a logit row may
+ * carry one, which a chunk boundary has not. */
+static void q4e_cache_commit_interrupted(ds4_session *s, const ds4_tokens *prompt,
+                                         uint32_t pos) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    if (pos == 0u || !g->cache || (uint32_t)s->checkpoint.len != pos ||
+        g->pos != pos) {
+        return;
+    }
+    (void)q4e_cache_commit(s, prompt->v, pos, g->logits_pos == pos, false);
 }
 
 /* The next position at or before `len` where admission wants the frontier to
@@ -72447,6 +72480,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             uint32_t take = g->tok_cap < left ? g->tok_cap : left;
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
+                q4e_cache_commit_interrupted(s, prompt, pos);
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             /* The executor's hand-off point (see ds4_session_set_prefill_yield).
@@ -72463,6 +72497,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                                   (int)pos, (int)len);
                 if (rows < 0) {
                     snprintf(err, errlen, "interrupted");
+                    q4e_cache_commit_interrupted(s, prompt, pos);
                     return DS4_SESSION_SYNC_INTERRUPTED;
                 }
                 if (rows > 0 && (uint32_t)rows < take) take = (uint32_t)rows;
@@ -72505,10 +72540,14 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 /* A commit that cannot join the tree costs reuse, not
                  * correctness: the context keeps its own pages and carries
                  * on, exactly as the sequence-end caller does. */
-                if (q4e_cache_commit(s, prompt->v, pos, g->logits_pos == pos,
-                                     chunk_only) != 0) {
+                const int rc_commit = q4e_cache_commit(s, prompt->v, pos,
+                                                      g->logits_pos == pos,
+                                                      chunk_only);
+                if (rc_commit != 0) {
                     fprintf(stderr, "ds4: qwen4exp prefix cache could not record "
-                                    "position %u; reuse for this path is lost\n", pos);
+                                    "position %u (%s); reuse for this path is lost\n",
+                            pos, rc_commit == 2 ? "the tree refused the span"
+                                                : "the checkpoint copy failed");
                 }
             }
             ds4_session_report_progress(s, "prefill", (int)pos, prompt->len);
@@ -73643,7 +73682,14 @@ void ds4_session_cache_commit(ds4_session *s) {
                 with_logits ? "with its logits"
                             : "without logits (this frontier has none)");
     }
-    (void)q4e_cache_commit(s, s->checkpoint.v, g->pos, with_logits, false);
+    if (q4e_cache_commit(s, s->checkpoint.v, g->pos, with_logits, false) != 0) {
+        /* The sequence end is the position this conversation's next turn
+         * resumes from.  Losing it costs the whole turn's prefill, so it is
+         * worth a line even though the request itself succeeded. */
+        fprintf(stderr, "ds4: qwen4exp prefix cache could not record the sequence "
+                        "end at %u; the next turn will re-prefill from lower down\n",
+                g->pos);
+    }
 #endif
 }
 
