@@ -803,6 +803,10 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    /* OpenAI service_tier=flex (or header X-Service-Tier: flex): background
+     * work that only runs while no normal request is dispatched, and parks
+     * mid-stream when one is.  See docs/superpowers/specs/2026-09-07-flex-service-tier-design.md. */
+    bool flex;
     bool ignore_eos;
     int cache_read_tokens;
     int cache_write_tokens;
@@ -1024,6 +1028,17 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
 
 static bool parse_ignore_eos_value(const char **p, request *r) {
     return p && r && json_bool(p, &r->ignore_eos);
+}
+
+/* "service_tier": "flex" selects the background tier; every other string
+ * ("auto", "default", "priority") is the normal tier.  A non-string is a
+ * malformed request like any other mistyped field. */
+static bool parse_service_tier_value(const char **p, request *r) {
+    char *v = NULL;
+    if (!p || !r || !json_string(p, &v)) return false;
+    r->flex = v && strcasecmp(v, "flex") == 0;
+    free(v);
+    return true;
 }
 
 static bool request_validate_ignore_eos(const request *r,
@@ -3931,6 +3946,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "service_tier")) {
+            if (!parse_service_tier_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stream_options")) {
             if (!parse_stream_options(&p, &r->stream_include_usage)) {
                 free(key);
@@ -5137,6 +5157,11 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "service_tier")) {
+            if (!parse_service_tier_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "reasoning")) {
             bool effort_seen = false;
             if (!parse_responses_reasoning(&p, &reasoning_effort,
@@ -5389,6 +5414,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             r->seed = v > 0.0 ? (uint64_t)v : 0;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "service_tier")) {
+            if (!parse_service_tier_value(&p, r)) {
                 free(key);
                 goto bad;
             }
@@ -15348,6 +15378,7 @@ typedef struct {
     char path[256];
     char *body;
     size_t body_len;
+    bool flex_header;
 } http_request;
 
 static void http_request_free(http_request *r) {
@@ -15365,21 +15396,38 @@ static ssize_t header_end(const char *p, size_t n) {
     return -1;
 }
 
-static long content_length(const char *h, size_t n) {
+/* Value of header `name` (case-insensitive), trimmed, or false when absent.
+ * `h`/`n` span the request head up to and including the blank line. */
+static bool header_value(const char *h, size_t n, const char *name,
+                         char *out, size_t outlen) {
+    const size_t name_len = strlen(name);
     const char *p = h, *end = h + n;
     while (p < end) {
         const char *line = p;
         while (p < end && *p != '\n') p++;
         size_t len = (size_t)(p - line);
         if (len && line[len - 1] == '\r') len--;
-        if (len >= 15 && strncasecmp(line, "Content-Length:", 15) == 0) {
-            const char *v = line + 15;
-            while (v < line + len && isspace((unsigned char)*v)) v++;
-            return strtol(v, NULL, 10);
+        if (len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            const char *v = line + name_len + 1;
+            const char *vend = line + len;
+            while (v < vend && isspace((unsigned char)*v)) v++;
+            while (vend > v && isspace((unsigned char)vend[-1])) vend--;
+            size_t vlen = (size_t)(vend - v);
+            if (vlen >= outlen) vlen = outlen - 1;
+            memcpy(out, v, vlen);
+            out[vlen] = '\0';
+            return true;
         }
         if (p < end) p++;
     }
-    return 0;
+    return false;
+}
+
+static long content_length(const char *h, size_t n) {
+    char v[32];
+    if (!header_value(h, n, "Content-Length", v, sizeof(v))) return 0;
+    return strtol(v, NULL, 10);
 }
 
 static bool read_http_request(int fd, http_request *r) {
@@ -15410,6 +15458,10 @@ static bool read_http_request(int fd, http_request *r) {
     if (q) *q = '\0';
 
     long clen = content_length(b.ptr, (size_t)hend);
+    char tier[32];
+    r->flex_header = header_value(b.ptr, (size_t)hend, "X-Service-Tier",
+                                  tier, sizeof(tier)) &&
+                     strcasecmp(tier, "flex") == 0;
     if (clen < 0 || (size_t)clen > max_body) goto fail;
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
@@ -15721,7 +15773,10 @@ static void *client_main(void *arg) {
         http_request_free(&hr);
         goto done;
     }
-    if (ok) req.raw_body = xstrndup(hr.body, hr.body_len);
+    if (ok) {
+        req.raw_body = xstrndup(hr.body, hr.body_len);
+        if (hr.flex_header) req.flex = true;
+    }
     http_request_free(&hr);
     if (!ok) {
         http_error(fd, s->enable_cors, 400, err);
@@ -22253,7 +22308,61 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_flex_request_tier_parsing(void) {
+    request r;
+    char err[128] = {0};
+
+    /* Body: OpenAI-shaped parsers accept "service_tier". A NULL engine/server
+     * can only be used here to exercise a *rejection* path: on success every
+     * one of these parsers unconditionally calls
+     * request_tokenize_multimodal_prompt() -> ds4_tokenize_rendered_chat(),
+     * which dereferences e->vocab and crashes with e == NULL (confirmed via
+     * gdb: SIGSEGV in special_token_at on vocab==(ds4_vocab*)0x8a0). This is
+     * pre-existing and unrelated to service_tier -- no test in this file
+     * calls parse_chat_request/parse_completion_request/parse_responses_request
+     * with NULL engine/server and expects success. So the service_tier
+     * "flex"/"default"/absent success cases are covered instead by the
+     * standalone parse_service_tier_value tests below, and the body-parser
+     * wiring is verified here only through the crash-free rejection path
+     * (a non-string tier goes to `bad` before tokenization). */
+    TEST_ASSERT(!parse_chat_request(NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"service_tier\":1}",
+        128, 32768, &r, err, sizeof(err)));
+
+    TEST_ASSERT(!parse_completion_request(NULL,
+        "{\"prompt\":\"hi\",\"service_tier\":1}",
+        128, 32768, &r, err, sizeof(err)));
+
+    TEST_ASSERT(!parse_responses_request(NULL, NULL,
+        "{\"input\":\"hi\",\"service_tier\":1}",
+        128, 32768, &r, err, sizeof(err)));
+
+    /* The value parser on its own. */
+    request_init(&r, REQ_CHAT, 128);
+    const char *p = "\"flex\"";
+    TEST_ASSERT(parse_service_tier_value(&p, &r) && r.flex && *p == '\0');
+    p = "\"FLEX\"";
+    r.flex = false;
+    TEST_ASSERT(parse_service_tier_value(&p, &r) && r.flex);
+    p = "null";
+    TEST_ASSERT(!parse_service_tier_value(&p, &r));
+    request_free(&r);
+
+    /* Header scan. */
+    const char *hdr = "POST /v1/chat/completions HTTP/1.1\r\n"
+                      "Content-Length: 5\r\n"
+                      "x-service-tier:  Flex \r\n\r\n";
+    char v[32];
+    TEST_ASSERT(header_value(hdr, strlen(hdr), "X-Service-Tier", v, sizeof(v)));
+    TEST_ASSERT(!strcmp(v, "Flex"));
+    TEST_ASSERT(header_value(hdr, strlen(hdr), "Content-Length", v, sizeof(v)));
+    TEST_ASSERT(!strcmp(v, "5"));
+    TEST_ASSERT(!header_value(hdr, strlen(hdr), "Authorization", v, sizeof(v)));
+    TEST_ASSERT(content_length(hdr, strlen(hdr)) == 5);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_flex_request_tier_parsing();
     test_batched_prefill_round_robin();
     test_cancel_clears_awaiting_first_grant();
     test_multi_ctx_decode_round_robin();
