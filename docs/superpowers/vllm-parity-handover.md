@@ -63,21 +63,21 @@ blocks/SM instead of 1, bit-exact, ~-5 ms at B=3 and more at B=8); (3) the
 15-row verify's MoE (~50 ms) is at the bandwidth floor for ~100 distinct
 experts -- only fewer rows help, which is why K=3.
 
-**Lever A landed opt-in (2026-09-07, later the same day; GPU was held by the
-service, so untested on the GPU):** `q4e_mtp_draft_batch` + `q4e_spec_draft_batch`
+**Lever A landed and is the default (validated 2026-09-07 evening: specbatch
+gate ok, drafts 13 -> 5.8 ms; live B=3 tick 108 -> 101.5 ms / 65.7 -> 68.8
+tok/s end to end; B=4 tick 130 -> 119 ms / 75.9 -> 78.1, ~97 tok/s steady
+state against vLLM's 108; `DS4_QWEN4EXP_BATCH_DRAFTS=0` opts out):** `q4e_mtp_draft_batch` + `q4e_spec_draft_batch`
 (`ds4.c`) run every member's draft chain in lockstep -- one segmented pass
 flushing all pending rows, then one row per member per depth -- through the
 draft head's shared KV pool with per-row page tables (`g->batch`), projecting
 the head for all rows at once (`mtp_logits` is now `logit_rows` deep,
-`mtp_hidden` gathers the inputs).  Enable with `DS4_QWEN4EXP_BATCH_DRAFTS=1`.
-Validate in this order once the GPU is free, then flip the default in
-`q4e_spec_step_batch`:
+`mtp_hidden` gathers the inputs).  The validation that was run:
 ```
 DS4_QWEN4EXP_BATCH_DRAFTS=1 ./tests/test_qwen4exp_specbatch      # committed == greedy
 DS4_QWEN4EXP_BATCH_DRAFTS=1 DS4_QWEN4EXP_SPEC_LOG=2 misc/qwen4exp-numerics/q4espec_bench specbat 3 30   # drafts= should drop ~17 -> ~6 ms
 misc/qwen4exp-numerics/server_ab.sh draftsA 3 DS4_QWEN4EXP_BATCH_DRAFTS=1  # vs the 108 ms / ~79 tok/s baseline
 ```
-Expected: B=3 tick 108 -> ~98 ms (~87 tok/s), B=4 ~14 ms less.  The same
+The same
 change makes the batched paths' mRoPE image-aware (`q4e_mrope_batch_row`):
 `q4e_forward_batch`/`q4e_forward_segmented` used scalar positions, which are
 wrong after an image (the temporal index runs behind the KV slot).

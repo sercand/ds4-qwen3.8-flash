@@ -71630,14 +71630,15 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
     /* Drafts: every member's chain in lockstep, one pass per depth over all
      * of them -- the flush of each member's pending rows first (a segmented
      * pass, since the rows per member vary), then one row per member still
-     * drafting.  Opt-in (DS4_QWEN4EXP_BATCH_DRAFTS=1) until its GPU gates have
-     * run: tests/test_qwen4exp_specbatch under that variable, then the live
-     * three-stream A/B in misc/qwen4exp-numerics/server_ab.sh.  The trace and
+     * drafting.  Measured 2026-09-07 (GB10, live server): drafts 13 -> 5.8 ms
+     * of the three-stream tick (108 -> 101 ms), four-stream tick 130 -> 119,
+     * committed tokens identical (tests/test_qwen4exp_specbatch).
+     * DS4_QWEN4EXP_BATCH_DRAFTS=0 restores the serial drafts; the trace and
      * dump paths know only the single-session draft, so they keep it. */
     static int batched_drafts = -1;
     if (batched_drafts < 0) {
         const char *bd = getenv("DS4_QWEN4EXP_BATCH_DRAFTS");
-        batched_drafts = (bd && bd[0] && bd[0] != '0') ? 1 : 0;
+        batched_drafts = (bd && bd[0] == '0') ? 0 : 1;
     }
     const bool serial = !batched_drafts || q4e_trace_enabled() || getenv("DS4_QWEN4EXP_MTP_DUMP");
     if (serial) {
