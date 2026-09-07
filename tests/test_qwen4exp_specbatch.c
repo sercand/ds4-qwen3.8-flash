@@ -8,6 +8,15 @@
  * near-tied argmax may flip and the streams separate from there; the first
  * divergence and how far they agreed are reported.
  *
+ * The second case is a MIXED tick: only some members set item.speculate.  The
+ * server's decode coordinator builds exactly this -- a slot inside a tool call
+ * decodes greedily and asks to speculate while a sampled slot next to it does
+ * not -- and a member that did not ask must commit exactly ONE token, because
+ * one token is all its caller emits.  Before the per-member draft depth landed,
+ * every member of the tick drafted; the plain member's accepted drafts went
+ * into its KV and never reached the response text, which is how generated text
+ * came out as a subsequence of itself (a tool call lost its "<function").
+ *
  * Env: DS4_QWEN4EXP_MODEL (skips without it), DS4_QWEN4EXP_MTP (the draft head;
  * without it spec_k=0 and this reduces to batched plain decode, still exact). */
 #include <stdio.h>
@@ -43,6 +52,49 @@ static ds4_session *mk(ds4_engine *e, int ctx, int i, char *err, size_t el) {
     ds4_tokens_free(&p);
     if (rc != 0) { ds4_session_free(s); return NULL; }
     return s;
+}
+
+/* One batched-speculative generation with a per-member speculate mask.
+ * `over` counts ticks on which a member that did not ask to speculate
+ * committed more than one token -- the caller of such a member emits exactly
+ * one, so anything more is text lost against the session's KV. */
+static int run_batch(ds4_engine *engine, int ctx, const int *spec,
+                     int (*out)[GEN], float *lg, int nv, int *over,
+                     char *err, size_t el) {
+    ds4_session *ss[NSEQ];
+    ds4_decode_item it[NSEQ];
+    int filled[NSEQ] = {0};
+    int rc = 0;
+    *over = 0;
+    for (int i = 0; i < NSEQ; i++) ss[i] = NULL;
+    for (int i = 0; i < NSEQ; i++) {
+        ss[i] = mk(engine, ctx, i, err, el);
+        if (!ss[i]) { rc = 1; goto out_free; }
+        ds4_session_copy_logits(ss[i], lg, nv);
+        memset(&it[i], 0, sizeof(it[i]));
+        it[i].session = ss[i];
+        it[i].token = amax(lg, nv);
+        it[i].speculate = spec[i] != 0;
+    }
+    int done_all = 0;
+    while (!done_all) {
+        int acc[NSEQ][DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1];
+        int com[NSEQ];
+        if (ds4_sessions_eval_speculative_batch(it, NSEQ, -1, acc, com, err, el) != 0) {
+            rc = 1; goto out_free;
+        }
+        done_all = 1;
+        for (int i = 0; i < NSEQ; i++) {
+            if (!spec[i] && com[i] > 1) (*over)++;
+            for (int j = 0; j < com[i] && filled[i] < GEN; j++) out[i][filled[i]++] = acc[i][j];
+            ds4_session_copy_logits(ss[i], lg, nv);
+            it[i].token = amax(lg, nv);
+            if (filled[i] < GEN) done_all = 0;
+        }
+    }
+out_free:
+    for (int i = 0; i < NSEQ; i++) if (ss[i]) ds4_session_free(ss[i]);
+    return rc;
 }
 
 int main(void) {
@@ -88,50 +140,40 @@ int main(void) {
         ds4_session_free(s);
     }
 
-    /* Batched speculative. */
-    {
-        ds4_session *ss[NSEQ];
-        ds4_decode_item it[NSEQ];
-        int filled[NSEQ] = {0};
+    /* All members speculating, then a mixed tick. */
+    for (int pass = 0; pass < 2; pass++) {
+        int spec[NSEQ];
+        int over = 0;   /* non-speculating members that committed more than one */
+        for (int i = 0; i < NSEQ; i++) spec[i] = (pass == 0) ? 1 : (i % 2 == 0);
+        if (run_batch(engine, ctx, spec, bat, lg, nv, &over, err, sizeof(err)) != 0) {
+            printf("  FAIL: %s batch: %s\n", pass ? "mixed" : "spec", err);
+            fail = 1; goto done;
+        }
+        printf("  %s tick:\n", pass ? "mixed" : "all-speculative");
+        if (pass == 1) {
+            /* The regression this gate exists for. */
+            if (over != 0) {
+                printf("    FAIL: a non-speculating member committed more than one "
+                       "token on %d tick(s) -- those tokens never reach the caller\n", over);
+                fail = 1;
+            } else {
+                printf("    plain members committed exactly one token per tick\n");
+            }
+        }
         for (int i = 0; i < NSEQ; i++) {
-            ss[i] = mk(engine, ctx, i, err, sizeof(err));
-            if (!ss[i]) { printf("  FAIL: bat session %d: %s\n", i, err); fail = 1; goto done; }
-            ds4_session_copy_logits(ss[i], lg, nv);
-            it[i].session = ss[i];
-            it[i].token = amax(lg, nv);
-        }
-        int done_all = 0;
-        while (!done_all) {
-            int acc[NSEQ][DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1];
-            int com[NSEQ];
-            if (ds4_sessions_eval_speculative_batch(it, NSEQ, -1, acc, com, err, sizeof(err)) != 0) {
-                printf("  FAIL: spec batch: %s\n", err);
-                for (int i = 0; i < NSEQ; i++) ds4_session_free(ss[i]);
-                fail = 1; goto done;
+            int agree = 0;
+            while (agree < GEN && ref[i][agree] == bat[i][agree]) agree++;
+            if (agree == GEN) {
+                printf("    seq %d (%s): %d/%d committed tokens match\n",
+                       i, spec[i] ? "spec" : "plain", agree, GEN);
+            } else {
+                /* A late divergence is a near-tie the MoE regrouping tipped; an
+                 * immediate one is a real defect. */
+                printf("    %s seq %d (%s): agreed %d/%d, then greedy %d vs batched %d\n",
+                       agree >= 8 ? "near-tie" : "FAIL", i, spec[i] ? "spec" : "plain",
+                       agree, GEN, ref[i][agree], bat[i][agree]);
+                if (agree < 8) fail = 1;
             }
-            done_all = 1;
-            for (int i = 0; i < NSEQ; i++) {
-                for (int j = 0; j < com[i] && filled[i] < GEN; j++) bat[i][filled[i]++] = acc[i][j];
-                ds4_session_copy_logits(ss[i], lg, nv);
-                it[i].token = amax(lg, nv);
-                if (filled[i] < GEN) done_all = 0;
-            }
-        }
-        for (int i = 0; i < NSEQ; i++) ds4_session_free(ss[i]);
-    }
-
-    for (int i = 0; i < NSEQ; i++) {
-        int agree = 0;
-        while (agree < GEN && ref[i][agree] == bat[i][agree]) agree++;
-        if (agree == GEN) {
-            printf("  seq %d: %d/%d committed tokens match\n", i, agree, GEN);
-        } else {
-            /* A late divergence is a near-tie the MoE regrouping tipped; an
-             * immediate one is a real defect. */
-            printf("  %s seq %d: agreed %d/%d, then greedy %d vs batched %d\n",
-                   agree >= 8 ? "near-tie" : "FAIL", i, agree, GEN,
-                   ref[i][agree], bat[i][agree]);
-            if (agree < 8) fail = 1;
         }
     }
     printf("batched speculative gate: %s\n", fail ? "FAILED" : "ok");

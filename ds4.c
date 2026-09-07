@@ -71594,9 +71594,13 @@ static int q4e_spec_draft_batch(ds4_session **sessions, const int *first_tokens,
  * segmented forward, accept and roll back each on its own.  Same result as
  * calling q4e_spec_step per session, but the verify -- the pass over the
  * weights -- is shared.  `accepted[i]` receives the 1 + a_i committed tokens
- * for session i; committed[i] is that count.  Greedy only. */
+ * for session i; committed[i] is that count.  Greedy only.
+ * K_ceil is per member: K_ceil[i] == 0 means "verify this member's one token,
+ * do not draft it", which is what a non-speculative slot sharing the tick
+ * needs -- it still rides the weight pass and still gets its MTP residual
+ * staged, but committed[i] is exactly 1. */
 static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
-                               uint32_t n_sess, uint32_t K_ceil, int eos_token,
+                               uint32_t n_sess, const uint32_t *K_ceil, int eos_token,
                                int (*accepted)[Q4E_SPEC_MAX_DRAFT + 1], int *committed,
                                char *err, size_t errlen) {
     if (n_sess == 0) return -1;
@@ -71622,7 +71626,11 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
     for (uint32_t i = 0; i < n_sess; i++) {
         ds4_session *s = sessions[i];
         pos0[i] = (uint32_t)s->checkpoint.len;
-        uint32_t K = K_ceil;
+        if (pos0[i] + 1u > s->q4e_graph.ctx_size) {
+            if (errlen) snprintf(err, errlen, "qwen4exp context is full");
+            return -1;
+        }
+        uint32_t K = K_ceil[i];
         if (K > s->q4e_graph.spec_k) K = s->q4e_graph.spec_k;
         if (pos0[i] + 1u + K > s->q4e_graph.ctx_size) K = s->q4e_graph.ctx_size - pos0[i] - 1u;
         Kc[i] = K;
@@ -71784,7 +71792,13 @@ int ds4_sessions_eval_speculative_batch(ds4_decode_item *items, int count,
         }
         if (cap > 0 && K > (uint32_t)cap) K = (uint32_t)cap;
     }
-    return q4e_spec_step_batch(ss, first, (uint32_t)count, K, eos_token,
+    /* Per-member depth.  A member that did not ask to speculate rides the
+     * shared weight pass at depth 0 and commits exactly one token, so a
+     * coordinator that mixes speculative and plain slots in one tick cannot
+     * advance a plain slot's session past the single token its caller emits. */
+    uint32_t Kc[DS4_EXEC_CONTEXTS_MAX];
+    for (int i = 0; i < count; i++) Kc[i] = items[i].speculate ? K : 0u;
+    return q4e_spec_step_batch(ss, first, (uint32_t)count, Kc, eos_token,
                                accepted, committed, err, errlen);
 }
 #endif /* DS4_NO_GPU */

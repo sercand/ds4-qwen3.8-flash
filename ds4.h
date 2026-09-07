@@ -654,6 +654,13 @@ int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
 typedef struct {
     ds4_session *session;
     int token;
+    /* Batched speculative ticks only: draft this member.  A member left false
+     * takes draft depth 0 -- it still rides the shared weight pass and still
+     * has its MTP residual staged, but it commits exactly the one token its
+     * caller emits.  The coordinator mixes speculative and plain slots in one
+     * tick, and a plain slot that drafted would have its accepted tokens
+     * committed to the KV and dropped from the response text. */
+    bool speculate;
 } ds4_decode_item;
 
 /* Advance independent sessions by one token each. Batch size one is exactly

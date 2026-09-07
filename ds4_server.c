@@ -12592,7 +12592,7 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen);
+                             int *toks, int *ntok_out, char *err, size_t errlen);
 
 static char *rendered_chat_system_region(const char *prompt_text) {
     if (!prompt_text) return xstrdup("");
@@ -13825,8 +13825,15 @@ static bool server_cancel_pending_decode_locked(server *s, server_slot *slot) {
     return true;
 }
 
+/* Advance one slot by one token.  `toks`/`ntok_out` receive the tokens the
+ * step actually committed: normally just `token`, but the decode coordinator
+ * may run this slot inside a speculative tick, and then the session has
+ * advanced past `token` by the drafts it accepted.  Returning them is what
+ * keeps the response text and the session's KV in step -- a caller that
+ * assumed one token here silently dropped the rest. */
 static int server_eval_token(server *s, server_slot *slot, int token,
-                             char *err, size_t errlen) {
+                             int *toks, int *ntok_out, char *err, size_t errlen) {
+    if (toks && ntok_out) { toks[0] = token; *ntok_out = 1; }
     if (!s || !slot) return 1;
     if (s->multi_ctx_mode && !server_batch_decode_now(s)) {
         /* One grant of the model for one token.  No coalescing: contexts here
@@ -13871,6 +13878,7 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     slot->decode_rc = 1;
     slot->decode_err[0] = '\0';
     slot->decode_done = false;
+    slot->decode_committed_n = 0;
     slot->decode_pending = true;
     s->decode_pending++;
     pthread_cond_broadcast(&s->model_cv);
@@ -13896,6 +13904,21 @@ static int server_eval_token(server *s, server_slot *slot, int token,
                  g_stop_requested ? "shutdown requested" :
                  (slot->decode_err[0] ? slot->decode_err : "decode interrupted"));
     }
+    /* A non-speculative member of a speculative tick takes draft depth 0, so
+     * this is 1.  If it is ever more, the tick advanced this session past the
+     * caller's token: hand the extra tokens back rather than lose them, and
+     * say so -- the accepted drafts are greedy, which a sampled request did
+     * not ask for. */
+    if (rc == 0 && toks && ntok_out && slot->decode_committed_n > 1) {
+        int n = slot->decode_committed_n;
+        if (n > DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1) n = DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1;
+        for (int i = 0; i < n; i++) toks[i] = slot->decode_committed[i];
+        *ntok_out = n;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: plain decode step committed %d tokens in a speculative tick",
+                   n);
+    }
+    slot->decode_committed_n = 0;
     slot->decode_done = false;
     pthread_mutex_unlock(&s->model_mu);
     return rc;
@@ -14017,6 +14040,12 @@ static void *decode_worker_main(void *arg) {
             members[count] = slot;
             items[count].session = slot->session;
             items[count].token = slot->decode_token;
+            /* Per member, not per tick: a slot that did not ask to speculate
+             * drafts to depth 0 inside a speculative tick, so it commits the
+             * one token its caller emits.  Before this, tick_spec upgraded
+             * every member and a plain slot's accepted drafts were committed
+             * to its KV and dropped from the response text. */
+            items[count].speculate = slot->decode_spec;
             if (slot->decode_spec) tick_spec = true;
             count++;
         }
@@ -14765,12 +14794,12 @@ decode_again:
             }
             ntok = nt;
         } else {
-            if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
+            int nt = 0;
+            if (server_eval_token(s, slot, token, toks, &nt, err, sizeof(err)) != 0) {
                 finish = "error";
                 break;
             }
-            toks[0] = token;
-            ntok = 1;
+            ntok = nt;
         }
 
         bool stop_decode = false;
