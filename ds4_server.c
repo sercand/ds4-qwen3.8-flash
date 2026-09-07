@@ -10322,6 +10322,9 @@ struct server_slot {
     bool promoted;    /* a normal request is bound to this flex slot: run as normal */
     bool generating;  /* inside generate_job_inner's decode loop */
     bool parked;      /* the worker is waiting at server_flex_pause_point */
+    /* The worker's live progress struct while one is installed; the pause
+     * point keeps the stream alive through it.  Worker-thread only. */
+    struct server_prefill_progress *progress;
 
     bool decode_pending;
     bool decode_in_flight;
@@ -12408,7 +12411,7 @@ static void trace_finish(
     pthread_mutex_unlock(&s->trace_mu);
 }
 
-typedef struct {
+typedef struct server_prefill_progress {
     server *srv;
     server_slot *slot;
     req_kind kind;
@@ -12740,9 +12743,8 @@ static int server_normal_active_locked(const server *s) {
 
 /* model_mu held: may this slot take a step now?  Only an unpromoted flex
  * slot with normal work dispatched is held back.  The future single tick
- * loop evaluates exactly this per row.  MAYBE_UNUSED until the pause point
- * calls it; only the unit tests exercise it today. */
-static DS4_SERVER_MAYBE_UNUSED bool server_slot_runnable_locked(
+ * loop evaluates exactly this per row. */
+static bool server_slot_runnable_locked(
     const server *s, const server_slot *slot) {
     if (!s || !slot) return false;
     if (slot->tier != SLOT_TIER_FLEX || slot->promoted) return true;
@@ -13002,6 +13004,60 @@ static int server_prefill_chunk_rows(server *s, const server_slot *slot) {
     return contended ? s->mixed_prefill_quantum : 0;
 }
 
+static void timespec_add_us(struct timespec *ts, long us);
+static bool server_stream_keepalive(server_prefill_progress *p, const char *comment);
+
+/* The flex tier's one scheduling hook.  A flex slot's worker calls this
+ * between steps -- at the top of each decode iteration and between prefill
+ * chunks -- and waits here while any slot holds normal work.  The grant
+ * functions are untouched: a normal dispatched while this slot is already
+ * inside a grant costs at most that one step.
+ *
+ * Nothing but `parked` is written, so cancel and error paths cannot drift a
+ * counter.  awaiting_first_grant is cleared because a fully cached prompt
+ * reaches this point before its first grant, and a normal prefill would
+ * otherwise defer to a startup that is parked.  The keepalive write runs
+ * with model_mu released (send_all can block for two seconds). */
+#define DS4_FLEX_KEEPALIVE_SEC 5.0
+
+static bool server_flex_pause_point(server *s, server_slot *slot, job *j) {
+    if (!s || !slot || !s->multi_ctx_mode) return true;
+    if (g_stop_requested || job_cancelled(j)) return false;
+    const bool log = getenv("DS4_SERVER_BATCH_LOG") != NULL;
+    double parked_at = 0.0;
+
+    pthread_mutex_lock(&s->model_mu);
+    while (!g_stop_requested && !s->model_stopping && !job_cancelled(j) &&
+           !server_slot_runnable_locked(s, slot)) {
+        if (!slot->parked) {
+            slot->parked = true;
+            slot->awaiting_first_grant = false;
+            parked_at = now_sec();
+            if (log) server_log(DS4_LOG_DEFAULT, "ds4-server: flex slot %d parked", slot->id);
+            pthread_cond_broadcast(&s->model_cv);
+        }
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        timespec_add_us(&deadline, (long)(DS4_FLEX_KEEPALIVE_SEC * 1e6));
+        int rc = pthread_cond_timedwait(&s->model_cv, &s->model_mu, &deadline);
+        if (rc == ETIMEDOUT && slot->progress) {
+            pthread_mutex_unlock(&s->model_mu);
+            (void)server_stream_keepalive(slot->progress, ": keepalive\n\n");
+            pthread_mutex_lock(&s->model_mu);
+        }
+    }
+    const bool was_parked = slot->parked;
+    slot->parked = false;
+    const bool ok = !g_stop_requested && !s->model_stopping && !job_cancelled(j);
+    if (was_parked) pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
+    if (was_parked && log) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: flex slot %d %s after %.1f s",
+                   slot->id, ok ? "resumed" : "released", now_sec() - parked_at);
+    }
+    return ok;
+}
+
 static int server_prefill_yield_cb(void *ud, int pos, int len) {
     server_prefill_turn *t = ud;
     (void)pos;
@@ -13012,6 +13068,12 @@ static int server_prefill_yield_cb(void *ud, int pos, int len) {
     }
     server_model_leave(t->srv);
     t->held = false;
+    /* A flex prefill parks between chunks while normal work is dispatched.
+     * tier and work are stable for the life of this slot's own request. */
+    if (t->slot->tier == SLOT_TIER_FLEX &&
+        !server_flex_pause_point(t->srv, t->slot, t->slot->work)) {
+        return -1;
+    }
     if (!server_model_enter_prefill(t->srv, t->slot)) return -1;
     t->held = true;
     return server_prefill_chunk_rows(t->srv, t->slot);
@@ -13270,39 +13332,50 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     }
 }
 
+/* Keep a streaming client alive while the server is not producing tokens:
+ * the SSE headers go out first if they have not yet, then `comment` (a `:`
+ * line, ignored by SSE clients; must end in a blank line).  Shared by the
+ * prefill progress callback and the flex pause point.  Returns false, marks
+ * the stream failed and cancels the job when the socket is gone.  Never call
+ * with model_mu held: send_all can block for DS4_SERVER_SEND_STALL_TIMEOUT_MS. */
+static bool server_stream_keepalive(server_prefill_progress *p, const char *comment) {
+    if (!p || !p->stream || p->fd < 0 || p->stream_failed) return true;
+    if (p->request_job && job_cancelled(p->request_job)) return false;
+    bool ok = true;
+    if (!p->headers_sent) {
+        p->headers_sent = true;
+        ok = sse_headers(p->fd, p->enable_cors);
+    }
+    if (ok && comment) ok = send_all(p->fd, comment, strlen(comment));
+    if (!ok) {
+        p->stream_failed = true;
+        if (p->request_job) job_mark_cancelled(p->request_job);
+        return false;
+    }
+    p->last_keepalive = now_sec();
+    return true;
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event || job_cancelled(p->request_job)) return;
-    const bool is_chunk = strcmp(event, "prefill_chunk") == 0;
+    /* "prefill" is what the qwen4exp multi-context prefill reports per chunk
+     * (ds4.c, pos/prompt->len like "prefill_chunk"); without it a long
+     * prefill there sent neither headers nor keepalives. */
+    const bool is_chunk = strcmp(event, "prefill_chunk") == 0 ||
+                          strcmp(event, "prefill") == 0;
     const bool is_display = strcmp(event, "prefill_display") == 0;
     if (!is_chunk && !is_display) return;
 
     double now = now_sec();
-    /* Keep the HTTP/SSE connection alive while prefill runs.  We write the SSE
-     * response headers the first time the callback fires and then emit a
-     * comment line (`:` prefix, ignored by SSE clients) every few seconds.
-     * A failed write marks the job cancelled; the session callback then stops
-     * prefill at the next backend-safe boundary. */
-    if (p->stream && p->fd >= 0 && !p->stream_failed) {
-        if (!p->headers_sent) {
-            p->headers_sent = true;
-            if (sse_headers(p->fd, p->enable_cors)) {
-                p->last_keepalive = now;
-            } else {
-                p->stream_failed = true;
-                job_mark_cancelled(p->request_job);
-                return;
-            }
-        } else if (now - p->last_keepalive >= 5.0) {
-            static const char ka[] = ": prefill\n\n";
-            if (send_all(p->fd, ka, sizeof(ka) - 1)) {
-                p->last_keepalive = now;
-            } else {
-                p->stream_failed = true;
-                job_mark_cancelled(p->request_job);
-                return;
-            }
-        }
+    /* Keep the HTTP/SSE connection alive while prefill runs: headers on the
+     * first callback, then a comment line every few seconds.  A failed write
+     * marks the job cancelled; the session callback then stops prefill at the
+     * next backend-safe boundary. */
+    if (!p->headers_sent) {
+        if (!server_stream_keepalive(p, NULL)) return;
+    } else if (now - p->last_keepalive >= 5.0) {
+        if (!server_stream_keepalive(p, ": prefill\n\n")) return;
     }
     if (is_display) return;
     double elapsed = now - p->t0;
@@ -13600,10 +13673,12 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
         };
         snprintf(rebuild_progress.ctx, sizeof(rebuild_progress.ctx), "%s", rebuild_ctx);
         ds4_session_set_progress(slot->session, server_progress_cb, &rebuild_progress);
+        slot->progress = &rebuild_progress;
         ds4_session_set_display_progress(slot->session, server_progress_cb, &rebuild_progress);
         if (server_session_sync(s, slot, sync_prompt,
                                 sync_err, sizeof(sync_err)) == 0) {
             ds4_session_set_progress(slot->session, NULL, NULL);
+            slot->progress = NULL;
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             const double rebuild_sec = now_sec() - rebuild_t0;
             if (loaded > 0) {
@@ -13623,6 +13698,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
             }
         } else {
             ds4_session_set_progress(slot->session, NULL, NULL);
+            slot->progress = NULL;
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: tool checkpoint rebuild failed ctx=%s request_ctx=%s source=%s cached=%d replay=%d target=%d error=\"%s\"",
@@ -14221,6 +14297,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
                req_flags[0] ? " " : "",
                req_flags);
     ds4_session_set_progress(slot->session, server_progress_cb, &progress);
+    slot->progress = &progress;
     ds4_session_set_display_progress(slot->session, server_progress_cb, &progress);
     /* The boundaries this client may branch from next turn.  A recurrent
      * family puts a checkpoint at each: the end of the rendered scaffolding
@@ -14305,6 +14382,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
+            slot->progress = NULL;
             ds4_session_set_display_progress(slot->session, NULL, NULL);
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
@@ -14339,6 +14417,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (prompt_sync_rc != 0) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
+        slot->progress = NULL;
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                          cold_store_len);
@@ -14356,6 +14435,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     free(disk_cache_path);
     if (job_cancelled(j)) {
         ds4_session_set_progress(slot->session, NULL, NULL);
+        slot->progress = NULL;
         ds4_session_set_display_progress(slot->session, NULL, NULL);
         request_live_state_clear(s, slot);
         trace_event(s, trace_id, "cancelled after prefill");
@@ -14368,6 +14448,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     if (!anthropic_live_continuation) anthropic_live_clear(s, slot);
     if (!thinking_live_continuation) thinking_live_clear(s, slot);
     ds4_session_set_progress(slot->session, NULL, NULL);
+    slot->progress = NULL;
     ds4_session_set_display_progress(slot->session, NULL, NULL);
     if (!multimodal) kv_cache_maybe_store_continued(s, slot);
     server_log(DS4_LOG_PREFILL,
@@ -14520,6 +14601,12 @@ decode_again:
     server_generation_enter(s, slot);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
+        if (j->req.flex && !server_flex_pause_point(s, slot, j)) {
+            finish = "error";
+            snprintf(err, sizeof(err), "%s",
+                     g_stop_requested ? "shutdown requested" : "client disconnected");
+            break;
+        }
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
@@ -15322,6 +15409,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     pthread_mutex_lock(&s->model_mu);
     slot->running = j;
     pthread_mutex_unlock(&s->model_mu);
+    slot->progress = NULL;
 
     ds4_session_set_cancel(slot->session, job_cancelled, j);
     if (!job_cancelled(j)) generate_job_inner(s, slot, j);
@@ -15430,6 +15518,41 @@ static int job_slot_score(server *s, server_slot *slot, const job *j,
     return common;
 }
 
+/* s->mu held.  Forget the tier the slot was holding, and with it promotion
+ * and parking: the slot is idle again as far as the executor is concerned.
+ * The broadcast lets a parked flex re-check server_slot_runnable_locked. */
+static void server_slot_release_tier(server *s, server_slot *slot) {
+    pthread_mutex_lock(&s->model_mu);
+    slot->tier = SLOT_TIER_NONE;
+    slot->promoted = false;
+    slot->parked = false;
+    pthread_cond_broadcast(&s->model_cv);
+    pthread_mutex_unlock(&s->model_mu);
+}
+
+/* s->mu held.  May a flex job be placed this pass?  Three rules: no normal
+ * job anywhere in the queue (admission-only -- it must never feed the pause
+ * predicate, or a normal bound to a parked flex slot would deadlock it), no
+ * slot holding normal work, and fewer than flex_cap slots holding flex so a
+ * normal request always finds a free slot. */
+static bool server_flex_placeable_locked(server *s) {
+    for (const job *j = s->head; j; j = j->next) {
+        if (!j->req.flex) return false;
+    }
+    int flex_held = 0;
+    for (int i = 0; i < s->slot_count; i++) {
+        const job *work = s->slots[i].work;
+        if (work && work->req.flex) flex_held++;
+    }
+    pthread_mutex_lock(&s->model_mu);
+    const bool normal_active = server_normal_active_locked(s) > 0;
+    pthread_mutex_unlock(&s->model_mu);
+    if (normal_active) return false;
+    const int cap = s->flex_cap > 0 ? s->flex_cap
+                                    : (s->slot_count > 1 ? s->slot_count - 1 : 1);
+    return flex_held < cap;
+}
+
 static void dispatch_jobs_locked(server *s) {
     if (!server_time_sliced(s)) return;
     for (;;) {
@@ -15437,12 +15560,26 @@ static void dispatch_jobs_locked(server *s) {
         job *chosen_prev = NULL;
         server_slot *chosen_slot = NULL;
         int chosen_score = INT_MIN;
+        const bool flex_ok = server_flex_placeable_locked(s);
 
         pthread_mutex_lock(&s->tool_mu);
         job *prev = NULL;
         for (job *j = s->head; j; prev = j, j = j->next) {
+            if (j->req.flex && !flex_ok) continue;   /* a normal behind it still goes */
             int required = job_required_slot_locked(s, j);
             if (required < 0) required = job_busy_owner_locked(s, j);
+            /* A normal request bound to a slot that is running flex work
+             * would wait behind a flex that parks whenever another normal
+             * runs.  Promote the slot: it runs as normal until released. */
+            if (required >= 0 && !j->req.flex) {
+                server_slot *owner = &s->slots[required];
+                if (owner->work && owner->work->req.flex && !owner->promoted) {
+                    pthread_mutex_lock(&s->model_mu);
+                    owner->promoted = true;
+                    pthread_cond_broadcast(&s->model_cv);
+                    pthread_mutex_unlock(&s->model_mu);
+                }
+            }
             server_slot *best = NULL;
             int best_score = INT_MIN;
             for (int i = 0; i < s->slot_count; i++) {
@@ -15473,6 +15610,9 @@ static void dispatch_jobs_locked(server *s) {
         chosen_slot->busy = true;
         pthread_mutex_lock(&s->model_mu);
         chosen_slot->awaiting_first_grant = true;
+        chosen_slot->tier = chosen->req.flex ? SLOT_TIER_FLEX : SLOT_TIER_NORMAL;
+        chosen_slot->promoted = false;
+        chosen_slot->parked = false;
         pthread_cond_broadcast(&s->model_cv);
         pthread_mutex_unlock(&s->model_mu);
         pthread_cond_broadcast(&s->cv);
@@ -15504,9 +15644,14 @@ static job *dequeue(server *s) {
         pthread_mutex_unlock(&s->mu);
         return NULL;
     }
-    job *j = s->head;
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
+    /* Flex is queue ordering only here: the first normal job goes before
+     * any flex job, FIFO within each tier. */
+    job *j = s->head, *prev = NULL;
+    for (job *it = s->head, *p = NULL; it; p = it, it = it->next) {
+        if (!it->req.flex) { j = it; prev = p; break; }
+    }
+    if (prev) prev->next = j->next; else s->head = j->next;
+    if (s->tail == j) s->tail = prev;
     pthread_mutex_unlock(&s->mu);
     j->next = NULL;
     return j;
@@ -15548,6 +15693,7 @@ static void *slot_worker_main(void *arg) {
         pthread_mutex_lock(&s->mu);
         slot->busy = false;
         slot->work = NULL;
+        server_slot_release_tier(s, slot);
         dispatch_jobs_locked(s);
         pthread_mutex_unlock(&s->mu);
         job_complete(j);
@@ -15836,6 +15982,11 @@ static void server_cancel_job(server *s, job *j) {
         detached = true;
         break;
     }
+    if (detached && server_time_sliced(s)) {
+        /* The job that just left the queue may have been the normal that was
+         * keeping a flex job out; give the queue another look. */
+        dispatch_jobs_locked(s);
+    }
     if (!detached && server_time_sliced(s)) {
         for (int i = 0; i < s->slot_count; i++) {
             server_slot *slot = &s->slots[i];
@@ -15858,6 +16009,7 @@ static void server_cancel_job(server *s, job *j) {
             pthread_mutex_lock(&s->model_mu);
             slot->awaiting_first_grant = false;
             pthread_mutex_unlock(&s->model_mu);
+            server_slot_release_tier(s, slot);   /* same reason, same ordering */
             dispatch_jobs_locked(s);
             break;
         }
@@ -16067,6 +16219,7 @@ typedef struct {
     bool mixed_prefill_quantum_set;
     bool batched_decode;
     bool batched_decode_set;
+    int flex_contexts;   /* --flex-contexts; 0 = default slot_count-1 */
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -16291,6 +16444,13 @@ static server_config parse_options(int argc, char **argv) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
             c.mixed_prefill_quantum_set = true;
+        } else if (!strcmp(arg, "--flex-contexts")) {
+            int v = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --flex-contexts must be positive");
+                exit(2);
+            }
+            c.flex_contexts = v;
         } else if (!strcmp(arg, "--kv-disk-dir")) {
             c.kv_disk_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--kv-disk-space-mb")) {
@@ -16575,6 +16735,13 @@ int main(int argc, char **argv) {
                        ds4_engine_has_mtp(engine);
     }
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
+    /* Flex tier: how many contexts background requests may hold at once.
+     * One fewer than the contexts by default, so a normal request always
+     * finds a free slot instead of waiting for a flex to finish. */
+    s.flex_cap = slot_count > 1 ? slot_count - 1 : 1;
+    if (cfg.flex_contexts > 0) {
+        s.flex_cap = cfg.flex_contexts > slot_count ? slot_count : cfg.flex_contexts;
+    }
     /* The executor's contended quantum.  128 -- this flag's default, sized for
      * DeepSeek -- is far too small for a 512-expert MoE, where a chunk that
      * thin leaves each expert two rows; multi-context mode asks for about a
@@ -22674,10 +22841,292 @@ static void test_flex_predicates(void) {
     pthread_mutex_destroy(&s.model_mu);
 }
 
+/* Flex admission: only when no normal is queued, no slot holds a normal, and
+ * fewer than flex_cap slots hold flex.  A normal behind a skipped flex still
+ * goes, FIFO. */
+static void test_flex_release(server_slot *slot) {
+    slot->assigned = NULL; slot->busy = false; slot->work = NULL;
+    slot->tier = SLOT_TIER_NONE; slot->promoted = false; slot->parked = false;
+}
+
+static void test_flex_dispatch_gating(void) {
+    server s;
+    server_slot slots[2];
+    test_cancel_server_init(&s);
+    memset(slots, 0, sizeof(slots));
+    s.slots = slots; s.slot_count = 2; s.multi_ctx_mode = true; s.flex_cap = 1;
+    for (int i = 0; i < 2; i++) { slots[i].srv = &s; slots[i].id = i; }
+
+    job flex1, flex2, normal1, normal2;
+    test_cancel_job_init(&flex1); flex1.req.flex = true;
+    test_cancel_job_init(&flex2); flex2.req.flex = true;
+    test_cancel_job_init(&normal1);
+    test_cancel_job_init(&normal2);
+
+    /* Idle server: one flex goes, the second waits on the cap. */
+    s.head = &flex1; flex1.next = &flex2; s.tail = &flex2;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(slots[0].assigned == &flex1 && slots[0].tier == SLOT_TIER_FLEX);
+    TEST_ASSERT(s.head == &flex2 && slots[1].assigned == NULL);
+
+    /* A normal arrives behind the queued flex: it is dispatched past it. */
+    flex2.next = &normal1; s.tail = &normal1;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(slots[1].assigned == &normal1 && slots[1].tier == SLOT_TIER_NORMAL);
+    TEST_ASSERT(s.head == &flex2 && s.tail == &flex2 && flex2.next == NULL);
+    TEST_ASSERT(server_normal_active_locked(&s) == 1);
+
+    /* Both finish.  A second normal queued behind flex2 goes first, and flex2
+     * stays out while that normal holds a slot. */
+    test_flex_release(&slots[0]);
+    test_flex_release(&slots[1]);
+    flex2.next = &normal2; s.tail = &normal2;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(slots[0].assigned == &normal2 || slots[1].assigned == &normal2);
+    TEST_ASSERT(s.head == &flex2 && flex2.next == NULL);
+    TEST_ASSERT(slots[0].assigned != &flex2 && slots[1].assigned != &flex2);
+
+    /* The normal slot is released: flex2 is admitted. */
+    for (int i = 0; i < 2; i++) if (slots[i].assigned == &normal2) test_flex_release(&slots[i]);
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(s.head == NULL && s.tail == NULL);
+    TEST_ASSERT(slots[0].assigned == &flex2 || slots[1].assigned == &flex2);
+
+    test_cancel_job_destroy(&normal2); test_cancel_job_destroy(&normal1);
+    test_cancel_job_destroy(&flex2); test_cancel_job_destroy(&flex1);
+    test_cancel_server_destroy(&s);
+}
+
+/* Cancel before pickup releases the tier (a counter would have drifted);
+ * cancelling a queued normal re-dispatches so the flex it blocked is
+ * admitted. */
+static void test_flex_cancel_paths(void) {
+    server s;
+    server_slot slots[2];
+    test_cancel_server_init(&s);
+    memset(slots, 0, sizeof(slots));
+    s.slots = slots; s.slot_count = 2; s.multi_ctx_mode = true; s.flex_cap = 1;
+    for (int i = 0; i < 2; i++) { slots[i].srv = &s; slots[i].id = i; }
+
+    job normal, flex;
+    test_cancel_job_init(&normal);
+    test_cancel_job_init(&flex); flex.req.flex = true;
+
+    /* Dispatched normal, cancelled before its worker runs. */
+    s.head = s.tail = &normal;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(server_normal_active_locked(&s) == 1);
+    server_cancel_job(&s, &normal);
+    TEST_ASSERT(normal.done);
+    TEST_ASSERT(server_normal_active_locked(&s) == 0);
+    TEST_ASSERT(slots[0].tier == SLOT_TIER_NONE && slots[1].tier == SLOT_TIER_NONE);
+
+    /* Flex queued behind a queued normal while every slot is busy with
+     * something neither tier (a rebuild), then the normal is cancelled from
+     * the queue and the slots free up: the cancel's dispatch admits the flex. */
+    job normal_q, other;
+    test_cancel_job_init(&normal_q);
+    test_cancel_job_init(&other);
+    slots[0].busy = true; slots[0].work = &other;
+    slots[1].busy = true; slots[1].work = &other;
+    s.head = &flex; flex.next = &normal_q; s.tail = &normal_q;
+    dispatch_jobs_locked(&s);
+    TEST_ASSERT(s.head == &flex && slots[0].assigned == NULL && slots[1].assigned == NULL);
+    test_flex_release(&slots[0]);
+    test_flex_release(&slots[1]);
+    server_cancel_job(&s, &normal_q);
+    TEST_ASSERT(normal_q.done);
+    TEST_ASSERT(s.head == NULL);
+    TEST_ASSERT(slots[0].assigned == &flex || slots[1].assigned == &flex);
+
+    test_cancel_job_destroy(&other); test_cancel_job_destroy(&normal_q);
+    test_cancel_job_destroy(&flex); test_cancel_job_destroy(&normal);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_flex_dequeue_prefers_normal(void) {
+    server s;
+    test_cancel_server_init(&s);
+    job flex, normal;
+    test_cancel_job_init(&flex); flex.req.flex = true;
+    test_cancel_job_init(&normal);
+    s.head = &flex; flex.next = &normal; s.tail = &normal;
+    TEST_ASSERT(dequeue(&s) == &normal);
+    TEST_ASSERT(s.head == &flex && s.tail == &flex && flex.next == NULL);
+    TEST_ASSERT(dequeue(&s) == &flex);
+    TEST_ASSERT(s.head == NULL && s.tail == NULL);
+    test_cancel_job_destroy(&normal); test_cancel_job_destroy(&flex);
+    test_cancel_server_destroy(&s);
+}
+
+/* A normal follow-up turn bound (D2) to the slot generating its flex
+ * predecessor promotes that slot instead of starving behind it. */
+static void test_flex_bound_normal_promotes_flex_slot(void) {
+    server s;
+    server_slot slots[2];
+    test_cancel_server_init(&s);
+    memset(slots, 0, sizeof(slots));
+    s.slots = slots; s.slot_count = 2; s.multi_ctx_mode = true; s.flex_cap = 1;
+    for (int i = 0; i < 2; i++) { slots[i].srv = &s; slots[i].id = i; }
+
+    enum { N = 64 };
+    int live[N + 8], follow[N + 8];
+    for (int i = 0; i < N + 8; i++) { live[i] = i; follow[i] = i; }
+    job flex_running, followup;
+    test_cancel_job_init(&flex_running); flex_running.req.flex = true;
+    flex_running.req.prompt = (ds4_tokens){.v = live, .len = N, .cap = N};
+    test_cancel_job_init(&followup);
+    followup.req.prompt = (ds4_tokens){.v = follow, .len = N + 8, .cap = N + 8};
+
+    slots[0].busy = true; slots[0].work = &flex_running; slots[0].tier = SLOT_TIER_FLEX;
+    TEST_ASSERT(job_busy_owner_locked(&s, &followup) == 0);
+    TEST_ASSERT(!slots[0].promoted);
+
+    s.head = s.tail = &followup;
+    dispatch_jobs_locked(&s);
+    /* Still queued (its slot is busy), but that slot now runs as normal. */
+    TEST_ASSERT(s.head == &followup);
+    TEST_ASSERT(slots[0].promoted);
+    TEST_ASSERT(server_normal_active_locked(&s) == 1);
+    TEST_ASSERT(server_slot_runnable_locked(&s, &slots[0]));
+
+    /* Releasing the slot clears promotion with the tier. */
+    pthread_mutex_lock(&s.mu);
+    server_slot_release_tier(&s, &slots[0]);
+    pthread_mutex_unlock(&s.mu);
+    TEST_ASSERT(slots[0].tier == SLOT_TIER_NONE && !slots[0].promoted && !slots[0].parked);
+
+    test_cancel_job_destroy(&followup); test_cancel_job_destroy(&flex_running);
+    test_cancel_server_destroy(&s);
+}
+
+static void test_flex_stream_keepalive_sends_headers_first(void) {
+    job j;
+    test_cancel_job_init(&j);
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    server_prefill_progress p = { .request_job = &j, .fd = sv[0], .stream = true };
+
+    TEST_ASSERT(server_stream_keepalive(&p, ": keepalive\n\n"));
+    TEST_ASSERT(p.headers_sent);
+    TEST_ASSERT(server_stream_keepalive(&p, ": keepalive\n\n"));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "HTTP/1.1 200") != NULL);
+    TEST_ASSERT(strstr(out, "text/event-stream") != NULL);
+    const char *first = strstr(out, ": keepalive\n\n");
+    TEST_ASSERT(first != NULL && strstr(first + 1, ": keepalive\n\n") != NULL);
+    free(out);
+    close(sv[0]); close(sv[1]);
+
+    /* Non-streaming: writes nothing, reports success. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    server_prefill_progress q = { .request_job = &j, .fd = sv[0], .stream = false };
+    TEST_ASSERT(server_stream_keepalive(&q, ": keepalive\n\n"));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(out[0] == '\0');
+    free(out);
+    close(sv[0]); close(sv[1]);
+
+    /* The multi-context engine reports "prefill": that must count. */
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    server_prefill_progress r = { .request_job = &j, .fd = sv[0], .stream = true,
+                                  .prompt_tokens = 100,
+                                  /* a repeated position takes the early
+                                   * return, so the test log stays quiet */
+                                  .seen = true, .last_current = 10 };
+    server_progress_cb(&r, "prefill", 10, 100);
+    TEST_ASSERT(r.headers_sent);
+    close(sv[0]); close(sv[1]);
+    test_cancel_job_destroy(&j);
+}
+
+typedef struct {
+    server *srv;
+    server_slot *slot;
+    job *j;
+    bool result;
+    bool returned;
+} test_flex_pause_arg;
+
+static void *test_flex_pause_main(void *ud) {
+    test_flex_pause_arg *a = ud;
+    a->result = server_flex_pause_point(a->srv, a->slot, a->j);
+    a->returned = true;
+    return NULL;
+}
+
+/* A flex slot parks while a normal slot holds work, clears its startup flag
+ * so no prefill defers to it, and resumes when the normal slot is released.
+ * Promotion also releases it; a cancel while parked returns false. */
+static void test_flex_pause_point_parks_and_resumes(void) {
+    server s;
+    server_slot slots[2];
+    test_cancel_server_init(&s);
+    memset(slots, 0, sizeof(slots));
+    s.slots = slots; s.slot_count = 2; s.multi_ctx_mode = true;
+    for (int i = 0; i < 2; i++) { slots[i].srv = &s; slots[i].id = i; }
+    job flex; test_cancel_job_init(&flex); flex.req.flex = true;
+
+    slots[0].tier = SLOT_TIER_FLEX;
+    slots[0].awaiting_first_grant = true;
+    TEST_ASSERT(server_flex_pause_point(&s, &slots[0], &flex));
+    TEST_ASSERT(!slots[0].parked);
+
+    slots[1].tier = SLOT_TIER_NORMAL;
+    test_flex_pause_arg a = { .srv = &s, .slot = &slots[0], .j = &flex };
+    pthread_t th;
+    TEST_ASSERT(pthread_create(&th, NULL, test_flex_pause_main, &a) == 0);
+    for (int i = 0; i < 2000 && !slots[0].parked; i++) usleep(1000);
+    pthread_mutex_lock(&s.model_mu);
+    TEST_ASSERT(slots[0].parked);
+    TEST_ASSERT(!slots[0].awaiting_first_grant);
+    TEST_ASSERT(!a.returned);
+    slots[1].tier = SLOT_TIER_NONE;          /* as server_slot_release_tier does */
+    pthread_cond_broadcast(&s.model_cv);
+    pthread_mutex_unlock(&s.model_mu);
+    pthread_join(th, NULL);
+    TEST_ASSERT(a.returned && a.result);
+    TEST_ASSERT(!slots[0].parked);
+
+    slots[1].tier = SLOT_TIER_NORMAL;
+    a = (test_flex_pause_arg){ .srv = &s, .slot = &slots[0], .j = &flex };
+    TEST_ASSERT(pthread_create(&th, NULL, test_flex_pause_main, &a) == 0);
+    for (int i = 0; i < 2000 && !slots[0].parked; i++) usleep(1000);
+    pthread_mutex_lock(&s.model_mu);
+    slots[0].promoted = true;
+    pthread_cond_broadcast(&s.model_cv);
+    pthread_mutex_unlock(&s.model_mu);
+    pthread_join(th, NULL);
+    TEST_ASSERT(a.result);
+    slots[0].promoted = false;
+
+    a = (test_flex_pause_arg){ .srv = &s, .slot = &slots[0], .j = &flex };
+    TEST_ASSERT(pthread_create(&th, NULL, test_flex_pause_main, &a) == 0);
+    for (int i = 0; i < 2000 && !slots[0].parked; i++) usleep(1000);
+    job_mark_cancelled(&flex);
+    pthread_mutex_lock(&s.model_mu);
+    pthread_cond_broadcast(&s.model_cv);
+    pthread_mutex_unlock(&s.model_mu);
+    pthread_join(th, NULL);
+    TEST_ASSERT(!a.result);
+    TEST_ASSERT(!slots[0].parked);
+
+    test_cancel_job_destroy(&flex);
+    test_cancel_server_destroy(&s);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_flex_request_tier_parsing();
     test_flex_response_echo();
     test_flex_predicates();
+    test_flex_dispatch_gating();
+    test_flex_cancel_paths();
+    test_flex_dequeue_prefers_normal();
+    test_flex_bound_normal_promotes_flex_slot();
+    test_flex_stream_keepalive_sends_headers_first();
+    test_flex_pause_point_parks_and_resumes();
     test_batched_prefill_round_robin();
     test_cancel_clears_awaiting_first_grant();
     test_multi_ctx_decode_round_robin();
