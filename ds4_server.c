@@ -10281,6 +10281,11 @@ typedef struct {
     size_t visible_len;
 } visible_live_state;
 
+/* The tier of the job a slot holds, from dispatch until the worker (or a
+ * cancel before pickup) releases the slot.  NONE while idle.  Guarded by
+ * model_mu, like the other executor facts on the slot. */
+typedef enum { SLOT_TIER_NONE = 0, SLOT_TIER_NORMAL, SLOT_TIER_FLEX } slot_tier;
+
 struct server_slot {
     server *srv;
     int id;
@@ -10309,6 +10314,14 @@ struct server_slot {
      * milliseconds, and making it wait a quantum each is most of a short
      * request's first-token latency. */
     bool awaiting_first_grant;
+
+    /* Flex tier (spec docs/superpowers/specs/2026-09-07-flex-service-tier-design.md).
+     * All four are facts published by dispatch or by this slot's own worker;
+     * nothing here is a counter, so a cancel path cannot leave drift behind. */
+    slot_tier tier;
+    bool promoted;    /* a normal request is bound to this flex slot: run as normal */
+    bool generating;  /* inside generate_job_inner's decode loop */
+    bool parked;      /* the worker is waiting at server_flex_pause_point */
 
     bool decode_pending;
     bool decode_in_flight;
@@ -10372,6 +10385,9 @@ struct server {
      * (server_inference_lock).  A prefill quantum yields to them. */
     int engine_waiting;
     int mixed_prefill_quantum;
+    /* Most slots flex jobs may hold at once (default slot_count-1, so one
+     * slot always stays free for normal traffic; --flex-contexts). */
+    int flex_cap;
     int last_prefill_slot;
     int last_decode_slot;
     pthread_mutex_t mu;
@@ -12709,6 +12725,42 @@ static bool server_time_sliced(const server *s) {
     return s && (s->batched_mode || s->multi_ctx_mode);
 }
 
+/* model_mu held: slots holding a normal request, or a flex one a normal
+ * request is bound to (promoted).  A scan, not a counter -- see the
+ * awaiting_first_grant comment in server_cancel_job for why a counter here
+ * would drift on a cancel before pickup. */
+static int server_normal_active_locked(const server *s) {
+    int n = 0;
+    for (int i = 0; s && i < s->slot_count; i++) {
+        const server_slot *slot = &s->slots[i];
+        if (slot->tier == SLOT_TIER_NORMAL || (slot->tier == SLOT_TIER_FLEX && slot->promoted)) n++;
+    }
+    return n;
+}
+
+/* model_mu held: may this slot take a step now?  Only an unpromoted flex
+ * slot with normal work dispatched is held back.  The future single tick
+ * loop evaluates exactly this per row.  MAYBE_UNUSED until the pause point
+ * calls it; only the unit tests exercise it today. */
+static DS4_SERVER_MAYBE_UNUSED bool server_slot_runnable_locked(
+    const server *s, const server_slot *slot) {
+    if (!s || !slot) return false;
+    if (slot->tier != SLOT_TIER_FLEX || slot->promoted) return true;
+    return server_normal_active_locked(s) == 0;
+}
+
+/* model_mu held: generating contexts that will actually ask for steps.  A
+ * parked flex is resident but asks for nothing, and counting it would make
+ * the credit rule wait for a step that never comes, push a lone normal into
+ * the batched (non-MTP) path, and hold the coordinator's coalesce window. */
+static int server_eligible_generations_locked(const server *s) {
+    int n = 0;
+    for (int i = 0; s && i < s->slot_count; i++) {
+        if (s->slots[i].generating && !s->slots[i].parked) n++;
+    }
+    return n;
+}
+
 static int server_next_prefill_slot_locked(const server *s) {
     if (!s || s->slot_count <= 0) return -1;
     for (int n = 1; n <= s->slot_count; n++) {
@@ -12737,8 +12789,8 @@ static bool server_startup_pending_locked(const server *s, int except_id) {
     for (int i = 0; i < s->slot_count; i++) {
         if (i == except_id) continue;
         const server_slot *slot = &s->slots[i];
-        if (slot->awaiting_first_grant && !slot->prefill_waiting &&
-            !slot->decode_waiting) {
+        if (!slot->parked && slot->awaiting_first_grant &&
+            !slot->prefill_waiting && !slot->decode_waiting) {
             return true;
         }
     }
@@ -12752,7 +12804,7 @@ static bool server_startup_pending_locked(const server *s, int except_id) {
  * context has already had its step since the last quantum. */
 static bool server_prefill_before_decode_locked(const server *s) {
     return s->decode_waiting == 0 ||
-           s->decodes_since_prefill >= s->active_generations;
+           s->decodes_since_prefill >= server_eligible_generations_locked(s);
 }
 
 /* Should this decode step be batched with the other contexts' rather than
@@ -12796,7 +12848,7 @@ static int server_batch_decode_min(void) {
 static bool server_batch_decode_now(server *s) {
     if (!s->batched_decode) return false;
     pthread_mutex_lock(&s->model_mu);
-    const bool batch = s->active_generations >= server_batch_decode_min();
+    const bool batch = server_eligible_generations_locked(s) >= server_batch_decode_min();
     pthread_mutex_unlock(&s->model_mu);
     return batch;
 }
@@ -12905,7 +12957,7 @@ static int server_prefill_quantum_for(const server *s,
 
 static int server_prefill_quantum(server *s) {
     pthread_mutex_lock(&s->model_mu);
-    bool generation_active = s->active_generations > 0;
+    bool generation_active = server_eligible_generations_locked(s) > 0;
     pthread_mutex_unlock(&s->model_mu);
     return server_prefill_quantum_for(s, generation_active);
 }
@@ -12942,7 +12994,7 @@ static int server_prefill_chunk_rows(server *s, const server_slot *slot) {
     pthread_mutex_lock(&s->model_mu);
     for (int i = 0; i < s->slot_count && !contended; i++) {
         const server_slot *other = &s->slots[i];
-        if (other == slot) continue;
+        if (other == slot || other->parked) continue;
         contended = other->running != NULL || other->prefill_waiting ||
                     other->decode_waiting || other->awaiting_first_grant;
     }
@@ -13603,17 +13655,19 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
-static void server_generation_enter(server *s) {
+static void server_generation_enter(server *s, server_slot *slot) {
     if (!server_time_sliced(s)) return;
     pthread_mutex_lock(&s->model_mu);
+    if (slot) slot->generating = true;
     s->active_generations++;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
 }
 
-static void server_generation_leave(server *s) {
+static void server_generation_leave(server *s, server_slot *slot) {
     if (!server_time_sliced(s)) return;
     pthread_mutex_lock(&s->model_mu);
+    if (slot) slot->generating = false;
     if (s->active_generations > 0) s->active_generations--;
     pthread_cond_broadcast(&s->model_cv);
     pthread_mutex_unlock(&s->model_mu);
@@ -13800,7 +13854,7 @@ static void *decode_worker_main(void *arg) {
             timespec_add_us(&deadline, coalesce_us);
             int observed = s->decode_pending;
             while (!s->model_stopping && s->decode_pending < s->slot_count &&
-                   s->decode_pending < s->active_generations) {
+                   s->decode_pending < server_eligible_generations_locked(s)) {
                 int rc = pthread_cond_timedwait(&s->model_cv, &s->model_mu,
                                                 &deadline);
                 if (rc == ETIMEDOUT) break;
@@ -14463,7 +14517,7 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
-    server_generation_enter(s);
+    server_generation_enter(s, slot);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -14758,7 +14812,7 @@ decode_again:
         }
         if (stop_decode) break;
     }
-    server_generation_leave(s);
+    server_generation_leave(s, slot);
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -16815,12 +16869,15 @@ static void test_multi_ctx_decode_round_robin(void) {
  * a decoder is queued again. */
 static void test_multi_ctx_executor_alternation(void) {
     server s = {0};
+    server_slot slots[2] = {0};
+    s.slots = slots;
+    s.slot_count = 2;
 
     /* Nobody decoding: the prefiller runs whenever it is ready. */
     TEST_ASSERT(server_prefill_before_decode_locked(&s));
 
     /* One generating context, its step not yet taken this round. */
-    s.active_generations = 1;
+    slots[0].generating = true;
     s.decode_waiting = 1;
     s.decodes_since_prefill = 0;
     TEST_ASSERT(!server_prefill_before_decode_locked(&s));
@@ -16829,7 +16886,7 @@ static void test_multi_ctx_executor_alternation(void) {
     TEST_ASSERT(server_prefill_before_decode_locked(&s));
 
     /* Two generating contexts: both steps first, then the quantum. */
-    s.active_generations = 2;
+    slots[1].generating = true;
     s.decode_waiting = 2;
     s.decodes_since_prefill = 1;
     TEST_ASSERT(!server_prefill_before_decode_locked(&s));
@@ -22551,9 +22608,76 @@ static void test_flex_response_echo(void) {
     request_free(&r);
 }
 
+/* The per-slot tier facts and the three predicates derived from them: which
+ * slots hold normal work, which slots may take a step, and which generating
+ * contexts will actually ask for one. */
+static void test_flex_predicates(void) {
+    server s = {0};
+    server_slot slots[3] = {0};
+    s.slots = slots;
+    s.slot_count = 3;
+    s.multi_ctx_mode = true;
+    s.mixed_prefill_quantum = 512;
+    pthread_mutex_init(&s.model_mu, NULL);
+    pthread_cond_init(&s.model_cv, NULL);
+
+    /* Nothing dispatched: no normal work, every slot runnable. */
+    TEST_ASSERT(server_normal_active_locked(&s) == 0);
+    slots[0].tier = SLOT_TIER_FLEX;
+    TEST_ASSERT(server_slot_runnable_locked(&s, &slots[0]));
+
+    /* A normal slot parks every flex slot that is not promoted. */
+    slots[1].tier = SLOT_TIER_NORMAL;
+    TEST_ASSERT(server_normal_active_locked(&s) == 1);
+    TEST_ASSERT(!server_slot_runnable_locked(&s, &slots[0]));
+    TEST_ASSERT(server_slot_runnable_locked(&s, &slots[1]));
+    slots[0].promoted = true;
+    TEST_ASSERT(server_slot_runnable_locked(&s, &slots[0]));
+    TEST_ASSERT(server_normal_active_locked(&s) == 2);   /* promoted counts as normal */
+    slots[0].promoted = false;
+
+    /* Eligible generations exclude a parked slot. */
+    slots[0].generating = true;
+    slots[1].generating = true;
+    TEST_ASSERT(server_eligible_generations_locked(&s) == 2);
+    slots[0].parked = true;
+    TEST_ASSERT(server_eligible_generations_locked(&s) == 1);
+
+    /* The prefill-before-decode credit rule counts eligible generations only:
+     * one normal step since the quantum is enough even though two generate. */
+    s.decode_waiting = 1;
+    s.decodes_since_prefill = 1;
+    TEST_ASSERT(server_prefill_before_decode_locked(&s));
+    s.decodes_since_prefill = 0;
+    TEST_ASSERT(!server_prefill_before_decode_locked(&s));
+
+    /* A parked peer neither narrows a prefill nor makes it defer. */
+    job flex_in_flight = {0};
+    slots[0].running = &flex_in_flight;   /* the flex has a request in flight */
+    TEST_ASSERT(server_prefill_chunk_rows(&s, &slots[1]) == 0);
+    slots[0].parked = false;
+    TEST_ASSERT(server_prefill_chunk_rows(&s, &slots[1]) == 512);
+    slots[0].running = NULL;
+    slots[0].parked = true;
+    slots[0].awaiting_first_grant = true;
+    TEST_ASSERT(!server_startup_pending_locked(&s, 1));
+    slots[0].parked = false;
+    TEST_ASSERT(server_startup_pending_locked(&s, 1));
+    slots[0].awaiting_first_grant = false;
+
+    /* Enter/leave publish the per-slot fact. */
+    server_generation_enter(&s, &slots[2]);
+    TEST_ASSERT(slots[2].generating && s.active_generations == 1);
+    server_generation_leave(&s, &slots[2]);
+    TEST_ASSERT(!slots[2].generating && s.active_generations == 0);
+    pthread_cond_destroy(&s.model_cv);
+    pthread_mutex_destroy(&s.model_mu);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_flex_request_tier_parsing();
     test_flex_response_echo();
+    test_flex_predicates();
     test_batched_prefill_round_robin();
     test_cancel_clears_awaiting_first_grant();
     test_multi_ctx_decode_round_robin();
