@@ -55963,6 +55963,7 @@ struct ds4_q4e_graph {
     ds4_gpu_tensor *mtp_idx_pooled;   /* borrowed: [pool_slots/4][128] f16 */
     ds4_gpu_tensor *mtp_v_cache;   /* borrowed */
     ds4_gpu_tensor *mtp_logits;
+    ds4_gpu_tensor *mtp_hidden;    /* [logit_rows][hc_dim]: gathered draft inputs for a batched pass */
     FILE           *mtp_dump_fp;     /* DS4_QWEN4EXP_MTP_DUMP record awaiting its logits */
 
     /* Target residual rows whose draft-side KV has not been written yet: the
@@ -67293,14 +67294,19 @@ static void q4e_mrope_fill(int32_t *out, const int32_t *positions, uint32_t n,
     }
 }
 
-/* One batched-decode row's private window: rows 0..DS4_Q4E_MROPE_BACK hold
- * positions p-DS4_Q4E_MROPE_BACK .. p, so the row index q4e_idx_pool_kernel
- * computes for this row's block start lands inside it. */
-static void q4e_mrope_fill_batch_row(int32_t *out, int32_t p) {
+/* One batched row's rope triple and its private window: rows
+ * 0..DS4_Q4E_MROPE_BACK of the window hold positions p-DS4_Q4E_MROPE_BACK .. p,
+ * so the row index q4e_idx_pool_kernel computes for this row's block start
+ * lands inside it.  Both go through q4e_mrope_at with the row's own session's
+ * images: after an image the temporal index runs behind the KV position, so a
+ * scalar copy of p is wrong for exactly the sessions that carried one. */
+static void q4e_mrope_batch_row(int32_t *row3, int32_t *win, int32_t p,
+                                const ds4_vision_span *img, size_t n_img) {
+    q4e_mrope_at(img, n_img, p, &row3[0], &row3[1], &row3[2]);
     for (uint32_t i = 0; i <= DS4_Q4E_MROPE_BACK; i++) {
         const int32_t back = (int32_t)DS4_Q4E_MROPE_BACK - (int32_t)i;
         const int32_t q = (p > back) ? (p - back) : 0;
-        out[3u * i] = out[3u * i + 1u] = out[3u * i + 2u] = q;
+        q4e_mrope_at(img, n_img, q, &win[3u * i], &win[3u * i + 1u], &win[3u * i + 2u]);
     }
 }
 
@@ -68514,6 +68520,7 @@ static void q4e_scratch_free(ds4_engine *e) {
         sc->sh_mid, sc->sh_out, sc->sh_logit, sc->ple_rows, sc->ple_emb, sc->ple_k,
         sc->ple_v, sc->ple_q, sc->ple_gv, sc->ple_cv, sc->logits, sc->argmax_dev,
         sc->mtp_res, sc->mtp_embed, sc->mtp_tokens, sc->mtp_positions, sc->mtp_logits,
+        sc->mtp_hidden,
         sc->idx_k, sc->idx_q, sc->idx_qn, sc->idx_score, sc->idx_sel,
         sc->idx_cnt, sc->idx_tokens, sc->idx_nsel, sc->idx_part,
     };
@@ -68740,7 +68747,10 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
           && q4e_alloc(&g->mtp_positions, (uint64_t)T * sizeof(int32_t))
           && q4e_alloc(&g->mtp_mrope,
                        (uint64_t)(T + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t))
-          && q4e_alloc(&g->mtp_logits, (uint64_t)DS4_N_VOCAB * f);
+          /* One logits row per draft row of a batched tick: every context's
+           * chain step is projected in one launch and picked in one argmax. */
+          && q4e_alloc(&g->mtp_logits, (uint64_t)g->logit_rows * DS4_N_VOCAB * f)
+          && q4e_alloc(&g->mtp_hidden, (uint64_t)g->logit_rows * Q4E_HC_DIM * f);
         if (ok) {
             g->mtp_mrope_rows = ds4_gpu_tensor_view(
                     g->mtp_mrope, (uint64_t)DS4_Q4E_MROPE_BACK * 3u * sizeof(int32_t),
@@ -70222,9 +70232,10 @@ static int q4e_forward_batch(ds4_decode_item *items, uint32_t n,
     }
 
     for (uint32_t r = 0; r < n; r++) {
-        mrope[3u * r] = mrope[3u * r + 1u] = mrope[3u * r + 2u] = pos[r];
-        q4e_mrope_fill_batch_row(mrope_win + (size_t)r * (DS4_Q4E_MROPE_BACK + 1u) * 3u,
-                                 pos[r]);
+        const ds4_session *s = items[r].session;
+        q4e_mrope_batch_row(mrope + 3u * r,
+                            mrope_win + (size_t)r * (DS4_Q4E_MROPE_BACK + 1u) * 3u,
+                            pos[r], s->sync_images, s->sync_image_count);
     }
     if (!ds4_gpu_tensor_write(g->tokens, 0, ids, (uint64_t)n * sizeof(int32_t)) ||
         !ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n * sizeof(int32_t)) ||
@@ -70413,8 +70424,9 @@ static int q4e_forward_segmented(q4e_seg_item *items, uint32_t n_items,
             row_sess[row] = s;
             ids[row] = s->checkpoint.v[p];
             pos[row] = (int32_t)p;
-            mrope[3u * row] = mrope[3u * row + 1u] = mrope[3u * row + 2u] = (int32_t)p;
-            q4e_mrope_fill_batch_row(mrope_win + (size_t)row * (DS4_Q4E_MROPE_BACK + 1u) * 3u, (int32_t)p);
+            q4e_mrope_batch_row(mrope + 3u * row,
+                                mrope_win + (size_t)row * (DS4_Q4E_MROPE_BACK + 1u) * 3u,
+                                (int32_t)p, s->sync_images, s->sync_image_count);
             row++;
         }
     }
@@ -70882,6 +70894,186 @@ static int q4e_mtp_draft(ds4_session *s, const ds4_gpu_tensor *hidden,
     return 0;
 }
 
+/* One draft pass over several sessions at once.  Segment i is session i's
+ * run of rows: `hidden` rows [hidden_row0, hidden_row0 + n_rows) of the given
+ * tensor (the session's staged pend_res for a flush, a row of the previous
+ * pass's mtp_res for a chain step), with the token at each position + 1 and
+ * the positions themselves.  The draft head's KV is the one shared pool,
+ * addressed through each session's own page table, so this is the target's
+ * batched pass applied to the draft layer: every row's page table comes from
+ * g->batch, the lead's scratch carries the activations, and the head is
+ * projected for all rows in one launch and picked in one argmax.  Fills
+ * out_pick[i] with segment i's last-row greedy pick (when want_pick).
+ *
+ * Numerics: the rows of one pass share the GEMMs, so a pick can differ from
+ * the single-session draft's at a near tie -- which only moves acceptance,
+ * never a committed token; the verify decides those. */
+typedef struct {
+    ds4_session          *session;
+    const ds4_gpu_tensor *hidden;
+    uint32_t              hidden_row0;
+    uint32_t              n_rows;
+    const int32_t        *tokens;      /* n_rows */
+    const int32_t        *positions;   /* n_rows */
+} q4e_draft_seg;
+
+static int q4e_mtp_draft_batch(ds4_session *lead, const q4e_draft_seg *segs, uint32_t n_seg,
+                               bool want_pick, int *out_pick) {
+    ds4_q4e_graph *g = &lead->q4e_graph;
+    ds4_engine *e = lead->engine;
+    const ds4_model *tm = &e->model;
+    const ds4_model *mm = &e->mtp_model;
+    const ds4_q4e_mtp_weights *mw = &e->q4e_mtp_weights;
+    if (!g->mtp_ready || n_seg == 0) return 1;
+
+    uint32_t n = 0;
+    bool segmented = false;
+    for (uint32_t i = 0; i < n_seg; i++) {
+        if (segs[i].n_rows == 0 || !segs[i].session->q4e_graph.mtp_ready) return 1;
+        n += segs[i].n_rows;
+        if (segs[i].n_rows > 1u) segmented = true;
+    }
+    if (n > g->tok_cap || n > g->logit_rows) return 1;
+
+    ds4_q4e_graph *views = xmalloc((size_t)n_seg * sizeof(*views));
+    ds4_q4e_graph **seq = xmalloc((size_t)n * sizeof(*seq));
+    ds4_q4e_graph **seg_owner = xmalloc((size_t)n_seg * sizeof(*seg_owner));
+    uint32_t *seg_row0 = xmalloc((size_t)n_seg * sizeof(uint32_t));
+    uint32_t *seg_len = xmalloc((size_t)n_seg * sizeof(uint32_t));
+    int32_t *tok = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *pos = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *mrope = xmalloc((size_t)(n + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t));
+    int32_t *mrope_win = xmalloc((size_t)n * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t));
+    int32_t *picks = xmalloc((size_t)n * sizeof(int32_t));
+    int rc = 1;
+    bool sparse = false;
+    const bool dense = q4e_draft_dense_enabled();
+
+    /* The lead's draft view owns the pass's scratch, exactly as in
+     * q4e_mtp_draft; each session gets a view with the draft planes swapped
+     * into the draft slot, which is all the per-row kernels read from an
+     * owner: its page table and its caches at that layer. */
+    ds4_q4e_graph d = *g;
+    d.res = g->mtp_res;
+    d.embed = g->mtp_embed;
+    d.tokens = g->mtp_tokens;
+    d.positions = g->mtp_positions;
+    d.mrope = g->mtp_mrope;
+    d.mrope_rows = g->mtp_mrope_rows;
+    d.logits = g->mtp_logits;
+    d.k_cache[Q4E_MTP_SLOT] = g->mtp_k_cache;
+    d.v_cache[Q4E_MTP_SLOT] = g->mtp_v_cache;
+    d.idx_k_cache[Q4E_MTP_SLOT] = dense ? NULL : g->mtp_idx_k_cache;
+    d.idx_pooled[Q4E_MTP_SLOT] = dense ? NULL : g->mtp_idx_pooled;
+    d.spec_k = 0;
+    d.ctx_slot = -1;
+
+    uint32_t row = 0;
+    for (uint32_t i = 0; i < n_seg; i++) {
+        ds4_session *s = segs[i].session;
+        ds4_q4e_graph *o = &s->q4e_graph;
+        uint32_t hi = 0;
+        for (uint32_t r = 0; r < segs[i].n_rows; r++) {
+            const int32_t p = segs[i].positions[r];
+            if (p < 0 || (uint32_t)p >= o->ctx_size) goto done;
+            if ((uint32_t)p > hi) hi = (uint32_t)p;
+        }
+        if (q4e_kv_reserve(o, hi + 1u) != 0) goto done;
+        views[i] = *o;
+        views[i].k_cache[Q4E_MTP_SLOT] = o->mtp_k_cache;
+        views[i].v_cache[Q4E_MTP_SLOT] = o->mtp_v_cache;
+        views[i].idx_k_cache[Q4E_MTP_SLOT] = dense ? NULL : o->mtp_idx_k_cache;
+        views[i].idx_pooled[Q4E_MTP_SLOT] = dense ? NULL : o->mtp_idx_pooled;
+        views[i].spec_k = 0;
+        views[i].ctx_slot = -1;
+        if (d.idx_k_cache[Q4E_MTP_SLOT] && o->idx_ready &&
+            (hi + 1u) / 4u > DS4_N_INDEXER_TOP_K / 4u) sparse = true;
+        seg_owner[i] = &views[i];
+        seg_row0[i] = row;
+        seg_len[i] = segs[i].n_rows;
+        /* Gather this segment's input rows behind the previous ones. */
+        if (!ds4_gpu_tensor_copy(g->mtp_hidden, (uint64_t)row * Q4E_HC_DIM * sizeof(float),
+                                 segs[i].hidden, (uint64_t)segs[i].hidden_row0 * Q4E_HC_DIM * sizeof(float),
+                                 (uint64_t)segs[i].n_rows * Q4E_HC_DIM * sizeof(float))) goto done;
+        for (uint32_t r = 0; r < segs[i].n_rows; r++, row++) {
+            seq[row] = &views[i];
+            tok[row] = segs[i].tokens[r];
+            pos[row] = segs[i].positions[r];
+            q4e_mrope_batch_row(mrope + 3u * (DS4_Q4E_MROPE_BACK + row),
+                                mrope_win + (size_t)row * (DS4_Q4E_MROPE_BACK + 1u) * 3u,
+                                pos[row], s->sync_images, s->sync_image_count);
+        }
+    }
+    /* The table's leading back rows serve only the unbatched pooled-indexer
+     * launch; the batched one reads each row's own window. */
+    for (uint32_t i = 0; i < DS4_Q4E_MROPE_BACK; i++)
+        mrope[3u * i] = mrope[3u * i + 1u] = mrope[3u * i + 2u] = 0;
+    d.qsa_sparse = sparse;
+
+    q4e_batch batch = { .seq = seq, .n = n, .n_seg = n_seg, .seg_row0 = seg_row0,
+                        .seg_len = seg_len, .seg_owner = seg_owner, .segmented = segmented };
+    {
+        const uint32_t NL = DS4_N_LAYER;
+        const uint32_t cnt = n * (2u * NL + 2u);
+        ds4_gpu_tensor **srcs = xcalloc(cnt, sizeof(*srcs));
+        /* Only the page tables are read: the draft slot is an attention layer
+         * and the recurrent/PLE entries stay NULL. */
+        for (uint32_t r = 0; r < n; r++) srcs[(uint64_t)(2u * NL + 1u) * n + r] = seq[r]->kv_pages;
+        const int packed = ds4_gpu_q4e_ptrs_pack(g->batch_ptrs, srcs, cnt);
+        free(srcs);
+        if (!packed) goto done;
+    }
+    d.batch = &batch;
+
+    if (!ds4_gpu_tensor_write(d.tokens, 0, tok, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(d.positions, 0, pos, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(d.mrope, 0, mrope, (uint64_t)(n + DS4_Q4E_MROPE_BACK) * 3u * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->mrope_batch, 0, mrope_win,
+                              (uint64_t)n * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t))) goto done;
+
+    /* The same sequence of launches as q4e_mtp_draft, on n rows. */
+    if (!q4e_embed(d.embed, d.tokens, tm, e->weights.token_embd, n)) goto done;
+    if (!ds4_gpu_q4e_hc_norm(g->blk_out, d.embed, mm->map, mm->size,
+                             mw->pre_fc_norm_embedding->abs_offset,
+                             DS4_N_EMBD, 1u, n, DS4_RMS_EPS)) goto done;
+    if (!q4e_matmul_at(g->mixed, mw->fc_map, mw->fc_map_size, mw->fc_embedding, g->blk_out, n)) goto done;
+    if (!ds4_gpu_q4e_hc_norm(g->ple_q, g->mtp_hidden, mm->map, mm->size,
+                             mw->pre_fc_norm_hidden->abs_offset,
+                             Q4E_HC_DIM, 1u, n, DS4_RMS_EPS)) goto done;
+    if (!q4e_matmul_at(g->ple_gv, mw->fc_map, mw->fc_map_size, mw->fc_hidden, g->ple_q, n * DS4_N_HC)) goto done;
+    if (!ds4_gpu_q4e_hc_init_add(d.res, g->mixed, g->ple_gv, DS4_N_EMBD, DS4_N_HC, n)) goto done;
+    /* No graph capture: the rows carry several page tables. */
+    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 0u, n, false,
+                        /*xn_ready=*/false, mw->block.hc_ffn_norm)) goto done;
+    if (!q4e_run_island(&d, mm, &mw->block, Q4E_MTP_SLOT, 1u, n, false,
+                        /*xn_ready=*/true, /*next_norm=*/NULL)) goto done;
+    if (!want_pick) { rc = 0; goto done; }
+
+    if (!q4e_hc_mix(&d, mm, mw->hc_norm, mw->hc_down, mw->hc_up, NULL, n)) goto done;
+    ds4_q4e_head_slice *hs = &e->q4e_head_slice;
+    if (hs->path && !hs->dev && !hs->failed) q4e_head_slice_build(e);
+    const bool sliced = hs->dev != NULL;
+    const uint32_t n_out = sliced ? hs->n_sel : (uint32_t)DS4_N_VOCAB;
+    const int projected = sliced
+        ? ds4_gpu_q4e_exl3_matmul_dev(d.logits, hs->dev, hs->bits, DS4_N_EMBD, hs->n_sel, g->mixed, n)
+        : q4e_matmul(d.logits, tm, e->weights.output, g->mixed, n);
+    if (!projected) goto done;
+    if (!ds4_gpu_q4e_argmax_rows(g->argmax_dev, d.logits, n_out, n)) goto done;
+    if (!ds4_gpu_synchronize()) goto done;
+    if (!ds4_gpu_tensor_read(g->argmax_dev, 0, picks, (uint64_t)n * sizeof(int32_t))) goto done;
+    for (uint32_t i = 0; i < n_seg; i++) {
+        int32_t pick = picks[seg_row0[i] + seg_len[i] - 1u];
+        if (sliced && pick >= 0 && (uint32_t)pick < hs->n_sel) pick = hs->ids[pick];
+        out_pick[i] = (int)pick;
+    }
+    rc = 0;
+
+done:
+    free(views); free(seq); free(seg_owner); free(seg_row0); free(seg_len);
+    free(tok); free(pos); free(mrope); free(mrope_win); free(picks);
+    return rc;
+}
+
 /* Write the draft KV for `n` target residual rows starting at row `row0` of
  * `src`, which stand at positions [pos0, pos0 + n).  history supplies the
  * token after each row; `last_token` overrides it for the final row, which is
@@ -71266,6 +71458,138 @@ static uint32_t q4e_spec_draft_only(ds4_session *s, int first_token, uint32_t K,
     return n_draft;
 }
 
+/* The draft phase of a batched tick, for every member together: the
+ * per-session decisions of q4e_spec_draft_only (n-gram proposal and its
+ * MTP gate, the eos stop, the depth) unchanged, the GPU passes shared.
+ * Fills drafts[i][0..Kd[i]) per member; a member with nothing pending or
+ * K = 0 takes no chain rows but still has its pending rows flushed, so the
+ * draft KV follows every committed token as before. */
+static int q4e_spec_draft_batch(ds4_session **sessions, const int *first_tokens,
+                                const uint32_t *Kc, uint32_t n_sess, int eos_token,
+                                int (*drafts)[Q4E_SPEC_MAX_DRAFT], uint32_t *Kd,
+                                bool *from_ngram, q4e_ngram_src *ngram_src) {
+    static int ngram_drafts[DS4_EXEC_CONTEXTS_MAX][Q4E_SPEC_MAX_DRAFT];
+    static int32_t tok[DS4_EXEC_CONTEXTS_MAX][Q4E_SPEC_MAX_DRAFT + 1];
+    static int32_t pos[DS4_EXEC_CONTEXTS_MAX][Q4E_SPEC_MAX_DRAFT + 1];
+    uint32_t n_ngram[DS4_EXEC_CONTEXTS_MAX], K[DS4_EXEC_CONTEXTS_MAX];
+    uint32_t last_row[DS4_EXEC_CONTEXTS_MAX];   /* this member's row in the last pass */
+    bool ready[DS4_EXEC_CONTEXTS_MAX];
+    q4e_draft_seg segs[DS4_EXEC_CONTEXTS_MAX];
+    int picks[DS4_EXEC_CONTEXTS_MAX];
+    uint32_t seg_of[DS4_EXEC_CONTEXTS_MAX];
+
+    for (uint32_t i = 0; i < n_sess; i++) {
+        ds4_session *s = sessions[i];
+        ds4_q4e_graph *g = &s->q4e_graph;
+        const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+        Kd[i] = 0;
+        from_ngram[i] = false;
+        ngram_src[i].draft = 0;
+        ngram_src[i].pos = 0;
+        n_ngram[i] = 0;
+        ready[i] = g->mtp_ready && g->pend_valid;
+        uint32_t mtp_k = 0;
+        if (ready[i]) {
+            mtp_k = s->engine->mtp_draft_tokens > 0 ? (uint32_t)s->engine->mtp_draft_tokens : 0;
+            if (mtp_k > Kc[i]) mtp_k = Kc[i];
+        }
+        if (mtp_k) {
+            uint32_t ng_k = q4e_ngram_k();
+            if (ng_k > Kc[i]) ng_k = Kc[i];
+            if (ng_k > mtp_k) {
+                n_ngram[i] = q4e_ngram_propose(s->checkpoint.v, pos0, first_tokens[i],
+                                               g->ngram_gen_start, &g->ngram_mem,
+                                               ngram_drafts[i], ng_k, &ngram_src[i]);
+            }
+        }
+        K[i] = mtp_k;
+    }
+
+    /* Pass 1: flush every ready member's pending rows.  Row r of member i
+     * stands at pend_pos0 + r and is followed by history[pend_pos0 + r + 1],
+     * except the last, which is followed by the token just sampled. */
+    uint32_t n_seg = 0;
+    ds4_session *lead = NULL;
+    for (uint32_t i = 0; i < n_sess; i++) {
+        seg_of[i] = UINT32_MAX;
+        if (!ready[i]) continue;
+        ds4_session *s = sessions[i];
+        ds4_q4e_graph *g = &s->q4e_graph;
+        const uint32_t n = g->pend_n;
+        if (n == 0 || n > Q4E_SPEC_MAX_DRAFT + 1u) return 1;
+        for (uint32_t r = 0; r < n; r++) {
+            pos[i][r] = (int32_t)(g->pend_pos0 + r);
+            tok[i][r] = (r + 1u < n) ? s->checkpoint.v[g->pend_pos0 + r + 1u] : first_tokens[i];
+        }
+        segs[n_seg] = (q4e_draft_seg){ s, g->pend_res, 0u, n, tok[i], pos[i] };
+        seg_of[i] = n_seg++;
+        if (!lead) lead = s;
+        g->pend_valid = false;
+    }
+    if (n_seg == 0) return 0;
+    if (q4e_mtp_draft_batch(lead, segs, n_seg, true, picks) != 0) {
+        for (uint32_t i = 0; i < n_sess; i++) if (ready[i]) ds4_session_invalidate(sessions[i]);
+        return 1;
+    }
+    /* Where each member's last flushed row landed in the pass's mtp_res. */
+    {
+        uint32_t row = 0;
+        for (uint32_t si = 0; si < n_seg; si++) {
+            for (uint32_t i = 0; i < n_sess; i++) if (seg_of[i] == si) last_row[i] = row + segs[si].n_rows - 1u;
+            row += segs[si].n_rows;
+        }
+    }
+    for (uint32_t i = 0; i < n_sess; i++) {
+        if (!ready[i] || K[i] == 0) continue;
+        ds4_q4e_graph *g = &sessions[i]->q4e_graph;
+        const int pick = picks[seg_of[i]];
+        drafts[i][Kd[i]++] = pick;
+        if (n_ngram[i] > K[i] && ngram_drafts[i][0] == pick) {
+            for (uint32_t j = 1; j < n_ngram[i]; j++) drafts[i][j] = ngram_drafts[i][j];
+            Kd[i] = n_ngram[i];
+            K[i] = n_ngram[i];
+            from_ngram[i] = true;
+        } else if (n_ngram[i]) {
+            g->spec_ngram_vetoed++;
+        }
+    }
+
+    /* Passes 2..K: one row per member still drafting, fed the row its
+     * previous pass wrote.  The gather into mtp_hidden happens before the
+     * pass overwrites mtp_res, inside q4e_mtp_draft_batch. */
+    for (;;) {
+        ds4_q4e_graph *lg = &lead->q4e_graph;
+        n_seg = 0;
+        for (uint32_t i = 0; i < n_sess; i++) {
+            seg_of[i] = UINT32_MAX;
+            if (!ready[i] || from_ngram[i] || Kd[i] == 0 || Kd[i] >= K[i]) continue;
+            if (drafts[i][Kd[i] - 1u] == eos_token) continue;
+            const uint32_t pos0 = (uint32_t)sessions[i]->checkpoint.len;
+            tok[i][0] = drafts[i][Kd[i] - 1u];
+            pos[i][0] = (int32_t)(pos0 - 1u + Kd[i]);
+            segs[n_seg] = (q4e_draft_seg){ sessions[i], lg->mtp_res, last_row[i], 1u, tok[i], pos[i] };
+            seg_of[i] = n_seg++;
+        }
+        if (n_seg == 0) break;
+        if (q4e_mtp_draft_batch(lead, segs, n_seg, true, picks) != 0) {
+            for (uint32_t i = 0; i < n_sess; i++) if (seg_of[i] != UINT32_MAX) ds4_session_invalidate(sessions[i]);
+            return 1;
+        }
+        for (uint32_t i = 0; i < n_sess; i++) {
+            if (seg_of[i] == UINT32_MAX) continue;
+            last_row[i] = seg_of[i];
+            drafts[i][Kd[i]++] = picks[seg_of[i]];
+        }
+    }
+    for (uint32_t i = 0; i < n_sess; i++) {
+        if (!from_ngram[i]) continue;
+        ds4_q4e_graph *g = &sessions[i]->q4e_graph;
+        g->spec_ngram_steps++;
+        g->spec_ngram_drafted += Kd[i];
+    }
+    return 0;
+}
+
 /* Batched speculative decode: draft each session, verify all of them in one
  * segmented forward, accept and roll back each on its own.  Same result as
  * calling q4e_spec_step per session, but the verify -- the pass over the
@@ -71294,16 +71618,42 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
     const int spec_log = q4e_spec_log_level();
     const double t_draft = now_sec();
 
-    uint32_t total = 0;
+    uint32_t Kc[DS4_EXEC_CONTEXTS_MAX];
     for (uint32_t i = 0; i < n_sess; i++) {
         ds4_session *s = sessions[i];
         pos0[i] = (uint32_t)s->checkpoint.len;
         uint32_t K = K_ceil;
         if (K > s->q4e_graph.spec_k) K = s->q4e_graph.spec_k;
         if (pos0[i] + 1u + K > s->q4e_graph.ctx_size) K = s->q4e_graph.ctx_size - pos0[i] - 1u;
-        Kd[i] = q4e_spec_draft_only(s, first_tokens[i], K, eos_token,
-                                    drafts[i], &from_ngram[i], &ngram_src[i]);
-        if (Kd[i] == UINT32_MAX) { if (errlen) snprintf(err, errlen, "draft failed"); return -1; }
+        Kc[i] = K;
+    }
+    /* Drafts: every member's chain in lockstep, one pass per depth over all
+     * of them -- the flush of each member's pending rows first (a segmented
+     * pass, since the rows per member vary), then one row per member still
+     * drafting.  Opt-in (DS4_QWEN4EXP_BATCH_DRAFTS=1) until its GPU gates have
+     * run: tests/test_qwen4exp_specbatch under that variable, then the live
+     * three-stream A/B in misc/qwen4exp-numerics/server_ab.sh.  The trace and
+     * dump paths know only the single-session draft, so they keep it. */
+    static int batched_drafts = -1;
+    if (batched_drafts < 0) {
+        const char *bd = getenv("DS4_QWEN4EXP_BATCH_DRAFTS");
+        batched_drafts = (bd && bd[0] && bd[0] != '0') ? 1 : 0;
+    }
+    const bool serial = !batched_drafts || q4e_trace_enabled() || getenv("DS4_QWEN4EXP_MTP_DUMP");
+    if (serial) {
+        for (uint32_t i = 0; i < n_sess; i++) {
+            Kd[i] = q4e_spec_draft_only(sessions[i], first_tokens[i], Kc[i], eos_token,
+                                        drafts[i], &from_ngram[i], &ngram_src[i]);
+            if (Kd[i] == UINT32_MAX) { if (errlen) snprintf(err, errlen, "draft failed"); return -1; }
+        }
+    } else if (q4e_spec_draft_batch(sessions, first_tokens, Kc, n_sess, eos_token,
+                                    drafts, Kd, from_ngram, ngram_src) != 0) {
+        if (errlen) snprintf(err, errlen, "batched draft failed");
+        return -1;
+    }
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n_sess; i++) {
+        ds4_session *s = sessions[i];
         token_vec_push(&s->checkpoint, first_tokens[i]);
         for (uint32_t j = 0; j < Kd[i]; j++) token_vec_push(&s->checkpoint, drafts[i][j]);
         ss[i] = s;
