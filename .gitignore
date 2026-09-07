@@ -49,7 +49,6 @@ __pycache__/
 .*.swp
 .DS_Store
 /.worktrees/
-docs/superpowers/plans/
 tests/test_nfc
 /tests/test_qwen4exp_exl3
 /tests/test_qwen4exp_cache
