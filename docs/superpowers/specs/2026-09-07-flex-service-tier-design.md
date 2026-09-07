@@ -217,8 +217,23 @@ Landed on `qwen3.8-flash-next`:
   promotion recomputed per pass.
 
 Unit tests: `make ds4_server_test && ./ds4_server_test`. Integration:
-`tests/test_flex_tier.py` against `ds4-server --exec-contexts 2` (needs the GPU
-and the model; not yet run at the time of writing -- record the numbers here).
+`tests/test_flex_tier.py` against `ds4-server --exec-contexts 2`. Run
+2026-09-07 15:12-15:25 on the GB10 (EXL3 4.05bpw, MTP draft 4, ctx 8192,
+thinking off, greedy):
+- A (normal arrives while a flex is generating): normal TTFT 0.25 s, normal
+  wall 0.54 s, flex tokens leaked during the normal: 0; server log shows
+  `flex slot 0 parked` / `resumed after 0.5 s`.
+- B (two flex, cap 1, then a normal): second flex not admitted; normal TTFT
+  0.13 s with one flex running and one queued; the queued flex ran afterwards.
+- C (normal arrives during a 5909-token flex prefill): normal TTFT 0.52 s, flex
+  parked between chunks (`resumed after 0.4 s`) and completed (prefill 4.56 s
+  total). Parks were shorter than the 5 s keepalive period, so no keepalive
+  comment was observed end to end; the unit test covers that path.
+- The solo-vs-parked text equality held on one run and differed at a near-tie
+  on another (known cross-run nondeterminism of the MoE, not the scheduler);
+  the script now asserts only the pre-park prefix and reports the rest.
+- Not covered end to end: promotion (spec test 4) and the no-flex throughput
+  baseline (spec test 5, `tests/bench_concurrency.py`).
 
 Follow-ups not done: gating flex admission on KV pool headroom; evicting a
 parked flex under slot pressure; a pause deadline / 429.
