@@ -661,6 +661,27 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* qwen4exp segmented batched forward: several per-session sequential runs
+ * (tokens already in each session->checkpoint) in one pass, sharing the dense
+ * and MoE weight reads while the recurrent kernels run per run. Fills
+ * out_argmax with per-row greedy picks (row order). Does not commit state. The
+ * shared primitive under batched speculative verify and chunked prefill. */
+int ds4_sessions_forward_segmented(ds4_session **sessions, const uint32_t *pos0,
+                                   const uint32_t *ntok, uint32_t n_items,
+                                   int32_t *out_argmax, char *err, size_t errlen);
+/* Test helper: reset a session to fresh and seed its checkpoint with tokens so a
+ * segmented forward re-prefills them. qwen4exp only. */
+int ds4_session_seed_prefill_for_test(ds4_session *s, const int32_t *toks, uint32_t n);
+
+/* Max speculative drafts per step (matches the engine's Q4E_SPEC_MAX_DRAFT). */
+#define DS4_QWEN4EXP_SPEC_MAX_DRAFT 8
+/* Batched speculative decode: keep MTP speculation on across a batch. Each
+ * items[i].token is that session's sampled first token; on return
+ * accepted[i][0..committed[i]) holds the committed tokens (greedy). qwen4exp. */
+int ds4_sessions_eval_speculative_batch(ds4_decode_item *items, int count,
+                                        int eos_token,
+                                        int (*accepted)[DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1],
+                                        int *committed, char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */

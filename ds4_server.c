@@ -6769,12 +6769,19 @@ static bool sse_error_event(int fd, const request *r, const char *msg) {
     return ok;
 }
 
+/* OpenAI echoes the tier the request ran under.  Emitted only when the
+ * request asked for flex, so normal responses are byte-identical to before. */
+static void append_service_tier_json(buf *b, const request *r) {
+    if (r && r->flex) buf_puts(b, ",\"service_tier\":\"flex\"");
+}
+
 static bool sse_chunk(int fd, const request *r, const char *id, const char *text, const char *finish) {
     buf b = {0};
     long now = (long)time(NULL);
     if (r->kind == REQ_CHAT) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":");
         if (text) {
             buf_puts(&b, "{\"content\":");
@@ -6789,6 +6796,7 @@ static bool sse_chunk(int fd, const request *r, const char *id, const char *text
     } else {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"text\":");
         json_escape(&b, text ? text : "");
         buf_puts(&b, ",\"index\":0,\"finish_reason\":");
@@ -8146,6 +8154,7 @@ static bool responses_sse_created(int fd, const request *r, responses_stream *st
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"in_progress\","
         "\"model\":", st->response_id, created_at);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     buf_puts(&b, ",\"output\":[]}}");
     bool ok = responses_sse_emit_event(fd, st, b.ptr);
     buf_free(&b);
@@ -8540,6 +8549,7 @@ static bool responses_sse_completed(int fd, const request *r,
         "\"object\":\"response\",\"created_at\":%ld,\"status\":\"%s\",\"model\":",
         event_type, st->response_id, created_at, status);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     if (!strcmp(event_type, "response.failed")) {
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
@@ -9161,6 +9171,7 @@ static bool responses_final_response(int fd, bool enable_cors,
         "\"model\":",
         response_id, now, status);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     if (finish && !strcmp(finish, "error")) {
         buf_puts(&b, ",\"error\":{\"code\":\"server_error\","
                      "\"message\":\"generation failed\"}");
@@ -9221,6 +9232,7 @@ static bool final_response(int fd, bool enable_cors,
     if (r->kind == REQ_CHAT) {
         buf_printf(&b, "{\"id\":\"%s\",\"object\":\"chat.completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
         json_escape(&b, text ? text : "");
         if (reasoning && reasoning[0]) {
@@ -9237,6 +9249,7 @@ static bool final_response(int fd, bool enable_cors,
     } else {
         buf_printf(&b, "{\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"text\":");
         json_escape(&b, text);
         buf_puts(&b, ",\"index\":0,\"finish_reason\":");
@@ -10289,8 +10302,11 @@ struct server_slot {
     bool decode_pending;
     bool decode_in_flight;
     bool decode_done;
+    bool decode_spec;      /* this tick runs batched speculative, not one token */
     int decode_token;
     int decode_rc;
+    int decode_committed[DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1];
+    int decode_committed_n;
     char decode_err[160];
 };
 
@@ -10333,6 +10349,7 @@ struct server {
     pthread_cond_t model_cv;
     bool model_busy;
     bool model_stopping;
+    bool batch_spec;   /* keep MTP across batched decode via speculative verify */
     int decode_pending;
     /* Executor bookkeeping, guarded by model_mu: contexts queued for a decode
      * step, contexts inside their decode loop, and how many steps have been
@@ -12751,10 +12768,24 @@ static bool server_prefill_before_decode_locked(const server *s) {
  * staged residual so a later speculative step rebuilds it). */
 #define DS4_BATCH_DECODE_MIN_GENERATIONS 3
 
+/* The minimum concurrent generations at which decode coalesces into one
+ * batched pass.  DS4_BATCH_DECODE_MIN overrides the compile default so the
+ * threshold can be swept (and set to 1 for always-on continuous batching)
+ * without a rebuild. */
+static int server_batch_decode_min(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_BATCH_DECODE_MIN");
+        cached = (env && env[0]) ? atoi(env) : DS4_BATCH_DECODE_MIN_GENERATIONS;
+        if (cached < 1) cached = 1;
+    }
+    return cached;
+}
+
 static bool server_batch_decode_now(server *s) {
     if (!s->batched_decode) return false;
     pthread_mutex_lock(&s->model_mu);
-    const bool batch = s->active_generations >= DS4_BATCH_DECODE_MIN_GENERATIONS;
+    const bool batch = s->active_generations >= server_batch_decode_min();
     pthread_mutex_unlock(&s->model_mu);
     return batch;
 }
@@ -13667,6 +13698,59 @@ static int server_eval_token(server *s, server_slot *slot, int token,
     return rc;
 }
 
+/* Enqueue a first token for a batched speculative tick and return the tokens
+ * the coordinator committed for this slot (first token plus accepted drafts).
+ * Mirrors the batched branch of server_eval_token; the coordinator distinguishes
+ * the tick by slot->decode_spec. */
+static int server_eval_speculative_batch(server *s, server_slot *slot, int first_token,
+                                         int *toks, int *ntok_out, char *err, size_t errlen) {
+    pthread_mutex_lock(&s->model_mu);
+    if (g_stop_requested || slot_job_cancelled(slot)) {
+        pthread_mutex_unlock(&s->model_mu);
+        if (err && errlen) snprintf(err, errlen, "%s",
+                                    g_stop_requested ? "shutdown requested" : "client disconnected");
+        return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    if (slot->decode_pending || slot->decode_in_flight) {
+        pthread_mutex_unlock(&s->model_mu);
+        if (err && errlen) snprintf(err, errlen, "session already has a decode in flight");
+        return 1;
+    }
+    slot->decode_token = first_token;
+    slot->decode_spec = true;
+    slot->decode_rc = 1;
+    slot->decode_err[0] = '\0';
+    slot->decode_done = false;
+    slot->decode_committed_n = 0;
+    slot->decode_pending = true;
+    s->decode_pending++;
+    pthread_cond_broadcast(&s->model_cv);
+    while (!slot->decode_done) {
+        const bool client_cancelled = slot_job_cancelled(slot);
+        if ((client_cancelled || g_stop_requested) &&
+            server_cancel_pending_decode_locked(s, slot)) {
+            if (!client_cancelled) snprintf(slot->decode_err, sizeof(slot->decode_err), "shutdown requested");
+            break;
+        }
+        pthread_cond_wait(&s->model_cv, &s->model_mu);
+    }
+    int rc = slot->decode_rc;
+    if (g_stop_requested && rc == 0) rc = DS4_SESSION_SYNC_INTERRUPTED;
+    if (rc == 0) {
+        int n = slot->decode_committed_n;
+        for (int i = 0; i < n; i++) toks[i] = slot->decode_committed[i];
+        *ntok_out = n;
+    } else if (err && errlen) {
+        snprintf(err, errlen, "%s",
+                 g_stop_requested ? "shutdown requested" :
+                 (slot->decode_err[0] ? slot->decode_err : "decode interrupted"));
+    }
+    slot->decode_spec = false;
+    slot->decode_done = false;
+    pthread_mutex_unlock(&s->model_mu);
+    return rc;
+}
+
 static long server_decode_coalesce_us(void) {
     long us = 2000;
     const char *env = getenv("DS4_SERVER_DECODE_COALESCE_US");
@@ -13720,6 +13804,7 @@ static void *decode_worker_main(void *arg) {
         if (s->model_stopping && s->decode_pending == 0) break;
 
         int count = 0;
+        bool tick_spec = false;
         for (int i = 0; i < s->slot_count; i++) {
             server_slot *slot = &s->slots[i];
             if (!slot->decode_pending) continue;
@@ -13729,6 +13814,7 @@ static void *decode_worker_main(void *arg) {
             members[count] = slot;
             items[count].session = slot->session;
             items[count].token = slot->decode_token;
+            if (slot->decode_spec) tick_spec = true;
             count++;
         }
         if (count == 0) continue;
@@ -13737,14 +13823,24 @@ static void *decode_worker_main(void *arg) {
 
         char batch_err[160] = {0};
         const double batch_t0 = log_batches ? now_sec() : 0.0;
+        int spec_committed[DS4_EXEC_CONTEXTS_MAX];
+        int spec_accepted[DS4_EXEC_CONTEXTS_MAX][DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1];
         server_inference_lock(s);
-        int rc = ds4_sessions_eval_batch(items, count,
-                                         batch_err, sizeof(batch_err));
+        int rc;
+        if (tick_spec) {
+            /* One first token per context; verify every context's drafts in one
+             * segmented forward and keep MTP on. */
+            rc = ds4_sessions_eval_speculative_batch(items, count, -1,
+                                                     spec_accepted, spec_committed,
+                                                     batch_err, sizeof(batch_err));
+        } else {
+            rc = ds4_sessions_eval_batch(items, count, batch_err, sizeof(batch_err));
+        }
         server_inference_unlock(s);
         if (log_batches) {
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: decode batch count=%d elapsed=%.3f ms status=%s",
-                       count, (now_sec() - batch_t0) * 1000.0,
+                       "ds4-server: decode batch count=%d spec=%d elapsed=%.3f ms status=%s",
+                       count, tick_spec, (now_sec() - batch_t0) * 1000.0,
                        rc == 0 ? "ok" : "error");
         }
 
@@ -13754,7 +13850,13 @@ static void *decode_worker_main(void *arg) {
             server_slot *slot = members[i];
             slot->decode_in_flight = false;
             slot->decode_rc = rc;
-            if (rc != 0) {
+            if (rc == 0 && tick_spec) {
+                slot->decode_committed_n = spec_committed[i];
+                for (int t = 0; t < spec_committed[i] &&
+                                t < DS4_QWEN4EXP_SPEC_MAX_DRAFT + 1; t++) {
+                    slot->decode_committed[t] = spec_accepted[i][t];
+                }
+            } else if (rc != 0) {
                 snprintf(slot->decode_err, sizeof(slot->decode_err), "%s",
                          batch_err[0] ? batch_err : "batched decode failed");
             }
@@ -14431,6 +14533,21 @@ decode_again:
                 finish = "error";
                 break;
             }
+        } else if (s->batch_spec && server_batch_decode_now(s) &&
+                   temperature <= 0.0f &&
+                   ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                   getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            /* Batched decode with MTP kept on: the coordinator verifies every
+             * context's drafts in one segmented forward.  Greedy only -- the
+             * batched verify accepts by argmax -- so sampled requests fall to
+             * the plain batched path below. */
+            int nt = 0;
+            if (server_eval_speculative_batch(s, slot, token, toks, &nt,
+                                              err, sizeof(err)) != 0) {
+                finish = "error";
+                break;
+            }
+            ntok = nt;
         } else {
             if (server_eval_token(s, slot, token, err, sizeof(err)) != 0) {
                 finish = "error";
@@ -16382,6 +16499,16 @@ int main(int argc, char **argv) {
      * over the weights. */
     s.batched_decode = multi_ctx_mode && slot_count > 1 &&
                        (cfg.batched_decode_set ? cfg.batched_decode : true);
+    /* Keep MTP speculation on across a batched-decode tick by verifying every
+     * context's drafts in one segmented forward.  Opt-in for now
+     * (DS4_QWEN4EXP_BATCH_SPEC=1): the batched-verify engine path is unit-tested
+     * (tests/test_qwen4exp_specbatch) but the server coordinator path wants
+     * validation under real concurrency before it is a default. */
+    {
+        const char *bs = getenv("DS4_QWEN4EXP_BATCH_SPEC");
+        s.batch_spec = s.batched_decode && bs && bs[0] == '1' &&
+                       ds4_engine_has_mtp(engine);
+    }
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     /* The executor's contended quantum.  128 -- this flag's default, sized for
      * DeepSeek -- is far too small for a 512-expert MoE, where a chunk that
@@ -22363,8 +22490,50 @@ static void test_flex_request_tier_parsing(void) {
     TEST_ASSERT(content_length(hdr, strlen(hdr)) == 5);
 }
 
+static void test_flex_response_echo(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    int sv[2];
+
+    r.flex = true;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(final_response(sv[0], false, &r, "cmpl-flex", "OK", NULL, NULL, "stop", 3, 1));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"service_tier\":\"flex\"") != NULL);
+    free(out); close(sv[0]); close(sv[1]);
+
+    r.flex = false;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(final_response(sv[0], false, &r, "cmpl-norm", "OK", NULL, NULL, "stop", 3, 1));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "service_tier") == NULL);
+    free(out); close(sv[0]); close(sv[1]);
+
+    r.flex = true;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(sse_chunk(sv[0], &r, "cmpl-flex", "tok", NULL));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"service_tier\":\"flex\"") != NULL);
+    free(out); close(sv[0]); close(sv[1]);
+
+    r.api = API_RESPONSES;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(responses_final_response(sv[0], false, &r, "resp_flex", "OK", NULL, NULL,
+                                         "stop", 3, 1));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"service_tier\":\"flex\"") != NULL);
+    free(out); close(sv[0]); close(sv[1]);
+
+    request_free(&r);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_flex_request_tier_parsing();
+    test_flex_response_echo();
     test_batched_prefill_round_robin();
     test_cancel_clears_awaiting_first_grant();
     test_multi_ctx_decode_round_robin();

@@ -975,6 +975,149 @@ __global__ static void q4e_add2_kernel(float *res, const float *a, const float *
 }
 
 /* ---------------------------------------------------------------------------
+ * Batched-decode variants of the three recurrent-state kernels.
+ *
+ * A batched decode passes one token per sequence (row) through the model in a
+ * single forward.  These three kernels each carry per-sequence state, so the
+ * scalar path loops them once per row on the host.  The batched variants add a
+ * grid.y = row dimension and take a device array of per-row state pointers
+ * (built once per step by ds4_gpu_q4e_ptrs_pack), so one launch serves every
+ * row.  Each row is exactly one token, so there is no chained scan and no
+ * checkpoint -- the math is the single-token body of the scalar kernel with
+ * every I/O offset by its row.  All threads in a block share blockIdx.y, so a
+ * NULL row-state guard cannot deadlock a __syncthreads.
+ * ------------------------------------------------------------------------ */
+__global__ static void q4e_gdn_conv_batch_kernel(
+        float *out, float * const *states, const float *x, const float *w,
+        uint32_t channels, uint32_t kernel) {
+    const uint32_t row = blockIdx.y;
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float *state = states[row];
+    if (!state) return;
+    const uint32_t hist = kernel - 1u;
+    const float *xr = x + (uint64_t)row * channels;
+    float *outr = out + (uint64_t)row * channels;
+    float win[8];
+    for (uint32_t i = 0; i < hist; i++) win[i] = state[(uint64_t)i * channels + c];
+    const float *wc = w + (uint64_t)c * kernel;
+    const float cur = xr[c];
+    float acc = 0.0f;
+    for (uint32_t k = 0; k < hist; k++) acc += wc[k] * win[k];
+    acc += wc[hist] * cur;
+    outr[c] = acc / (1.0f + __expf(-acc));
+    for (uint32_t k = 0; k + 1u < hist; k++) win[k] = win[k + 1];
+    if (hist > 0) win[hist - 1] = cur;
+    for (uint32_t i = 0; i < hist; i++) state[(uint64_t)i * channels + c] = win[i];
+}
+
+__global__ static void q4e_ple_conv_batch_kernel(
+        float *out, float * const *states, const float *x, const float *w,
+        uint32_t channels, uint32_t kernel, uint32_t dilation) {
+    const uint32_t row = blockIdx.y;
+    const uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
+    float *state = states[row];
+    if (!state) return;
+    const uint32_t hist = (kernel - 1u) * dilation;
+    const float *xr = x + (uint64_t)row * channels;
+    float *outr = out + (uint64_t)row * channels;
+    float win[16];
+    for (uint32_t i = 0; i < hist; i++) win[i] = state[(uint64_t)i * channels + c];
+    const float *wc = w + (uint64_t)c * kernel;
+    const float cur = xr[c];
+    float acc = wc[kernel - 1u] * cur;
+    for (uint32_t k = 0; k + 1u < kernel; k++) {
+        const uint32_t back = (kernel - 1u - k) * dilation;
+        acc += wc[k] * win[hist - back];
+    }
+    outr[c] = acc / (1.0f + __expf(-acc));
+    for (uint32_t i = 0; i + 1u < hist; i++) win[i] = win[i + 1];
+    if (hist > 0) win[hist - 1] = cur;
+    for (uint32_t i = 0; i < hist; i++) state[(uint64_t)i * channels + c] = win[i];
+}
+
+__global__ static void __launch_bounds__(512) q4e_gdn_recurrent_batch_kernel(
+        float *attn_out, float * const *states,
+        const float *qkv, const float *decay, const float *beta,
+        uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v,
+        uint32_t k_offset, uint32_t v_offset, uint32_t stride) {
+    extern __shared__ float q4e_gdn_smem[];
+    float *s_state = q4e_gdn_smem;
+    const uint32_t row = blockIdx.y;
+    const uint32_t h = blockIdx.x;
+    const uint32_t hk = h % n_head_k;
+    const uint32_t j = threadIdx.x / Q4E_GDN_SPLIT;
+    const uint32_t sub = threadIdx.x % Q4E_GDN_SPLIT;
+    const uint32_t seg = head_dim / Q4E_GDN_SPLIT;
+    const float scale = rsqrtf((float)head_dim);
+    const uint32_t row_stride = head_dim + 1u;
+    float *state = states[row];
+    if (!state) return;
+
+    float *m = state + (uint64_t)h * head_dim * head_dim;
+    for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
+        const uint32_t r = idx / head_dim, c = idx % head_dim;
+        s_state[r * row_stride + c] = m[idx];
+    }
+    __syncthreads();
+
+    __shared__ float s_k[128];
+    __shared__ float s_q[128];
+    __shared__ float s_kq;
+
+    const float *base = qkv + (uint64_t)row * stride;
+    const float *q_d = base + (uint64_t)hk * head_dim;
+    const float *k_d = base + k_offset + (uint64_t)hk * head_dim;
+    const float *v_d = base + v_offset + (uint64_t)h * head_dim;
+    float kq_part = 0.0f;
+    if (sub == 0u && j < head_dim) {
+        const float kv = k_d[j];
+        const float qv = q_d[j];
+        s_k[j] = kv;
+        s_q[j] = qv;
+        kq_part = kv * qv;
+    }
+    kq_part = q4e_block_sum(kq_part);
+    if (threadIdx.x == 0u) s_kq = kq_part;
+    __syncthreads();
+
+    const uint64_t gi = (uint64_t)row * n_head_v + h;
+    const float dec = __expf(decay[gi]);
+    const float bt = beta[gi];
+
+    float *rowp = s_state + (uint64_t)j * row_stride;
+    const uint32_t i0 = sub * seg;
+    float sk = 0.0f, sq = 0.0f;
+    for (uint32_t n = 0; n < seg; n++) {
+        const uint32_t i = i0 + ((n + 8u * sub) & (seg - 1u));
+        const float mv = rowp[i];
+        sk = fmaf(mv, s_k[i], sk);
+        sq = fmaf(mv, s_q[i], sq);
+    }
+    sk += __shfl_xor_sync(0xffffffffu, sk, 1);
+    sk += __shfl_xor_sync(0xffffffffu, sk, 2);
+    sq += __shfl_xor_sync(0xffffffffu, sq, 1);
+    sq += __shfl_xor_sync(0xffffffffu, sq, 2);
+    const float delta = (v_d[j] - dec * sk) * bt;
+
+    if (sub == 0u) {
+        attn_out[((uint64_t)row * n_head_v + h) * head_dim + j] =
+            (dec * sq + delta * s_kq) * scale;
+    }
+    for (uint32_t n = 0; n < seg; n++) {
+        const uint32_t i = i0 + ((n + 8u * sub) & (seg - 1u));
+        rowp[i] = fmaf(rowp[i], dec, delta * s_k[i]);
+    }
+    __syncthreads();
+
+    for (uint32_t idx = threadIdx.x; idx < head_dim * head_dim; idx += blockDim.x) {
+        const uint32_t r = idx / head_dim, c = idx % head_dim;
+        m[idx] = s_state[r * row_stride + c];
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * C entry points.  Weights are addressed by model offset and resolved through
  * the same weight cache every other qwen4exp-adjacent kernel uses.
  * ------------------------------------------------------------------------ */
@@ -2286,6 +2429,89 @@ extern "C" int ds4_gpu_q4e_add2(
     return cuda_ok(cudaGetLastError(), "qwen4exp add2");
 }
 
+/* Pack the raw device pointers of `count` tensors (NULL entries allowed) into
+ * `dst` as a contiguous void* array, for the batched-decode kernels that take
+ * a per-row array of state/page-table pointers.  One H2D copy per batched
+ * step; the host source lives for the duration of the synchronous copy. */
+extern "C" int ds4_gpu_q4e_ptrs_pack(
+        ds4_gpu_tensor *dst, ds4_gpu_tensor *const *srcs, uint32_t count) {
+    if (!dst || !srcs || !count) return 0;
+    if (dst->bytes < (uint64_t)count * sizeof(void *)) return 0;
+    void **raw = (void **)malloc((size_t)count * sizeof(void *));
+    if (!raw) return 0;
+    for (uint32_t i = 0; i < count; i++) raw[i] = srcs[i] ? srcs[i]->ptr : NULL;
+    int d = ds4_tensor_device_idx(dst);
+    int ok = 0;
+    WITH_DEVICE(g_gpu[d].device_id) {
+        ok = cuda_ok(cudaMemcpy(dst->ptr, raw, (size_t)count * sizeof(void *),
+                                cudaMemcpyHostToDevice),
+                     "q4e ptrs pack");
+    }
+    free(raw);
+    return ok;
+}
+
+extern "C" int ds4_gpu_q4e_gdn_conv_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state_ptrs, uint32_t ptr_off,
+        const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t channels, uint32_t kernel, uint32_t n_row) {
+    if (!out || !state_ptrs || !x || !n_row || kernel < 1u || kernel > 8u) return 0;
+    const float *w = q4e_weight(model_map, model_size, weight_offset,
+                                (uint64_t)channels * kernel * sizeof(float), out,
+                                "qwen4exp gdn conv batch");
+    if (!w) return 0;
+    const dim3 grid((channels + 255u) / 256u, n_row, 1);
+    q4e_gdn_conv_batch_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (float *const *)((void **)state_ptrs->ptr + ptr_off),
+            (const float *)x->ptr, w, channels, kernel);
+    return cuda_ok(cudaGetLastError(), "qwen4exp gdn conv batch");
+}
+
+extern "C" int ds4_gpu_q4e_ple_conv_batch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state_ptrs, uint32_t ptr_off,
+        const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint32_t channels, uint32_t kernel,
+        uint32_t dilation, uint32_t n_row) {
+    if (!out || !state_ptrs || !x || !n_row || (kernel - 1u) * dilation > 16u) return 0;
+    const float *w = q4e_weight(model_map, model_size, weight_offset,
+                                (uint64_t)channels * kernel * sizeof(float), out,
+                                "qwen4exp ple conv batch");
+    if (!w) return 0;
+    const dim3 grid((channels + 255u) / 256u, n_row, 1);
+    q4e_ple_conv_batch_kernel<<<grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)out->ptr, (float *const *)((void **)state_ptrs->ptr + ptr_off),
+            (const float *)x->ptr, w, channels, kernel, dilation);
+    return cuda_ok(cudaGetLastError(), "qwen4exp ple conv batch");
+}
+
+extern "C" int ds4_gpu_q4e_gdn_recurrent_batch(
+        ds4_gpu_tensor *attn_out, ds4_gpu_tensor *state_ptrs, uint32_t ptr_off,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *decay,
+        const ds4_gpu_tensor *beta, uint32_t head_dim, uint32_t n_head_k,
+        uint32_t n_head_v, uint32_t stride, uint32_t n_row) {
+    if (!attn_out || !state_ptrs || !qkv || !decay || !beta || !n_row) return 0;
+    if (head_dim != 128u) return 0;
+    const size_t shared = (size_t)head_dim * (head_dim + 1u) * sizeof(float);
+    static bool opted_in = false;
+    if (!opted_in) {
+        if (cudaFuncSetAttribute(q4e_gdn_recurrent_batch_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)shared) != cudaSuccess) {
+            return 0;
+        }
+        opted_in = true;
+    }
+    const uint32_t k_offset = n_head_k * head_dim;
+    const uint32_t v_offset = 2u * n_head_k * head_dim;
+    const dim3 grid(n_head_v, n_row, 1);
+    q4e_gdn_recurrent_batch_kernel<<<grid, (unsigned)head_dim * Q4E_GDN_SPLIT, shared,
+                                     cuda_decode_stream()>>>(
+            (float *)attn_out->ptr, (float *const *)((void **)state_ptrs->ptr + ptr_off),
+            (const float *)qkv->ptr, (const float *)decay->ptr, (const float *)beta->ptr,
+            head_dim, n_head_k, n_head_v, k_offset, v_offset, stride);
+    return cuda_ok(cudaGetLastError(), "qwen4exp gdn recurrent batch");
+}
+
 /* ---------------------------------------------------------------------------
  * QSA attention layers (every DS4_N_FULL_ATTN_INTERVAL-th layer).
  *
@@ -2509,6 +2735,117 @@ __global__ static void q4e_qsa_attention_kernel(
      * reads one contiguous row per warp. */
     extern __shared__ float q4e_attn_smem[];
     float *s_acc = q4e_attn_smem;                       /* warps * head_dim */
+    __shared__ float s_m[Q4E_ATTN_WARPS];
+    __shared__ float s_l[Q4E_ATTN_WARPS];
+    for (uint32_t j = 0; j < slots; j++) {
+        const uint32_t i = lane + 32u * j;
+        if (i < head_dim) s_acc[(uint64_t)warp * head_dim + i] = acc[j];
+    }
+    if (lane == 0u) { s_m[warp] = m; s_l[warp] = l; }
+    __syncthreads();
+
+    float gm = -INFINITY;
+    for (uint32_t w = 0; w < Q4E_ATTN_WARPS; w++) gm = fmaxf(gm, s_m[w]);
+    float den = 0.0f;
+    for (uint32_t w = 0; w < Q4E_ATTN_WARPS; w++) den += s_l[w] * __expf(s_m[w] - gm);
+    const float inv = 1.0f / den;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        float num = 0.0f;
+        for (uint32_t w = 0; w < Q4E_ATTN_WARPS; w++) {
+            num += s_acc[(uint64_t)w * head_dim + i] * __expf(s_m[w] - gm);
+        }
+        out[qbase + i] = num * inv;
+    }
+}
+
+/* Batched-decode variants of the KV store and the per-query attention.  Each
+ * query row (blockIdx.y = t) belongs to a different sequence, so `pages`
+ * becomes a per-row array of page tables; pos, q, k, v and out are already
+ * row-major over t.  The bodies are the single-token scalar kernels with only
+ * that indirection changed -- the tiled prefill attention is not used here
+ * because it stages several queries under one shared page table. */
+__global__ static void q4e_qsa_store_kv_batch_kernel(
+        __half *k_cache, __half *v_cache, const float *k, const float *v,
+        const float *kw, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot,
+        float rope_base, const int32_t *pos, const int32_t *mrope,
+        uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
+        const int32_t *const *pages_arr, uint32_t pool_slots, float eps) {
+    const uint32_t t = blockIdx.y;
+    const uint32_t h = blockIdx.x;
+    const int32_t *pages = pages_arr[t];
+    const uint64_t src = ((uint64_t)t * n_head_kv + h) * head_dim;
+
+    extern __shared__ float q4e_k_smem[];
+    float *s_k = q4e_k_smem;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float x = k[src + i];
+        s_k[i] = x;
+        sum += x * x;
+    }
+    const float scale = rsqrtf(q4e_block_sum(sum) / (float)head_dim + eps);
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) s_k[i] *= scale * kw[i];
+    __syncthreads();
+    q4e_rope_mrope(s_k, n_rot, rope_base,
+                   mrope[3u * t], mrope[3u * t + 1u], mrope[3u * t + 2u],
+                   sec_t, sec_h, sec_w, threadIdx.x, blockDim.x);
+    __syncthreads();
+    const uint64_t slot = ((uint64_t)q4e_kv_row(pages, (uint32_t)pos[t]) * n_head_kv + h) * head_dim;
+    if (slot + head_dim > (uint64_t)pool_slots * n_head_kv * head_dim) return;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        k_cache[slot + i] = __float2half(s_k[i]);
+        v_cache[slot + i] = __float2half(v[src + i]);
+    }
+}
+
+__global__ static void q4e_qsa_attention_batch_kernel(
+        float *out, const __half *k_cache, const __half *v_cache, const float *q,
+        uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
+        const int32_t *pos, const int32_t *const *pages_arr, uint32_t n_tok) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t t = blockIdx.y;
+    const int32_t *pages = pages_arr[t];
+    const uint32_t hkv = h / (n_head / n_head_kv);
+    const uint32_t last = (uint32_t)pos[t];
+    const float scale = rsqrtf((float)head_dim);
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t slots = (head_dim + 31u) / 32u;
+    const uint64_t qbase = ((uint64_t)t * n_head + h) * head_dim;
+
+    float qv[Q4E_ATTN_LANE_SLOTS];
+    float acc[Q4E_ATTN_LANE_SLOTS];
+    for (uint32_t j = 0; j < slots; j++) {
+        const uint32_t i = lane + 32u * j;
+        qv[j] = (i < head_dim) ? q[qbase + i] * scale : 0.0f;
+        acc[j] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    for (uint32_t p = warp; p <= last; p += Q4E_ATTN_WARPS) {
+        const uint64_t kb = ((uint64_t)q4e_kv_row(pages, p) * n_head_kv + hkv) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t j = 0; j < slots; j++) {
+            const uint32_t i = lane + 32u * j;
+            if (i < head_dim) dot += qv[j] * __half2float(k_cache[kb + i]);
+        }
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xffffffffu, dot, off);
+
+        const float m_new = fmaxf(m, dot);
+        const float corr = __expf(m - m_new);
+        const float w = __expf(dot - m_new);
+        for (uint32_t j = 0; j < slots; j++) {
+            const uint32_t i = lane + 32u * j;
+            const float v = (i < head_dim) ? __half2float(v_cache[kb + i]) : 0.0f;
+            acc[j] = acc[j] * corr + w * v;
+        }
+        l = l * corr + w;
+        m = m_new;
+    }
+
+    extern __shared__ float q4e_attn_smem[];
+    float *s_acc = q4e_attn_smem;
     __shared__ float s_m[Q4E_ATTN_WARPS];
     __shared__ float s_l[Q4E_ATTN_WARPS];
     for (uint32_t j = 0; j < slots; j++) {
@@ -2990,6 +3327,31 @@ extern "C" int ds4_gpu_q4e_idx_store_k(ds4_gpu_tensor *cache, const ds4_gpu_tens
             (__half *)cache->ptr, (const float *)k->ptr, (const int32_t *)pos->ptr,
             (const int32_t *)pages->ptr, n_tok);
     return cuda_ok(cudaGetLastError(), "qwen4exp idx store k");
+}
+
+/* Batched idx key store: one launch over all rows, each row's own page table.
+ * grid.x = row (block per token, as the scalar kernel), pages from the packed
+ * array.  Numerically identical to the per-row scalar path (a plain store). */
+__global__ static void q4e_idx_store_k_batch_kernel(
+        __half *cache, const float *k, const int32_t *pos,
+        const int32_t *const *pages_arr, uint32_t n_tok) {
+    const uint32_t t = blockIdx.x;
+    if (t >= n_tok) return;
+    const int32_t *pages = pages_arr[t];
+    const uint64_t dst = (uint64_t)q4e_kv_row(pages, (uint32_t)pos[t]) * Q4E_IDX_DIM;
+    for (uint32_t i = threadIdx.x; i < Q4E_IDX_DIM; i += blockDim.x) {
+        cache[dst + i] = __float2half(k[(uint64_t)t * Q4E_IDX_DIM + i]);
+    }
+}
+
+extern "C" int ds4_gpu_q4e_idx_store_k_batch(
+        ds4_gpu_tensor *cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *pos,
+        ds4_gpu_tensor *page_ptrs, uint32_t ptr_off, uint32_t n_row) {
+    if (!cache || !k || !pos || !page_ptrs || !n_row) return 0;
+    q4e_idx_store_k_batch_kernel<<<n_row, 128, 0, cuda_decode_stream()>>>(
+            (__half *)cache->ptr, (const float *)k->ptr, (const int32_t *)pos->ptr,
+            (const int32_t *const *)((void **)page_ptrs->ptr + ptr_off), n_row);
+    return cuda_ok(cudaGetLastError(), "qwen4exp idx store k batch");
 }
 
 /* One block per key block b in [b0, b1): mean of its r raw keys, RMSNorm with
@@ -3906,6 +4268,50 @@ extern "C" int ds4_gpu_q4e_qsa_q_norm_rope(
             head_dim, n_head, n_rot, rope_base, (const int32_t *)mrope->ptr,
             sec_t, sec_h, sec_w, eps);
     return cuda_ok(cudaGetLastError(), "qwen4exp qsa q");
+}
+
+extern "C" int ds4_gpu_q4e_qsa_store_kv_batch(
+        ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *k, const ds4_gpu_tensor *v,
+        const void *model_map, uint64_t model_size, uint64_t weight_offset,
+        const ds4_gpu_tensor *pos, const ds4_gpu_tensor *mrope,
+        uint32_t sec_t, uint32_t sec_h, uint32_t sec_w,
+        ds4_gpu_tensor *page_ptrs, uint32_t ptr_off,
+        uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base,
+        uint32_t pool_slots, uint32_t n_row, float eps) {
+    if (!k_cache || !v_cache || !k || !v || !pos || !mrope || !page_ptrs || !n_row) return 0;
+    const float *w = q4e_weight(model_map, model_size, weight_offset,
+                                (uint64_t)head_dim * sizeof(float), k_cache,
+                                "qwen4exp k norm");
+    if (!w) return 0;
+    const dim3 grid(n_head_kv, n_row, 1);
+    q4e_qsa_store_kv_batch_kernel<<<grid, 128, head_dim * sizeof(float),
+                                    cuda_decode_stream()>>>(
+            (__half *)k_cache->ptr, (__half *)v_cache->ptr,
+            (const float *)k->ptr, (const float *)v->ptr, w,
+            head_dim, n_head_kv, n_rot, rope_base,
+            (const int32_t *)pos->ptr, (const int32_t *)mrope->ptr,
+            sec_t, sec_h, sec_w,
+            (const int32_t *const *)((void **)page_ptrs->ptr + ptr_off), pool_slots, eps);
+    return cuda_ok(cudaGetLastError(), "qwen4exp qsa kv store batch");
+}
+
+extern "C" int ds4_gpu_q4e_qsa_attention_batch(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache,
+        const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos,
+        ds4_gpu_tensor *page_ptrs, uint32_t ptr_off,
+        uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_row) {
+    if (!out || !k_cache || !v_cache || !q || !pos || !page_ptrs || !n_row) return 0;
+    if (head_dim > 32u * Q4E_ATTN_LANE_SLOTS) return 0;
+    const dim3 grid(n_head, n_row, 1);
+    q4e_qsa_attention_batch_kernel<<<grid, 32u * Q4E_ATTN_WARPS,
+                                     Q4E_ATTN_WARPS * head_dim * sizeof(float),
+                                     cuda_decode_stream()>>>(
+            (float *)out->ptr, (const __half *)k_cache->ptr, (const __half *)v_cache->ptr,
+            (const float *)q->ptr, head_dim, n_head, n_head_kv,
+            (const int32_t *)pos->ptr,
+            (const int32_t *const *)((void **)page_ptrs->ptr + ptr_off), n_row);
+    return cuda_ok(cudaGetLastError(), "qwen4exp qsa attention batch");
 }
 
 extern "C" int ds4_gpu_q4e_qsa_store_kv(

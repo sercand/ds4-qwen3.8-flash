@@ -567,10 +567,28 @@ tests/test_qwen4exp_batch.o: tests/test_qwen4exp_batch.c ds4.h
 tests/test_qwen4exp_batch: tests/test_qwen4exp_batch.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
+tests/test_qwen4exp_verify.o: tests/test_qwen4exp_verify.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_verify: tests/test_qwen4exp_verify.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_qwen4exp_specbatch.o: tests/test_qwen4exp_specbatch.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_specbatch: tests/test_qwen4exp_specbatch.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
 tests/bench_qwen4exp_ctx.o: tests/bench_qwen4exp_ctx.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 tests/bench_qwen4exp_ctx: tests/bench_qwen4exp_ctx.o $(CORE_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+tests/test_qwen4exp_cache.o: tests/test_qwen4exp_cache.c ds4.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_qwen4exp_cache: tests/test_qwen4exp_cache.o $(CORE_OBJS)
 	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
 
 tests/test_qwen4exp_exl3.o: tests/test_qwen4exp_exl3.c ds4.h

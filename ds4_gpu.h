@@ -3236,6 +3236,16 @@ int ds4_gpu_q4e_ple_conv( ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_
 
 int ds4_gpu_q4e_add2( ds4_gpu_tensor *res, const ds4_gpu_tensor *a, const ds4_gpu_tensor *b, uint64_t n);
 
+/* Batched-decode helpers: pack per-row state/page pointers once per step, then
+ * the batched recurrent kernels take that device array plus an element offset. */
+int ds4_gpu_q4e_ptrs_pack( ds4_gpu_tensor *dst, ds4_gpu_tensor *const *srcs, uint32_t count);
+int ds4_gpu_q4e_gdn_conv_batch( ds4_gpu_tensor *out, ds4_gpu_tensor *state_ptrs, uint32_t ptr_off, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t channels, uint32_t kernel, uint32_t n_row);
+int ds4_gpu_q4e_ple_conv_batch( ds4_gpu_tensor *out, ds4_gpu_tensor *state_ptrs, uint32_t ptr_off, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t channels, uint32_t kernel, uint32_t dilation, uint32_t n_row);
+int ds4_gpu_q4e_gdn_recurrent_batch( ds4_gpu_tensor *attn_out, ds4_gpu_tensor *state_ptrs, uint32_t ptr_off, const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *decay, const ds4_gpu_tensor *beta, uint32_t head_dim, uint32_t n_head_k, uint32_t n_head_v, uint32_t stride, uint32_t n_row);
+int ds4_gpu_q4e_qsa_store_kv_batch( ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *mrope, uint32_t sec_t, uint32_t sec_h, uint32_t sec_w, ds4_gpu_tensor *page_ptrs, uint32_t ptr_off, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base, uint32_t pool_slots, uint32_t n_row, float eps);
+int ds4_gpu_q4e_qsa_attention_batch( ds4_gpu_tensor *out, const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *q, const ds4_gpu_tensor *pos, ds4_gpu_tensor *page_ptrs, uint32_t ptr_off, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv, uint32_t n_row);
+int ds4_gpu_q4e_idx_store_k_batch( ds4_gpu_tensor *cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *pos, ds4_gpu_tensor *page_ptrs, uint32_t ptr_off, uint32_t n_row);
+
 int ds4_gpu_q4e_qsa_q_norm_rope( ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, const ds4_gpu_tensor *qkv, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *mrope, uint32_t sec_t, uint32_t sec_h, uint32_t sec_w, uint32_t head_dim, uint32_t n_head, uint32_t n_rot, float rope_base, uint32_t n_tok, float eps);
 
 int ds4_gpu_q4e_qsa_store_kv( ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache, const ds4_gpu_tensor *k, const ds4_gpu_tensor *v, const void *model_map, uint64_t model_size, uint64_t weight_offset, const ds4_gpu_tensor *pos, const ds4_gpu_tensor *mrope, uint32_t sec_t, uint32_t sec_h, uint32_t sec_w, const ds4_gpu_tensor *pages, uint32_t head_dim, uint32_t n_head_kv, uint32_t n_rot, float rope_base, uint32_t pool_slots, uint32_t n_tok, float eps);

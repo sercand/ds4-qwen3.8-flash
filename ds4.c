@@ -55471,20 +55471,36 @@ static q4e_tree_node *q4e_tree_split(q4e_span_tree *t, q4e_tree_node *n, uint32_
 /* Hand the pages a context wrote for [start, end) to a new child of `parent`,
  * whose tokens are `tok`.  The context's table keeps its own holder on each
  * page, so the node and the context release them independently. */
+/* Why the last q4e_tree_add refused, for the callers' log lines. */
+static char q4e_tree_refusal[160];
+
 static q4e_tree_node *q4e_tree_add(q4e_span_tree *t, q4e_tree_node *parent,
                                    const int32_t *tok, uint32_t start, uint32_t end,
                                    const q4e_page_table *table, double now) {
-    if (end <= start || start != parent->end) return NULL;
+    if (end <= start || start != parent->end) {
+        snprintf(q4e_tree_refusal, sizeof(q4e_tree_refusal),
+                 "span [%u, %u) does not start at the parent's end %u", start, end, parent->end);
+        return NULL;
+    }
     /* Children branch by first token, and the whole walk relies on that being
      * unique.  A caller that reaches here with a token a sibling already
      * carries has lost track of the shared path (the tree changed under it);
      * refuse rather than make the walk ambiguous. */
     for (const q4e_tree_node *c = parent->child; c; c = c->next) {
-        if (c->tok[0] == tok[start]) return NULL;
+        if (c->tok[0] == tok[start]) {
+            snprintf(q4e_tree_refusal, sizeof(q4e_tree_refusal),
+                     "a sibling [%u, %u) already starts with token %d at %u",
+                     c->start, c->end, tok[start], start);
+            return NULL;
+        }
     }
     const uint32_t pg_lo = start >> DS4_Q4E_PAGE_SHIFT;
     const uint32_t pg_hi = q4e_pages_for(end);
-    if (pg_hi > table->len) return NULL;
+    if (pg_hi > table->len) {
+        snprintf(q4e_tree_refusal, sizeof(q4e_tree_refusal),
+                 "the page table holds %u pages, the span to %u needs %u", table->len, end, pg_hi);
+        return NULL;
+    }
     q4e_tree_node *n = xmalloc(sizeof(*n));
     memset(n, 0, sizeof(*n));
     n->parent = parent;
@@ -55720,9 +55736,22 @@ bool ds4_test_q4e_span_tree(void) {
  * windows and page table; the shared scratch is whichever context's graph the
  * pass runs through, since q4e_scratch_bind gives every context the same
  * buffers. */
+/* A batched pass over `n` rows.  `seq` is the per-row owner (all-length-1 plain
+ * decode: one sequence per row, and the batched stateful kernels apply).  A
+ * *segmented* batch groups rows into runs that each belong to one sequence and
+ * advance its recurrent state sequentially -- speculative verify (each segment
+ * is 1+K rows) and chunked prefill (one long prefill run plus single decode
+ * rows).  In segmented mode the stateful steps loop per segment, calling the
+ * single-sequence kernels on a row-view (exactly what q4e_forward does for that
+ * segment), while the dense/MoE parts still batch over all n rows. */
 typedef struct q4e_batch {
-    struct ds4_q4e_graph **seq;
+    struct ds4_q4e_graph **seq;      /* per-row owner, length n */
     uint32_t               n;
+    uint32_t               n_seg;    /* segments; 0 or == n means all-length-1 */
+    const uint32_t        *seg_row0; /* first row of each segment, length n_seg */
+    const uint32_t        *seg_len;  /* rows in each segment */
+    struct ds4_q4e_graph **seg_owner;/* owner graph of each segment */
+    bool                   segmented;/* any segment longer than one row */
 } q4e_batch;
 
 struct ds4_q4e_graph {
@@ -55746,6 +55775,11 @@ struct ds4_q4e_graph {
     ds4_gpu_tensor *gdn_conv[DS4_MAX_LAYER];
     ds4_gpu_tensor *gdn_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *ple_conv;
+    /* Batched decode: a device void* array of per-row state pointers, packed
+     * once per step.  Layout (stride = n, the batch size): gdn_conv[il] at
+     * il*n, gdn_state[il] at (N_LAYER+il)*n, ple_conv at 2*N_LAYER*n.  Only the
+     * lead context's buffer is used, during its exclusive batched pass. */
+    ds4_gpu_tensor *batch_ptrs;
 
     /* Paged KV.  k_cache/v_cache -- and the indexer and draft caches below --
      * are *borrowed* from the shared cache: one allocation of pool_slots rows
@@ -67451,6 +67485,7 @@ static void q4e_graph_free(ds4_q4e_graph *g) {
     }
     ds4_gpu_tensor_free(g->ple_conv);
     ds4_gpu_tensor_free(g->ple_conv_ckpt);
+    ds4_gpu_tensor_free(g->batch_ptrs);
     ds4_gpu_tensor_free(g->pend_res);
     ds4_gpu_tensor_free(g->kv_pages);
     if (g->cache) {
@@ -67704,19 +67739,33 @@ static int q4e_cache_commit(ds4_session *s, const int32_t *tok, uint32_t q,
     if (!c || q == 0u || !g->node || q <= g->node->end) return 0;
     const double now = now_sec();
     pthread_mutex_lock(&c->mu);
-    while (g->node->end < q && g->node->end < g->matched_end) {
-        /* Walk again rather than keep a node pointer across an unlock: the
-         * tree can have been split or pruned since the plan. */
-        const uint32_t upto = q < g->matched_end ? q : g->matched_end;
-        uint32_t m = 0;
-        q4e_tree_node *target = q4e_tree_walk(&c->tree, tok, upto, &m);
-        if (m < upto || target == c->tree.root) break;
-        if (target->end > upto) target = q4e_tree_split(&c->tree, target, upto);
-        /* Only ever move *down* from where this context already stands. */
-        if (!target || target->end != upto ||
-            !q4e_tree_is_ancestor(g->node, target)) break;
-        q4e_tree_mark_live(target, g->node, +1);
-        g->node = target;
+    /* Descend from where this context stands along its own tokens for as long
+     * as the tree already holds them, splitting the node the path leaves
+     * partway; only the remainder is new.  Bounded by the frontier, not by the
+     * plan's match: the tree can have changed since the plan (a split, a
+     * prune, another context's commit), and a turn whose client re-renders the
+     * history without the reasoning shares a prefix with the previous turn's
+     * branch that is longer than the prompt-time match -- stopping short there
+     * left a sibling carrying the new span's first token, which the add below
+     * refuses, and every turn of that conversation re-prefilled from the
+     * checkpoint.  Only ever moves *down* from the context's node. */
+    while (g->node->end < q) {
+        const uint32_t pos = g->node->end;
+        q4e_tree_node *pick = NULL;
+        for (q4e_tree_node *ch = g->node->child; ch; ch = ch->next) {
+            if (ch->tok[0] == tok[pos]) { pick = ch; break; }
+        }
+        if (!pick) break;
+        const uint32_t span = pick->end - pick->start;
+        uint32_t k = 0;
+        while (k < span && pos + k < q && pick->tok[k] == tok[pos + k]) k++;
+        if (k < span) {
+            q4e_tree_node *lo = q4e_tree_split(&c->tree, pick, pos + k);
+            if (!lo) break;
+            pick = lo;
+        }
+        q4e_tree_mark_live(pick, g->node, +1);
+        g->node = pick;
     }
     if (g->node->end < q) {
         q4e_tree_node *n = q4e_tree_add(&c->tree, g->node, tok, g->node->end, q,
@@ -68243,6 +68292,20 @@ static int q4e_payload_check(const uint32_t *h, const ds4_session *s,
  * the path it let go of: half a path is not a path.  The pages it holds, both
  * the adopted and the fresh ones, go back to the pool at the next detach,
  * which the cold prefill that follows performs. */
+/* DS4_QWEN4EXP_SPEC_LOG level: 0 off, 1 per-step lines, 2 adds a phase
+ * breakdown.  Parses the value so `=0` (or empty) means off -- the systemd
+ * unit sets it to 0 to silence the hot-path logging, and a bare presence test
+ * would have kept it on. */
+static int q4e_spec_log_level(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_QWEN4EXP_SPEC_LOG");
+        cached = (env && env[0]) ? atoi(env) : 0;
+        if (cached < 0) cached = 0;
+    }
+    return cached;
+}
+
 static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
                             char *err, size_t errlen) {
     ds4_q4e_graph *g = &s->q4e_graph;
@@ -68369,7 +68432,7 @@ static int q4e_payload_load(ds4_session *s, FILE *fp, uint64_t payload_bytes,
         payload_set_err(err, errlen, "failed to synchronize accelerator after qwen4exp restore");
         return 1;
     }
-    if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+    if (q4e_spec_log_level() > 0) {
         fprintf(stderr, "q4e disk: restored %u tokens, %u of %u pages adopted from "
                         "the tree at %u, %u read\n",
                 tokens, own_from, pages, matched, pages - own_from);
@@ -68729,6 +68792,7 @@ static void q4e_scratch_bind(ds4_q4e_graph *g, const ds4_q4e_graph *sc) {
     memset(g->gdn_state_ckpt, 0, sizeof(g->gdn_state_ckpt));
     g->ple_conv = NULL;
     g->ple_conv_ckpt = NULL;
+    g->batch_ptrs = NULL;
     /* The paged KV: borrowed from the cache, per-context table, own pages. */
     memset(g->k_cache, 0, sizeof(g->k_cache));
     memset(g->v_cache, 0, sizeof(g->v_cache));
@@ -68808,6 +68872,12 @@ static int q4e_graph_alloc(ds4_q4e_graph *g, ds4_engine *e, uint32_t ctx_size) {
     if (ok && g->spec_k) {
         ok = q4e_alloc(&g->ple_conv_ckpt, (uint64_t)g->spec_k * Q4E_PLE_HIST * Q4E_HC_DIM * f);
     }
+    /* Per-row state/page-pointer array for the batched-decode kernels and the
+     * segmented forward: gdn_conv + gdn_state (one slot per layer) + ple_conv +
+     * kv_pages, strided by the row count.  Sized for a full pass (tok_cap rows)
+     * so the segmented verify/prefill path fits, not just an 8-row decode. */
+    ok = ok && q4e_alloc(&g->batch_ptrs,
+                         (uint64_t)T * (2u * DS4_MAX_LAYER + 2u) * sizeof(void *));
     if (ok && mtp) {
         /* The staged pending draft rows: at most the 1 + K rows one verify
          * pass commits. */
@@ -69152,18 +69222,29 @@ static int q4e_ple_block(ds4_q4e_graph *g, const ds4_model *m,
                                   l->ple_conv1d->abs_offset, Q4E_HC_DIM,
                                   DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, n_tok,
                                   g->ple_conv_ckpt, g->spec_k)) return 0;
-    } else {
-        /* The dilated window is this sequence's own, like the DeltaNet one. */
+    } else if (g->batch->segmented) {
+        const q4e_batch *b = g->batch;
         const uint64_t rb = (uint64_t)Q4E_HC_DIM * sizeof(float);
-        for (uint32_t r = 0; r < n_tok; r++) {
-            ds4_gpu_tensor *cv = q4e_row(g->ple_cv, r, rb);
+        for (uint32_t si = 0; si < b->n_seg; si++) {
+            ds4_q4e_graph *o = b->seg_owner[si];
+            ds4_gpu_tensor *cv = ds4_gpu_tensor_view(g->ple_cv, (uint64_t)b->seg_row0[si] * rb,
+                                                     (uint64_t)b->seg_len[si] * rb);
             const int ok = cv &&
-                ds4_gpu_q4e_ple_conv(cv, g->batch->seq[r]->ple_conv, cv, m->map, m->size,
+                ds4_gpu_q4e_ple_conv(cv, o->ple_conv, cv, m->map, m->size,
                                      l->ple_conv1d->abs_offset, Q4E_HC_DIM,
-                                     DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, 1u, NULL, 0u);
+                                     DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, b->seg_len[si],
+                                     o->ple_conv_ckpt, o->spec_k);
             ds4_gpu_tensor_free(cv);
             if (!ok) return 0;
         }
+    } else {
+        /* The dilated window is this sequence's own, like the DeltaNet one.
+         * One launch over all rows: ptr array base for ple_conv is 2*N*n. */
+        if (!ds4_gpu_q4e_ple_conv_batch(g->ple_cv, g->batch_ptrs,
+                                        2u * (uint32_t)DS4_N_LAYER * n_tok,
+                                        g->ple_cv, m->map, m->size,
+                                        l->ple_conv1d->abs_offset, Q4E_HC_DIM,
+                                        DS4_N_PLE_CONV, DS4_N_PLE_NGRAM, n_tok)) return 0;
     }
     q4e_trace("ple_conv_out", (int)DS4_PLE_LAYER, g->ple_cv, (uint64_t)n_tok * Q4E_HC_DIM);
 
@@ -69198,18 +69279,33 @@ static int q4e_gdn_conv_step(ds4_q4e_graph *g, const ds4_model *m,
                                     Q4E_GDN_IN, DS4_N_GDN_CONV, n_tok,
                                     g->gdn_conv_ckpt[il], g->spec_k);
     }
-    const uint64_t rb = (uint64_t)Q4E_GDN_IN * sizeof(float);
-    for (uint32_t r = 0; r < n_tok; r++) {
-        ds4_gpu_tensor *v[2] = { q4e_row(g->gdn_conv_out, r, rb),
-                                 q4e_row(g->gdn_qkv, r, rb) };
-        const int ok = v[0] && v[1] &&
-            ds4_gpu_q4e_gdn_conv(v[0], g->batch->seq[r]->gdn_conv[il], v[1],
-                                 m->map, m->size, l->gdn_conv1d->abs_offset,
-                                 Q4E_GDN_IN, DS4_N_GDN_CONV, 1u, NULL, 0u);
-        q4e_row_free(v, 2);
-        if (!ok) return 0;
+    if (g->batch->segmented) {
+        /* Each segment is one sequence's sequential run: the single-sequence
+         * conv on a row-view of the shared scratch, its own window and (for a
+         * verify segment) its own rollback checkpoints. */
+        const q4e_batch *b = g->batch;
+        const uint64_t rb = (uint64_t)Q4E_GDN_IN * sizeof(float);
+        for (uint32_t si = 0; si < b->n_seg; si++) {
+            ds4_q4e_graph *o = b->seg_owner[si];
+            const uint64_t off = (uint64_t)b->seg_row0[si] * rb;
+            const uint64_t len = (uint64_t)b->seg_len[si] * rb;
+            ds4_gpu_tensor *ov = ds4_gpu_tensor_view(g->gdn_conv_out, off, len);
+            ds4_gpu_tensor *xv = ds4_gpu_tensor_view(g->gdn_qkv, off, len);
+            const int ok = ov && xv &&
+                ds4_gpu_q4e_gdn_conv(ov, o->gdn_conv[il], xv, m->map, m->size,
+                                     l->gdn_conv1d->abs_offset, Q4E_GDN_IN, DS4_N_GDN_CONV,
+                                     b->seg_len[si], o->gdn_conv_ckpt[il], o->spec_k);
+            ds4_gpu_tensor_free(ov);
+            ds4_gpu_tensor_free(xv);
+            if (!ok) return 0;
+        }
+        return 1;
     }
-    return 1;
+    /* One launch over all rows: ptr array base for gdn_conv[il] is il*n. */
+    return ds4_gpu_q4e_gdn_conv_batch(g->gdn_conv_out, g->batch_ptrs,
+                                      (uint32_t)il * n_tok, g->gdn_qkv,
+                                      m->map, m->size, l->gdn_conv1d->abs_offset,
+                                      Q4E_GDN_IN, DS4_N_GDN_CONV, n_tok);
 }
 
 /* The recurrent 128x128 matrix per value head. */
@@ -69221,23 +69317,37 @@ static int q4e_gdn_recurrent_step(ds4_q4e_graph *g, uint32_t il, uint32_t n_tok)
                                          DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, n_tok,
                                          g->gdn_state_ckpt[il], g->spec_k);
     }
-    const uint64_t in_b  = (uint64_t)Q4E_GDN_IN * sizeof(float);
-    const uint64_t out_b = (uint64_t)Q4E_GDN_V * sizeof(float);
-    const uint64_t gate_b = (uint64_t)DS4_N_GDN_VALUE_HEAD * sizeof(float);
-    for (uint32_t r = 0; r < n_tok; r++) {
-        ds4_gpu_tensor *v[4] = { q4e_row(g->gdn_attn, r, out_b),
-                                 q4e_row(g->gdn_conv_out, r, in_b),
-                                 q4e_row(g->gdn_decay, r, gate_b),
-                                 q4e_row(g->gdn_beta, r, gate_b) };
-        const int ok = v[0] && v[1] && v[2] && v[3] &&
-            ds4_gpu_q4e_gdn_recurrent(v[0], g->batch->seq[r]->gdn_state[il], v[1],
-                                      v[2], v[3],
-                                      DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
-                                      DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, 1u, NULL, 0u);
-        q4e_row_free(v, 4);
-        if (!ok) return 0;
+    if (g->batch->segmented) {
+        const q4e_batch *b = g->batch;
+        const uint64_t in_b = (uint64_t)Q4E_GDN_IN * sizeof(float);
+        const uint64_t out_b = (uint64_t)Q4E_GDN_V * sizeof(float);
+        const uint64_t gate_b = (uint64_t)DS4_N_GDN_VALUE_HEAD * sizeof(float);
+        for (uint32_t si = 0; si < b->n_seg; si++) {
+            ds4_q4e_graph *o = b->seg_owner[si];
+            const uint32_t r0 = b->seg_row0[si], sl = b->seg_len[si];
+            ds4_gpu_tensor *av = ds4_gpu_tensor_view(g->gdn_attn, (uint64_t)r0 * out_b, (uint64_t)sl * out_b);
+            ds4_gpu_tensor *cv = ds4_gpu_tensor_view(g->gdn_conv_out, (uint64_t)r0 * in_b, (uint64_t)sl * in_b);
+            ds4_gpu_tensor *dv = ds4_gpu_tensor_view(g->gdn_decay, (uint64_t)r0 * gate_b, (uint64_t)sl * gate_b);
+            ds4_gpu_tensor *bv = ds4_gpu_tensor_view(g->gdn_beta, (uint64_t)r0 * gate_b, (uint64_t)sl * gate_b);
+            const int ok = av && cv && dv && bv &&
+                ds4_gpu_q4e_gdn_recurrent(av, o->gdn_state[il], cv, dv, bv,
+                                          DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                          DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, sl,
+                                          o->gdn_state_ckpt[il], o->spec_k);
+            ds4_gpu_tensor_free(av);
+            ds4_gpu_tensor_free(cv);
+            ds4_gpu_tensor_free(dv);
+            ds4_gpu_tensor_free(bv);
+            if (!ok) return 0;
+        }
+        return 1;
     }
-    return 1;
+    /* One launch over all rows: ptr array base for gdn_state[il] is (N+il)*n. */
+    return ds4_gpu_q4e_gdn_recurrent_batch(g->gdn_attn, g->batch_ptrs,
+                                           ((uint32_t)DS4_N_LAYER + il) * n_tok,
+                                           g->gdn_conv_out, g->gdn_decay, g->gdn_beta,
+                                           DS4_N_GDN_HEAD_DIM, DS4_N_GDN_KEY_HEAD,
+                                           DS4_N_GDN_VALUE_HEAD, Q4E_GDN_IN, n_tok);
 }
 
 static int q4e_gdn_layer(ds4_q4e_graph *g, const ds4_model *m,
@@ -69288,24 +69398,15 @@ static int q4e_qsa_store_step(ds4_q4e_graph *g, const ds4_model *m,
                                         DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
                                         g->pool_slots, n_tok, DS4_RMS_EPS);
     }
-    const uint64_t kv_b = (uint64_t)Q4E_KV_DIM * sizeof(float);
-    for (uint32_t r = 0; r < n_tok; r++) {
-        ds4_gpu_tensor *v[4] = { q4e_row(g->qsa_k, r, kv_b),
-                                 q4e_row(g->qsa_v, r, kv_b),
-                                 q4e_row(g->positions, r, sizeof(int32_t)),
-                                 q4e_row(g->mrope_rows, r, 3u * sizeof(int32_t)) };
-        const int ok = v[0] && v[1] && v[2] && v[3] &&
-            ds4_gpu_q4e_qsa_store_kv(g->k_cache[il], g->v_cache[il], v[0], v[1],
-                                     m->map, m->size, l->qsa_k_norm->abs_offset,
-                                     v[2], v[3],
-                                     DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
-                                     g->batch->seq[r]->kv_pages, DS4_N_HEAD_DIM,
-                                     DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
-                                     g->pool_slots, 1u, DS4_RMS_EPS);
-        q4e_row_free(v, 4);
-        if (!ok) return 0;
-    }
-    return 1;
+    /* One launch: kv_pages block base in batch_ptrs is (2*N+1)*n. */
+    const uint32_t kv_off = (2u * (uint32_t)DS4_N_LAYER + 1u) * n_tok;
+    return ds4_gpu_q4e_qsa_store_kv_batch(g->k_cache[il], g->v_cache[il], g->qsa_k, g->qsa_v,
+                                          m->map, m->size, l->qsa_k_norm->abs_offset,
+                                          g->positions, g->mrope_rows,
+                                          DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W,
+                                          g->batch_ptrs, kv_off, DS4_N_HEAD_DIM,
+                                          DS4_N_HEAD_KV, DS4_N_ROT, DS4_ROPE_FREQ_BASE,
+                                          g->pool_slots, n_tok, DS4_RMS_EPS);
 }
 
 static int q4e_idx_store_step(ds4_q4e_graph *g, const ds4_model *m,
@@ -69320,20 +69421,23 @@ static int q4e_idx_store_step(ds4_q4e_graph *g, const ds4_model *m,
                                     g->kv_pages,
                                     n_tok, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
     }
-    const uint64_t k_b = 128u * sizeof(float);
+    /* Store every row's raw indexer key in one launch (identical writes), then
+     * pool per row: idx_pool spans a per-sequence block range, so it stays a
+     * per-row call reading that row's own freshly-stored key. */
+    const uint32_t kv_off = (2u * (uint32_t)DS4_N_LAYER + 1u) * n_tok;
+    if (!ds4_gpu_q4e_idx_store_k_batch(g->idx_k_cache[il], g->idx_k, g->positions,
+                                       g->batch_ptrs, kv_off, n_tok)) return 0;
     for (uint32_t r = 0; r < n_tok; r++) {
         ds4_gpu_tensor *pages = g->batch->seq[r]->kv_pages;
-        ds4_gpu_tensor *v[3] = { q4e_row(g->idx_k, r, k_b),
-                                 q4e_row(g->positions, r, sizeof(int32_t)),
+        ds4_gpu_tensor *v[2] = { q4e_row(g->positions, r, sizeof(int32_t)),
                                  q4e_row(g->mrope_batch, r,
                                          (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t)) };
-        const int ok = v[0] && v[1] && v[2] &&
-            ds4_gpu_q4e_idx_store_k(g->idx_k_cache[il], v[0], v[1], pages, 1u) &&
+        const int ok = v[0] && v[1] &&
             ds4_gpu_q4e_idx_pool(g->idx_pooled[il], g->idx_k_cache[il], m->map, m->size,
-                                 l->idx_k_norm->abs_offset, v[1], v[2],
+                                 l->idx_k_norm->abs_offset, v[0], v[1],
                                  DS4_MROPE_SEC_T, DS4_MROPE_SEC_H, DS4_MROPE_SEC_W, pages,
                                  1u, DS4_N_ROT, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS);
-        q4e_row_free(v, 3);
+        q4e_row_free(v, 2);
         if (!ok) return 0;
     }
     return 1;
@@ -69348,6 +69452,32 @@ static int q4e_qsa_attention_step(ds4_q4e_graph *g, uint32_t il, uint32_t n_tok)
                                          DS4_N_HEAD_DIM, DS4_N_HEAD, DS4_N_HEAD_KV, n_tok);
     }
     const uint64_t q_b = (uint64_t)Q4E_Q_DIM * sizeof(float);
+    if (g->batch->segmented) {
+        /* One attention call per segment (n_tok = run length), so a prefill
+         * run takes the tiled kernel and a verify run the split kernel over its
+         * own rows -- exactly what q4e_forward does for that sequence. */
+        const q4e_batch *b = g->batch;
+        for (uint32_t si = 0; si < b->n_seg; si++) {
+            ds4_q4e_graph *o = b->seg_owner[si];
+            const uint32_t r0 = b->seg_row0[si], sl = b->seg_len[si];
+            ds4_gpu_tensor *ov = ds4_gpu_tensor_view(g->qsa_out, (uint64_t)r0 * q_b, (uint64_t)sl * q_b);
+            ds4_gpu_tensor *qv = ds4_gpu_tensor_view(g->qsa_q, (uint64_t)r0 * q_b, (uint64_t)sl * q_b);
+            ds4_gpu_tensor *pv = ds4_gpu_tensor_view(g->positions, (uint64_t)r0 * sizeof(int32_t),
+                                                     (uint64_t)sl * sizeof(int32_t));
+            const int ok = ov && qv && pv &&
+                ds4_gpu_q4e_qsa_attention(ov, o->k_cache[il], o->v_cache[il], qv, pv,
+                                          o->kv_pages, DS4_N_HEAD_DIM, DS4_N_HEAD,
+                                          DS4_N_HEAD_KV, sl);
+            ds4_gpu_tensor_free(ov);
+            ds4_gpu_tensor_free(qv);
+            ds4_gpu_tensor_free(pv);
+            if (!ok) return 0;
+        }
+        return 1;
+    }
+    /* All-length-1 batch: a per-row loop over the scalar (split) decode kernel,
+     * bit-identical to single-stream (batching the split kernel with per-row
+     * page tables is a follow-up). */
     for (uint32_t r = 0; r < n_tok; r++) {
         ds4_gpu_tensor *v[3] = { q4e_row(g->qsa_out, r, q_b),
                                  q4e_row(g->qsa_q, r, q_b),
@@ -70052,6 +70182,31 @@ static int q4e_forward_batch(ds4_decode_item *items, uint32_t n,
     g->batch = &batch;
     g_q4e_trace_ntok = n;
 
+    /* Pack the per-row recurrent-state pointers once for the whole step; the
+     * batched conv/recurrent/PLE kernels index this array by (layer, row).
+     * Layout stride is n: gdn_conv[il] at il*n, gdn_state[il] at (N+il)*n,
+     * ple_conv at 2*N*n. */
+    {
+        const uint32_t NL = DS4_N_LAYER;
+        const uint32_t cnt = n * (2u * NL + 2u);
+        ds4_gpu_tensor **srcs = xmalloc((size_t)cnt * sizeof(*srcs));
+        for (uint32_t il = 0; il < NL; il++) {
+            for (uint32_t r = 0; r < n; r++) {
+                srcs[(uint64_t)il * n + r] = seq[r]->gdn_conv[il];
+                srcs[(uint64_t)(NL + il) * n + r] = seq[r]->gdn_state[il];
+            }
+        }
+        for (uint32_t r = 0; r < n; r++) srcs[(uint64_t)2u * NL * n + r] = seq[r]->ple_conv;
+        /* kv_pages block at (2N+1)*n, one page table per row. */
+        for (uint32_t r = 0; r < n; r++) srcs[(uint64_t)(2u * NL + 1u) * n + r] = seq[r]->kv_pages;
+        const int packed = ds4_gpu_q4e_ptrs_pack(g->batch_ptrs, srcs, cnt);
+        free(srcs);
+        if (!packed) {
+            if (err && errlen) snprintf(err, errlen, "batch state-pointer pack failed");
+            goto done;
+        }
+    }
+
     for (uint32_t r = 0; r < n; r++) {
         mrope[3u * r] = mrope[3u * r + 1u] = mrope[3u * r + 2u] = pos[r];
         q4e_mrope_fill_batch_row(mrope_win + (size_t)r * (DS4_Q4E_MROPE_BACK + 1u) * 3u,
@@ -70153,6 +70308,231 @@ done:
         snprintf(err, errlen, "qwen4exp batched decode failed");
     }
     return rc;
+}
+
+/* =========================================================================
+ * Segmented batched forward: several per-sequence runs in one pass.
+ * =========================================================================
+ *
+ * The dense and MoE matmuls batch over every row; the recurrent GDN/PLE
+ * kernels run per segment (a segment is one sequence's sequential run) exactly
+ * as q4e_forward would for that run, writing its own rollback checkpoints; the
+ * KV store and attention stay per row.  This is the shared primitive under
+ * batched speculative verify (each segment is 1+K rows) and chunked prefill
+ * (one long prefill run plus single decode rows).  The caller has already
+ * pushed each run's tokens into that session's checkpoint (the PLE hash and
+ * the causal attention read them).  It does NOT commit state -- the verify /
+ * prefill wrapper decides how far each sequence advances.  Per-row greedy
+ * argmax comes back in out_argmax (one int per row, in row order). */
+typedef struct {
+    ds4_session *session;
+    uint32_t     pos0;   /* first position of this run */
+    uint32_t     ntok;   /* rows in this run (already in session->checkpoint) */
+} q4e_seg_item;
+
+static int q4e_ple_gather_segmented(ds4_q4e_graph *g, ds4_session *const *row_sess,
+                                    const int32_t *pos, uint32_t n) {
+    const ds4_ple_params *params = &g->ple_params;
+    const uint32_t heads = params->n_heads;
+    for (uint32_t r = 0; r < n; r++) {
+        const ds4_session *s = row_sess[r];
+        ds4_ple_row_ids(params, s->checkpoint.v, (uint32_t)pos[r], 1u,
+                        g->ple_row_ids + (uint64_t)r * heads);
+    }
+    char err[256] = {0};
+    const double t0 = now_sec();
+    if (ds4_ple_stream_fetch(g->ple_stream, g->ple_row_ids, n * heads,
+                             g->ple_row_data, err, sizeof(err)) != 0) {
+        fprintf(stderr, "ds4: qwen4exp PLE segmented gather failed: %s\n", err);
+        return 1;
+    }
+    g_q4e_ple_wait_s += now_sec() - t0;
+    g_q4e_ple_waits++;
+    return ds4_gpu_tensor_write(g->ple_rows, 0, g->ple_row_data,
+                                (uint64_t)n * heads * ds4_ple_row_bytes(params)) ? 0 : 1;
+}
+
+static int q4e_forward_segmented(q4e_seg_item *items, uint32_t n_items,
+                                 int32_t *out_argmax, char *err, size_t errlen) {
+    if (n_items == 0) return 1;
+    ds4_session *lead = items[0].session;
+    ds4_q4e_graph *g = &lead->q4e_graph;
+    ds4_engine *e = lead->engine;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < n_items; i++) n += items[i].ntok;
+    if (n == 0 || n > g->tok_cap) {
+        if (errlen) snprintf(err, errlen, "segmented rows %u exceed pass width %u", n, g->tok_cap);
+        return 1;
+    }
+
+    ds4_q4e_graph **seq = xmalloc((size_t)n * sizeof(*seq));
+    ds4_session **row_sess = xmalloc((size_t)n * sizeof(*row_sess));
+    int32_t *ids = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *pos = xmalloc((size_t)n * sizeof(int32_t));
+    int32_t *mrope = xmalloc((size_t)n * 3u * sizeof(int32_t));
+    int32_t *mrope_win = xmalloc((size_t)n * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t));
+    uint32_t *seg_row0 = xmalloc((size_t)n_items * sizeof(uint32_t));
+    uint32_t *seg_len = xmalloc((size_t)n_items * sizeof(uint32_t));
+    ds4_q4e_graph **seg_owner = xmalloc((size_t)n_items * sizeof(*seg_owner));
+    bool segmented = false;
+    int rc = 1;
+
+    uint32_t row = 0;
+    for (uint32_t i = 0; i < n_items; i++) {
+        ds4_session *s = items[i].session;
+        ds4_q4e_graph *o = &s->q4e_graph;
+        seg_row0[i] = row;
+        seg_len[i] = items[i].ntok;
+        seg_owner[i] = o;
+        if (items[i].ntok > 1u) segmented = true;
+        if (q4e_kv_reserve(o, items[i].pos0 + items[i].ntok) != 0) {
+            if (errlen) snprintf(err, errlen, "segmented item %u has no KV room", i);
+            goto done;
+        }
+        o->logits_pos = 0;
+        for (uint32_t j = 0; j < items[i].ntok; j++) {
+            const uint32_t p = items[i].pos0 + j;
+            seq[row] = o;
+            row_sess[row] = s;
+            ids[row] = s->checkpoint.v[p];
+            pos[row] = (int32_t)p;
+            mrope[3u * row] = mrope[3u * row + 1u] = mrope[3u * row + 2u] = (int32_t)p;
+            q4e_mrope_fill_batch_row(mrope_win + (size_t)row * (DS4_Q4E_MROPE_BACK + 1u) * 3u, (int32_t)p);
+            row++;
+        }
+    }
+
+    q4e_batch batch = { .seq = seq, .n = n, .n_seg = n_items, .seg_row0 = seg_row0,
+                        .seg_len = seg_len, .seg_owner = seg_owner, .segmented = segmented };
+    g->batch = &batch;
+    g_q4e_trace_ntok = n;
+
+    {
+        const uint32_t NL = DS4_N_LAYER;
+        const uint32_t cnt = n * (2u * NL + 2u);
+        ds4_gpu_tensor **srcs = xmalloc((size_t)cnt * sizeof(*srcs));
+        for (uint32_t il = 0; il < NL; il++)
+            for (uint32_t r = 0; r < n; r++) {
+                srcs[(uint64_t)il * n + r] = seq[r]->gdn_conv[il];
+                srcs[(uint64_t)(NL + il) * n + r] = seq[r]->gdn_state[il];
+            }
+        for (uint32_t r = 0; r < n; r++) srcs[(uint64_t)2u * NL * n + r] = seq[r]->ple_conv;
+        for (uint32_t r = 0; r < n; r++) srcs[(uint64_t)(2u * NL + 1u) * n + r] = seq[r]->kv_pages;
+        const int packed = ds4_gpu_q4e_ptrs_pack(g->batch_ptrs, srcs, cnt);
+        free(srcs);
+        if (!packed) { if (errlen) snprintf(err, errlen, "segmented pack failed"); goto done; }
+    }
+
+    if (!ds4_gpu_tensor_write(g->tokens, 0, ids, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->positions, 0, pos, (uint64_t)n * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->mrope_rows, 0, mrope, (uint64_t)n * 3u * sizeof(int32_t)) ||
+        !ds4_gpu_tensor_write(g->mrope_batch, 0, mrope_win,
+                              (uint64_t)n * (DS4_Q4E_MROPE_BACK + 1u) * 3u * sizeof(int32_t))) {
+        if (errlen) snprintf(err, errlen, "segmented upload failed");
+        goto done;
+    }
+
+    if (!q4e_embed(g->embed, g->tokens, m, w->token_embd, n) ||
+        !ds4_gpu_q4e_hc_init(g->res, g->embed, DS4_N_EMBD, DS4_N_HC, n)) goto done;
+    g_q4e_steps++;
+
+    g->qsa_sparse = false;
+    if (g->idx_ready)
+        for (uint32_t i = 0; i < n_items; i++)
+            if ((items[i].pos0 + items[i].ntok) / 4u > DS4_N_INDEXER_TOP_K / 4u) g->qsa_sparse = true;
+
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (ds4_qwen4exp_layer_has_ple(il)) {
+            if (q4e_ple_gather_segmented(g, row_sess, pos, n) != 0) goto done;
+        }
+        const bool next_is_ple = il + 1u < DS4_N_LAYER && ds4_qwen4exp_layer_has_ple(il + 1u);
+        const ds4_tensor *after_ffn = (il + 1u < DS4_N_LAYER && !next_is_ple)
+            ? w->layer[il + 1u].hc_attn_norm : NULL;
+        const bool attn_xn_ready = il > 0u && !ds4_qwen4exp_layer_has_ple(il);
+        if (!q4e_run_island(g, m, l, il, 0u, n, false, attn_xn_ready, l->hc_ffn_norm)) goto done;
+        if (!q4e_run_island(g, m, l, il, 1u, n, false, true, after_ffn)) goto done;
+    }
+
+    /* Collapse the streams for every row, then project and argmax per segment:
+     * the logits buffer holds only one sequence's worth of rows. */
+    if (!q4e_hc_mix(g, m, w->output_mix_norm, w->output_mix_down, w->output_mix_up, NULL, n)) goto done;
+    for (uint32_t i = 0; i < n_items; i++) {
+        const uint32_t sl = seg_len[i], r0 = seg_row0[i];
+        /* Project only the trailing rows that fit the logits buffer: a verify
+         * run (<= logit_rows) yields every row's greedy pick; a long prefill
+         * run yields its last rows, which is all a next-token needs.  Rows
+         * before that window are left untouched in out_argmax. */
+        const uint32_t pr = sl < g->logit_rows ? sl : g->logit_rows;
+        const uint32_t first = r0 + sl - pr;
+        ds4_gpu_tensor *mv = ds4_gpu_tensor_view(g->mixed, (uint64_t)first * DS4_N_EMBD * sizeof(float),
+                                                 (uint64_t)pr * DS4_N_EMBD * sizeof(float));
+        int ok = mv && q4e_matmul(g->logits, m, w->output, mv, pr) &&
+                 ds4_gpu_q4e_argmax_rows(g->argmax_dev, g->logits, DS4_N_VOCAB, pr) &&
+                 ds4_gpu_synchronize() &&
+                 ds4_gpu_tensor_read(g->argmax_dev, 0, out_argmax + first, (uint64_t)pr * sizeof(int32_t)) &&
+                 /* Hand the run's last-row distribution back to its session,
+                  * as a normal decode would, for the caller's sampler/gate. */
+                 ds4_gpu_tensor_read(g->logits, (uint64_t)(pr - 1u) * DS4_N_VOCAB * sizeof(float),
+                                     items[i].session->logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float));
+        ds4_gpu_tensor_free(mv);
+        if (!ok) goto done;
+    }
+    rc = 0;
+
+done:
+    g->batch = NULL;
+    free(seq);
+    free(row_sess);
+    free(ids);
+    free(pos);
+    free(mrope);
+    free(mrope_win);
+    free(seg_row0);
+    free(seg_len);
+    free(seg_owner);
+    if (rc != 0 && errlen && !err[0]) snprintf(err, errlen, "qwen4exp segmented forward failed");
+    return rc;
+}
+
+/* Validation/utility entry: run a segmented forward over per-session runs whose
+ * tokens are already in each session->checkpoint, returning per-row greedy
+ * argmax.  Does not commit or roll back state -- the caller owns that.  Used by
+ * the batched-verify and chunked-prefill paths and by tests/test_qwen4exp_verify. */
+int ds4_sessions_forward_segmented(ds4_session **sessions, const uint32_t *pos0,
+                                   const uint32_t *ntok, uint32_t n_items,
+                                   int32_t *out_argmax, char *err, size_t errlen) {
+    if (!sessions || !pos0 || !ntok || !out_argmax || n_items == 0) return 1;
+    if (!ds4_session_is_qwen4exp(sessions[0])) {
+        if (errlen) snprintf(err, errlen, "segmented forward is qwen4exp only");
+        return 1;
+    }
+    q4e_seg_item *items = xmalloc((size_t)n_items * sizeof(*items));
+    for (uint32_t i = 0; i < n_items; i++) {
+        items[i].session = sessions[i];
+        items[i].pos0 = pos0[i];
+        items[i].ntok = ntok[i];
+    }
+    const int rc = q4e_forward_segmented(items, n_items, out_argmax, err, errlen);
+    free(items);
+    return rc;
+}
+
+/* Test helper: reset a session's recurrent state to fresh (position 0) and seed
+ * its checkpoint with `n` tokens, so a segmented forward at pos0=0/ntok=n
+ * re-prefills them from scratch.  qwen4exp only. */
+int ds4_session_seed_prefill_for_test(ds4_session *s, const int32_t *toks, uint32_t n) {
+    if (!s || !toks || !ds4_session_is_qwen4exp(s)) return 1;
+    q4e_graph_reset(&s->q4e_graph);
+    s->checkpoint.len = 0;
+    s->checkpoint_valid = false;
+    s->mtp_draft_valid = false;
+    for (uint32_t i = 0; i < n; i++) token_vec_push(&s->checkpoint, (int)toks[i]);
+    return 0;
 }
 
 /* =========================================================================
@@ -70601,11 +70981,7 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
     bool from_ngram = false;
     const double t_draft = now_sec();
     /* DS4_QWEN4EXP_SPEC_LOG=2 adds a host-side phase breakdown per step. */
-    static int spec_log = -1;
-    if (spec_log < 0) {
-        const char *env = getenv("DS4_QWEN4EXP_SPEC_LOG");
-        spec_log = (env && env[0]) ? atoi(env) : 0;
-    }
+    const int spec_log = q4e_spec_log_level();
     if (spec_log >= 2) q4e_log_logit_margin(s->logits, pos0);
     double t_ngram = t_draft, t_flush = t_draft;
 
@@ -70725,7 +71101,7 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
          * and is still allowed. */
         if (a < K) q4e_ngram_remember(&g->ngram_mem, &ngram_src);
     }
-    if (K && getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+    if (K && q4e_spec_log_level() > 0) {
         fprintf(stderr, "q4e spec pos=%u first=%d %s drafts=", pos0, first_token,
                 from_ngram ? "ngram" : "mtp");
         for (uint32_t i = 0; i < K; i++) fprintf(stderr, "%s%d", i ? "," : "", drafts[i]);
@@ -70779,6 +71155,204 @@ static int q4e_spec_step(ds4_session *s, int first_token, uint32_t K, int eos_to
         }
     }
     return (int)(1u + a);
+}
+
+/* Draft up to K tokens after first_token for one session (MTP head + n-gram
+ * lookup), leaving the draft KV current.  Fills drafts[] and returns the count.
+ * The same logic q4e_spec_step runs before its verify, split out so the batched
+ * verify can draft each member before one shared verify pass. */
+static uint32_t q4e_spec_draft_only(ds4_session *s, int first_token, uint32_t K,
+                                    int eos_token, int *drafts, bool *from_ngram,
+                                    q4e_ngram_src *ngram_src) {
+    ds4_q4e_graph *g = &s->q4e_graph;
+    const uint32_t pos0 = (uint32_t)s->checkpoint.len;
+    int ngram_drafts[Q4E_SPEC_MAX_DRAFT];
+    uint32_t n_draft = 0, n_ngram = 0;
+    *from_ngram = false;
+    ngram_src->draft = 0;
+    ngram_src->pos = 0;
+
+    const bool draft_ready = g->mtp_ready && g->pend_valid;
+    uint32_t mtp_k = 0;
+    if (draft_ready) {
+        mtp_k = s->engine->mtp_draft_tokens > 0 ? (uint32_t)s->engine->mtp_draft_tokens : 0;
+        if (mtp_k > K) mtp_k = K;
+    }
+    if (mtp_k) {
+        uint32_t ng_k = q4e_ngram_k();
+        if (ng_k > K) ng_k = K;
+        if (ng_k > mtp_k) {
+            n_ngram = q4e_ngram_propose(s->checkpoint.v, pos0, first_token,
+                                        g->ngram_gen_start, &g->ngram_mem,
+                                        ngram_drafts, ng_k, ngram_src);
+        }
+    }
+    K = mtp_k;
+    if (draft_ready) {
+        const uint32_t flushed_n = g->pend_n;
+        int pick = -1;
+        if (q4e_mtp_flush_pending(s, s->checkpoint.v, first_token, K ? &pick : NULL) != 0) {
+            ds4_session_invalidate(s);
+            return UINT32_MAX;
+        }
+        if (K) {
+            uint32_t last_row = flushed_n - 1u;
+            drafts[n_draft++] = pick;
+            if (n_ngram > K && ngram_drafts[0] == pick) {
+                for (uint32_t i = 1; i < n_ngram; i++) drafts[i] = ngram_drafts[i];
+                n_draft = n_ngram;
+                K = n_ngram;
+                *from_ngram = true;
+            } else if (n_ngram) {
+                g->spec_ngram_vetoed++;
+            }
+            while (n_draft < K && drafts[n_draft - 1u] != eos_token) {
+                ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
+                        g->mtp_res, (uint64_t)last_row * Q4E_HC_DIM * sizeof(float),
+                        (uint64_t)Q4E_HC_DIM * sizeof(float));
+                const int32_t tok = drafts[n_draft - 1u];
+                const int32_t pos = (int32_t)(pos0 - 1u + n_draft);
+                const int rc = hidden ? q4e_mtp_draft(s, hidden, &tok, &pos, 1u, &pick) : 1;
+                ds4_gpu_tensor_free(hidden);
+                if (rc != 0) { ds4_session_invalidate(s); return UINT32_MAX; }
+                last_row = 0;
+                drafts[n_draft++] = pick;
+            }
+        }
+    }
+    if (*from_ngram) {
+        g->spec_ngram_steps++;
+        g->spec_ngram_drafted += n_draft;
+    }
+    return n_draft;
+}
+
+/* Batched speculative decode: draft each session, verify all of them in one
+ * segmented forward, accept and roll back each on its own.  Same result as
+ * calling q4e_spec_step per session, but the verify -- the pass over the
+ * weights -- is shared.  `accepted[i]` receives the 1 + a_i committed tokens
+ * for session i; committed[i] is that count.  Greedy only. */
+static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
+                               uint32_t n_sess, uint32_t K_ceil, int eos_token,
+                               int (*accepted)[Q4E_SPEC_MAX_DRAFT + 1], int *committed,
+                               char *err, size_t errlen) {
+    if (n_sess == 0) return -1;
+    ds4_engine *e = sessions[0]->engine;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+
+    static int drafts[DS4_EXEC_CONTEXTS_MAX][Q4E_SPEC_MAX_DRAFT];
+    static bool from_ngram[DS4_EXEC_CONTEXTS_MAX];
+    static q4e_ngram_src ngram_src[DS4_EXEC_CONTEXTS_MAX];
+    uint32_t Kd[DS4_EXEC_CONTEXTS_MAX];
+    uint32_t pos0[DS4_EXEC_CONTEXTS_MAX];
+    ds4_session *ss[DS4_EXEC_CONTEXTS_MAX];
+    uint32_t sp[DS4_EXEC_CONTEXTS_MAX], nt[DS4_EXEC_CONTEXTS_MAX];
+    if (n_sess > DS4_EXEC_CONTEXTS_MAX) { if (errlen) snprintf(err, errlen, "too many sessions"); return -1; }
+
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < n_sess; i++) {
+        ds4_session *s = sessions[i];
+        pos0[i] = (uint32_t)s->checkpoint.len;
+        uint32_t K = K_ceil;
+        if (K > s->q4e_graph.spec_k) K = s->q4e_graph.spec_k;
+        if (pos0[i] + 1u + K > s->q4e_graph.ctx_size) K = s->q4e_graph.ctx_size - pos0[i] - 1u;
+        Kd[i] = q4e_spec_draft_only(s, first_tokens[i], K, eos_token,
+                                    drafts[i], &from_ngram[i], &ngram_src[i]);
+        if (Kd[i] == UINT32_MAX) { if (errlen) snprintf(err, errlen, "draft failed"); return -1; }
+        token_vec_push(&s->checkpoint, first_tokens[i]);
+        for (uint32_t j = 0; j < Kd[i]; j++) token_vec_push(&s->checkpoint, drafts[i][j]);
+        ss[i] = s;
+        sp[i] = pos0[i];
+        nt[i] = 1u + Kd[i];
+        total += nt[i];
+    }
+
+    int32_t *argmax = xmalloc((size_t)total * sizeof(int32_t));
+    if (ds4_sessions_forward_segmented(ss, sp, nt, n_sess, argmax, err, errlen) != 0) {
+        for (uint32_t i = 0; i < n_sess; i++) sessions[i]->checkpoint.len = (int)pos0[i];
+        free(argmax);
+        return -1;
+    }
+
+    ds4_q4e_graph *lead = &sessions[0]->q4e_graph;
+    uint32_t row_base = 0;
+    int rc = 0;
+    for (uint32_t i = 0; i < n_sess && rc == 0; i++) {
+        ds4_session *s = sessions[i];
+        ds4_q4e_graph *g = &s->q4e_graph;
+        const uint32_t K = Kd[i];
+        const int32_t *amx = argmax + row_base;
+        uint32_t a = 0;
+        while (a < K) {
+            if (amx[a] != drafts[i][a]) break;
+            a++;
+            if (drafts[i][a - 1u] == eos_token) break;
+        }
+        if (from_ngram[i]) {
+            g->spec_ngram_accepted += a;
+            if (a == 0) g->spec_ngram_zero++;
+            if (a < K) q4e_ngram_remember(&g->ngram_mem, &ngram_src[i]);
+        }
+        if (a < K && q4e_spec_rollback(g, a) != 0) {
+            if (errlen) snprintf(err, errlen, "rollback failed");
+            ds4_session_invalidate(s);
+            rc = -1;
+            break;
+        }
+        s->checkpoint.len = (int)(pos0[i] + 1u + a);
+        g->pos = pos0[i] + 1u + a;
+        /* The committed row's distribution for the sampler; g->mixed still holds
+         * every row after the segmented forward, so re-project row a. */
+        ds4_gpu_tensor *mv = ds4_gpu_tensor_view(lead->mixed,
+                (uint64_t)(row_base + a) * DS4_N_EMBD * sizeof(float),
+                (uint64_t)DS4_N_EMBD * sizeof(float));
+        int ok = mv && q4e_matmul(g->logits, m, w->output, mv, 1u) &&
+                 ds4_gpu_synchronize() &&
+                 ds4_gpu_tensor_read(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float));
+        ds4_gpu_tensor_free(mv);
+        if (!ok) { ds4_session_invalidate(s); rc = -1; break; }
+        g->logits_pos = g->pos;
+        /* Stage the committed rows' residuals for this session's next draft. */
+        if (g->mtp_ready && q4e_mtp_pend_set(g, g->res, row_base, 1u + a, pos0[i]) != 0) {
+            ds4_session_invalidate(s);
+            rc = -1;
+            break;
+        }
+        accepted[i][0] = first_tokens[i];
+        for (uint32_t j = 0; j < a; j++) accepted[i][1u + j] = drafts[i][j];
+        committed[i] = (int)(1u + a);
+        s->checkpoint_valid = true;
+        g->spec_steps++;
+        g->spec_drafted += K;
+        g->spec_accepted += a;
+        row_base += nt[i];
+    }
+    free(argmax);
+    return rc;
+}
+
+/* Public: batched speculative decode over several sessions, greedy.  Each
+ * items[i].token is that session's already-sampled first token; on return
+ * accepted[i][0..committed[i]) holds the committed tokens.  Mirrors
+ * ds4_sessions_eval_batch but keeps MTP speculation on. */
+int ds4_sessions_eval_speculative_batch(ds4_decode_item *items, int count,
+                                        int eos_token,
+                                        int (*accepted)[Q4E_SPEC_MAX_DRAFT + 1],
+                                        int *committed, char *err, size_t errlen) {
+    if (!items || count <= 0 || !accepted || !committed) return -1;
+    if (!ds4_session_is_qwen4exp(items[0].session)) {
+        if (errlen) snprintf(err, errlen, "speculative batch is qwen4exp only");
+        return -1;
+    }
+    ds4_session *ss[DS4_EXEC_CONTEXTS_MAX];
+    int first[DS4_EXEC_CONTEXTS_MAX];
+    if (count > DS4_EXEC_CONTEXTS_MAX) { if (errlen) snprintf(err, errlen, "too many sessions"); return -1; }
+    for (int i = 0; i < count; i++) { ss[i] = items[i].session; first[i] = items[i].token; }
+    const uint32_t K = ss[0]->engine->mtp_draft_tokens > 0
+        ? (uint32_t)ss[0]->engine->mtp_draft_tokens : 0u;
+    return q4e_spec_step_batch(ss, first, (uint32_t)count, K, eos_token,
+                               accepted, committed, err, errlen);
 }
 #endif /* DS4_NO_GPU */
 
@@ -72646,7 +73220,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             if (rc == 2) pl.ckpt = -1;   /* it went away: prefill cold below */
             start = g->pos;
-            if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+            if (q4e_spec_log_level() > 0) {
                 fprintf(stderr, "q4e sync: resumed %s checkpoint at %u (kv match %u), "
                                 "prefilling %u new tokens\n",
                         ds4_reuse_source_name(pl.source), start, pl.matched, len - start);
@@ -72763,7 +73337,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 if (rc_commit != 0) {
                     fprintf(stderr, "ds4: qwen4exp prefix cache could not record "
                                     "position %u (%s); reuse for this path is lost\n",
-                            pos, rc_commit == 2 ? "the tree refused the span"
+                            pos, rc_commit == 2 ? q4e_tree_refusal
                                                 : "the checkpoint copy failed");
                 }
             }
@@ -73894,18 +74468,19 @@ void ds4_session_cache_commit(ds4_session *s) {
      * s->logits.  Admitting that as this position's distribution would answer
      * a later exact re-send from another conversation's row. */
     const bool with_logits = g->logits_pos == g->pos;
-    if (getenv("DS4_QWEN4EXP_SPEC_LOG")) {
+    if (q4e_spec_log_level() > 0) {
         fprintf(stderr, "q4e cache: sequence-end commit at %u %s\n", g->pos,
                 with_logits ? "with its logits"
                             : "without logits (this frontier has none)");
     }
-    if (q4e_cache_commit(s, s->checkpoint.v, g->pos, with_logits, false) != 0) {
+    const int rc = q4e_cache_commit(s, s->checkpoint.v, g->pos, with_logits, false);
+    if (rc != 0) {
         /* The sequence end is the position this conversation's next turn
          * resumes from.  Losing it costs the whole turn's prefill, so it is
          * worth a line even though the request itself succeeded. */
         fprintf(stderr, "ds4: qwen4exp prefix cache could not record the sequence "
-                        "end at %u; the next turn will re-prefill from lower down\n",
-                g->pos);
+                        "end at %u (%s); the next turn will re-prefill from lower down\n",
+                g->pos, rc == 2 ? q4e_tree_refusal : "the checkpoint copy failed");
     }
 #endif
 }
