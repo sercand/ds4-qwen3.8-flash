@@ -212,7 +212,9 @@ Landed on `qwen3.8-flash-next`:
   queued-cancel re-dispatch, `dequeue` preferring normal, the shared
   `server_stream_keepalive` (headers first; fires on the qwen4exp `"prefill"`
   event), and `server_flex_pause_point` at the decode-loop top and between
-  prefill chunks (89d9cc9).
+  prefill chunks (89d9cc9), plus the final-review fixes (08cde46): keepalive kept
+  through decode, "prefill" event keepalive-only, cap at slot_count-1,
+  promotion recomputed per pass.
 
 Unit tests: `make ds4_server_test && ./ds4_server_test`. Integration:
 `tests/test_flex_tier.py` against `ds4-server --exec-contexts 2` (needs the GPU
