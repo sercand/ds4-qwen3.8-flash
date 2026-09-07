@@ -15400,6 +15400,7 @@ static ssize_t header_end(const char *p, size_t n) {
  * `h`/`n` span the request head up to and including the blank line. */
 static bool header_value(const char *h, size_t n, const char *name,
                          char *out, size_t outlen) {
+    if (!out || outlen == 0) return false;
     const size_t name_len = strlen(name);
     const char *p = h, *end = h + n;
     while (p < end) {
@@ -22358,6 +22359,7 @@ static void test_flex_request_tier_parsing(void) {
     TEST_ASSERT(header_value(hdr, strlen(hdr), "Content-Length", v, sizeof(v)));
     TEST_ASSERT(!strcmp(v, "5"));
     TEST_ASSERT(!header_value(hdr, strlen(hdr), "Authorization", v, sizeof(v)));
+    TEST_ASSERT(!header_value(hdr, strlen(hdr), "X-Service-Tier", v, 0));
     TEST_ASSERT(content_length(hdr, strlen(hdr)) == 5);
 }
 
