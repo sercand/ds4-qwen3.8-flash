@@ -12830,30 +12830,40 @@ static bool server_prefill_before_decode_locked(const server *s) {
  * the drafts were winning.  Below that the batch is a small loss, not a
  * small gain, so the threshold is three rather than two.
  *
+ * With batch_spec the tick keeps the drafts (one segmented verify over every
+ * context's 1 + K rows), so there is no trade to make and the threshold is
+ * two.  Measured 2026-09-07 on GB10, three concurrent 300-token greedy
+ * requests, ctx 16384, --mtp-draft 4: a count-3 tick is 122 ms for ~9.6
+ * tokens (~78 tok/s aggregate) against 54.6 ms for 3 tokens plain (55), and
+ * a count-2 tick 85 ms for ~6 against two single-stream speculative steps at
+ * 68 ms each; end to end 51.5 -> 63.6 tok/s.
+ *
  * Sampled per step, so a request arriving or finishing moves the whole set
  * over on the next token; both paths leave the session in the same state, so
  * alternating between them is safe (q4e_forward_batch clears the draft's
  * staged residual so a later speculative step rebuilds it). */
 #define DS4_BATCH_DECODE_MIN_GENERATIONS 3
+#define DS4_BATCH_SPEC_MIN_GENERATIONS 2
 
 /* The minimum concurrent generations at which decode coalesces into one
- * batched pass.  DS4_BATCH_DECODE_MIN overrides the compile default so the
+ * batched pass.  DS4_BATCH_DECODE_MIN overrides the compile defaults so the
  * threshold can be swept (and set to 1 for always-on continuous batching)
  * without a rebuild. */
-static int server_batch_decode_min(void) {
+static int server_batch_decode_min(bool spec) {
     static int cached = -1;
     if (cached < 0) {
         const char *env = getenv("DS4_BATCH_DECODE_MIN");
-        cached = (env && env[0]) ? atoi(env) : DS4_BATCH_DECODE_MIN_GENERATIONS;
-        if (cached < 1) cached = 1;
+        cached = (env && env[0]) ? atoi(env) : 0;
+        if (cached < 0) cached = 0;
     }
-    return cached;
+    if (cached > 0) return cached;
+    return spec ? DS4_BATCH_SPEC_MIN_GENERATIONS : DS4_BATCH_DECODE_MIN_GENERATIONS;
 }
 
 static bool server_batch_decode_now(server *s) {
     if (!s->batched_decode) return false;
     pthread_mutex_lock(&s->model_mu);
-    const bool batch = server_eligible_generations_locked(s) >= server_batch_decode_min();
+    const bool batch = server_eligible_generations_locked(s) >= server_batch_decode_min(s->batch_spec);
     pthread_mutex_unlock(&s->model_mu);
     return batch;
 }
@@ -16753,14 +16763,14 @@ int main(int argc, char **argv) {
     s.batched_decode = multi_ctx_mode && slot_count > 1 &&
                        (cfg.batched_decode_set ? cfg.batched_decode : true);
     /* Keep MTP speculation on across a batched-decode tick by verifying every
-     * context's drafts in one segmented forward.  Opt-in for now
-     * (DS4_QWEN4EXP_BATCH_SPEC=1): the batched-verify engine path is unit-tested
-     * (tests/test_qwen4exp_specbatch) but the server coordinator path wants
-     * validation under real concurrency before it is a default. */
+     * context's drafts in one segmented forward (tests/test_qwen4exp_specbatch;
+     * live A/B in the threshold note above).  On wherever the engine has a
+     * draft head; DS4_QWEN4EXP_BATCH_SPEC=0 falls back to plain batched
+     * decode, which drops the drafts once the batch forms. */
     {
         const char *bs = getenv("DS4_QWEN4EXP_BATCH_SPEC");
-        s.batch_spec = s.batched_decode && bs && bs[0] == '1' &&
-                       ds4_engine_has_mtp(engine);
+        s.batch_spec = s.batched_decode && ds4_engine_has_mtp(engine) &&
+                       !(bs && bs[0] == '0');
     }
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     /* Flex tier: how many contexts background requests may hold at once.

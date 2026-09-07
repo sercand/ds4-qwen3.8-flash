@@ -68642,6 +68642,12 @@ static int q4e_scratch_ensure(ds4_engine *e, uint32_t ctx_size) {
      * buffer is shared scratch, so the difference is a few megabytes once. */
     g->logit_rows = 1u + g->spec_k;
     if (g->logit_rows < Q4E_CTX_MAX) g->logit_rows = Q4E_CTX_MAX;
+    /* A batched speculative verify projects every context's 1 + K rows at
+     * once and commits one row per context straight out of the buffer, so it
+     * wants all of them resident: one projection and one synchronization for
+     * the tick instead of one per context (about a megabyte a row). */
+    if (mtp && g->logit_rows < (1u + g->spec_k) * Q4E_CTX_MAX)
+        g->logit_rows = (1u + g->spec_k) * Q4E_CTX_MAX;
     g->mtp_ready = mtp;      /* the scratch's copy: what it allocated for */
     g->hc_f16 = q4e_hc_weights_f16(e);
 
@@ -69647,7 +69653,15 @@ static int q4e_moe(ds4_q4e_graph *g, const ds4_model *m,
     /* EXL3 experts on a chunk: one fused launch does gate, up, SiLU and down
      * per expert (cuda/exl3, exllamav3's prefill design) into the per-slot
      * down buffer and combines it, so only the shared expert remains. */
-    if (tensor_type_is_exl3(l->ffn_gate_exps->type)) {
+    /* The grouped kernel's threshold (DS4_QWEN4EXP_MOE_BATCH_MIN, default 4)
+     * is set for rows of one sequence -- a speculative verify or a prefill
+     * run -- whose consecutive tokens route to the same experts, so each is
+     * read once for several rows.  A plain batched decode step's rows are
+     * unrelated sequences: there the grouping gains ~2% at 4-8 rows and
+     * changes the rounding of a path that is otherwise identical to
+     * single-stream decode, so it stays per-slot until a real chunk width. */
+    const bool unrelated_rows = g->batch && !g->batch->segmented;
+    if (tensor_type_is_exl3(l->ffn_gate_exps->type) && (!unrelated_rows || n_tok >= 32u)) {
         t = q4e_phase_begin();
         const int rc = ds4_gpu_q4e_moe_exl3_fused(g->blk_out, g->moe_down, g->mixed, g->moe_ids, g->moe_w,
                                                   m->map, m->size,
@@ -70460,6 +70474,12 @@ static int q4e_forward_segmented(q4e_seg_item *items, uint32_t n_items,
     /* Collapse the streams for every row, then project and argmax per segment:
      * the logits buffer holds only one sequence's worth of rows. */
     if (!q4e_hc_mix(g, m, w->output_mix_norm, w->output_mix_down, w->output_mix_up, NULL, n)) goto done;
+    /* When every row fits the logits buffer (a verify tick), each segment is
+     * projected into its own rows of it and the pass synchronizes once at the
+     * end; the caller can then commit any row straight out of the buffer.
+     * Otherwise (a long prefill run) the segments share row 0 and each waits
+     * for its own read, as they must. */
+    const bool packed = n <= g->logit_rows;
     for (uint32_t i = 0; i < n_items; i++) {
         const uint32_t sl = seg_len[i], r0 = seg_row0[i];
         /* Project only the trailing rows that fit the logits buffer: a verify
@@ -70468,19 +70488,38 @@ static int q4e_forward_segmented(q4e_seg_item *items, uint32_t n_items,
          * before that window are left untouched in out_argmax. */
         const uint32_t pr = sl < g->logit_rows ? sl : g->logit_rows;
         const uint32_t first = r0 + sl - pr;
+        const uint32_t lrow = packed ? first : 0u;
         ds4_gpu_tensor *mv = ds4_gpu_tensor_view(g->mixed, (uint64_t)first * DS4_N_EMBD * sizeof(float),
                                                  (uint64_t)pr * DS4_N_EMBD * sizeof(float));
-        int ok = mv && q4e_matmul(g->logits, m, w->output, mv, pr) &&
-                 ds4_gpu_q4e_argmax_rows(g->argmax_dev, g->logits, DS4_N_VOCAB, pr) &&
-                 ds4_gpu_synchronize() &&
-                 ds4_gpu_tensor_read(g->argmax_dev, 0, out_argmax + first, (uint64_t)pr * sizeof(int32_t)) &&
+        ds4_gpu_tensor *lv = mv ? ds4_gpu_tensor_view(g->logits, (uint64_t)lrow * DS4_N_VOCAB * sizeof(float),
+                                                      (uint64_t)pr * DS4_N_VOCAB * sizeof(float)) : NULL;
+        ds4_gpu_tensor *av = lv ? ds4_gpu_tensor_view(g->argmax_dev, (uint64_t)lrow * sizeof(int32_t),
+                                                      (uint64_t)pr * sizeof(int32_t)) : NULL;
+        int ok = av && q4e_matmul(lv, m, w->output, mv, pr) &&
+                 ds4_gpu_q4e_argmax_rows(av, lv, DS4_N_VOCAB, pr);
+        if (ok && !packed) {
+            ok = ds4_gpu_synchronize() &&
+                 ds4_gpu_tensor_read(av, 0, out_argmax + first, (uint64_t)pr * sizeof(int32_t)) &&
                  /* Hand the run's last-row distribution back to its session,
                   * as a normal decode would, for the caller's sampler/gate. */
-                 ds4_gpu_tensor_read(g->logits, (uint64_t)(pr - 1u) * DS4_N_VOCAB * sizeof(float),
+                 ds4_gpu_tensor_read(lv, (uint64_t)(pr - 1u) * DS4_N_VOCAB * sizeof(float),
                                      items[i].session->logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
+        }
+        ds4_gpu_tensor_free(av);
+        ds4_gpu_tensor_free(lv);
         ds4_gpu_tensor_free(mv);
         if (!ok) goto done;
+    }
+    if (packed) {
+        if (!ds4_gpu_synchronize() ||
+            !ds4_gpu_tensor_read(g->argmax_dev, 0, out_argmax, (uint64_t)n * sizeof(int32_t))) goto done;
+        for (uint32_t i = 0; i < n_items; i++) {
+            const uint32_t last = seg_row0[i] + seg_len[i] - 1u;
+            if (!ds4_gpu_tensor_read(g->logits, (uint64_t)last * DS4_N_VOCAB * sizeof(float),
+                                     items[i].session->logits,
+                                     (uint64_t)DS4_N_VOCAB * sizeof(float))) goto done;
+        }
     }
     rc = 0;
 
@@ -71250,6 +71289,11 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
     uint32_t sp[DS4_EXEC_CONTEXTS_MAX], nt[DS4_EXEC_CONTEXTS_MAX];
     if (n_sess > DS4_EXEC_CONTEXTS_MAX) { if (errlen) snprintf(err, errlen, "too many sessions"); return -1; }
 
+    /* DS4_QWEN4EXP_SPEC_LOG=2: the same host-side phase breakdown q4e_spec_step
+     * prints, per batched tick, so the two paths can be compared. */
+    const int spec_log = q4e_spec_log_level();
+    const double t_draft = now_sec();
+
     uint32_t total = 0;
     for (uint32_t i = 0; i < n_sess; i++) {
         ds4_session *s = sessions[i];
@@ -71268,12 +71312,14 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
         total += nt[i];
     }
 
+    const double t_verify = now_sec();
     int32_t *argmax = xmalloc((size_t)total * sizeof(int32_t));
     if (ds4_sessions_forward_segmented(ss, sp, nt, n_sess, argmax, err, errlen) != 0) {
         for (uint32_t i = 0; i < n_sess; i++) sessions[i]->checkpoint.len = (int)pos0[i];
         free(argmax);
         return -1;
     }
+    const double t_forward = now_sec();
 
     ds4_q4e_graph *lead = &sessions[0]->q4e_graph;
     uint32_t row_base = 0;
@@ -71302,15 +71348,23 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
         }
         s->checkpoint.len = (int)(pos0[i] + 1u + a);
         g->pos = pos0[i] + 1u + a;
-        /* The committed row's distribution for the sampler; g->mixed still holds
-         * every row after the segmented forward, so re-project row a. */
-        ds4_gpu_tensor *mv = ds4_gpu_tensor_view(lead->mixed,
-                (uint64_t)(row_base + a) * DS4_N_EMBD * sizeof(float),
-                (uint64_t)DS4_N_EMBD * sizeof(float));
-        int ok = mv && q4e_matmul(g->logits, m, w->output, mv, 1u) &&
+        /* The committed row's distribution for the sampler.  The segmented
+         * forward left every row's logits in the lead's buffer when they all
+         * fit (the rows are already synchronized); otherwise g->mixed still
+         * holds every row, so re-project row a. */
+        int ok;
+        if (total <= lead->logit_rows) {
+            ok = ds4_gpu_tensor_read(lead->logits, (uint64_t)(row_base + a) * DS4_N_VOCAB * sizeof(float),
+                                     s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float));
+        } else {
+            ds4_gpu_tensor *mv = ds4_gpu_tensor_view(lead->mixed,
+                    (uint64_t)(row_base + a) * DS4_N_EMBD * sizeof(float),
+                    (uint64_t)DS4_N_EMBD * sizeof(float));
+            ok = mv && q4e_matmul(g->logits, m, w->output, mv, 1u) &&
                  ds4_gpu_synchronize() &&
                  ds4_gpu_tensor_read(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * sizeof(float));
-        ds4_gpu_tensor_free(mv);
+            ds4_gpu_tensor_free(mv);
+        }
         if (!ok) { ds4_session_invalidate(s); rc = -1; break; }
         g->logits_pos = g->pos;
         /* Stage the committed rows' residuals for this session's next draft. */
@@ -71326,7 +71380,18 @@ static int q4e_spec_step_batch(ds4_session **sessions, const int *first_tokens,
         g->spec_steps++;
         g->spec_drafted += K;
         g->spec_accepted += a;
+        /* Book the shared tick against every member, as if each had run its
+         * own step: the summary then reads per-step like the single path's. */
+        g->spec_draft_ms += (t_verify - t_draft) * 1e3;
+        g->spec_verify_ms += (now_sec() - t_verify) * 1e3;
         row_base += nt[i];
+    }
+    if (spec_log >= 2) {
+        const double now = now_sec();
+        fprintf(stderr, "q4e spec batch timing n=%u rows=%u drafts=%.2f forward=%.2f "
+                "accept=%.2f total=%.2f ms\n", n_sess, total,
+                (t_verify - t_draft) * 1e3, (t_forward - t_verify) * 1e3,
+                (now - t_forward) * 1e3, (now - t_draft) * 1e3);
     }
     free(argmax);
     return rc;
@@ -71349,8 +71414,25 @@ int ds4_sessions_eval_speculative_batch(ds4_decode_item *items, int count,
     int first[DS4_EXEC_CONTEXTS_MAX];
     if (count > DS4_EXEC_CONTEXTS_MAX) { if (errlen) snprintf(err, errlen, "too many sessions"); return -1; }
     for (int i = 0; i < count; i++) { ss[i] = items[i].session; first[i] = items[i].token; }
-    const uint32_t K = ss[0]->engine->mtp_draft_tokens > 0
+    uint32_t K = ss[0]->engine->mtp_draft_tokens > 0
         ? (uint32_t)ss[0]->engine->mtp_draft_tokens : 0u;
+    /* DS4_QWEN4EXP_BATCH_SPEC_K caps the draft depth of a batched tick (two or
+     * more members) below --mtp-draft.  The verify's routed-expert traffic
+     * grows with every row of every member while the last draft position is
+     * accepted least, so the depth that wins alone is not the one that wins
+     * in a batch.  Default 3 (vLLM's choice at every concurrency): measured
+     * 2026-09-07 at three streams, K=3 ticks are 108 ms against 122 ms at
+     * K=4 for the same aggregate (~79 vs ~78 tok/s), i.e. the same
+     * throughput at lower per-token latency; 0 leaves --mtp-draft in charge. */
+    if (count >= 2) {
+        static int cap = -1;
+        if (cap < 0) {
+            const char *env = getenv("DS4_QWEN4EXP_BATCH_SPEC_K");
+            cap = (env && env[0]) ? atoi(env) : 3;
+            if (cap < 0) cap = 0;
+        }
+        if (cap > 0 && K > (uint32_t)cap) K = (uint32_t)cap;
+    }
     return q4e_spec_step_batch(ss, first, (uint32_t)count, K, eos_token,
                                accepted, committed, err, errlen);
 }

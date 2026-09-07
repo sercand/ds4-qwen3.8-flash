@@ -1495,6 +1495,30 @@ __global__ static void q4e_f32_to_f16_kernel(__half *out, const float *in, uint6
     if (i < n) out[i] = __float2half_rn(in[i]);
 }
 
+/* 1..16 rows through the fp32-activation warp kernel. */
+static int q4e_matmul_f16_rows_any(float *o, const __half *w, const float *xf,
+                                   uint32_t in_dim, uint32_t out_dim, uint32_t n_tok) {
+    switch (n_tok) {
+    case 1u: return q4e_matmul_f16_rows_launch<1>(o, w, xf, in_dim, out_dim);
+    case 2u: return q4e_matmul_f16_rows_launch<2>(o, w, xf, in_dim, out_dim);
+    case 3u: return q4e_matmul_f16_rows_launch<3>(o, w, xf, in_dim, out_dim);
+    case 4u: return q4e_matmul_f16_rows_launch<4>(o, w, xf, in_dim, out_dim);
+    case 5u: return q4e_matmul_f16_rows_launch<5>(o, w, xf, in_dim, out_dim);
+    case 6u: return q4e_matmul_f16_rows_launch<6>(o, w, xf, in_dim, out_dim);
+    case 7u: return q4e_matmul_f16_rows_launch<7>(o, w, xf, in_dim, out_dim);
+    case 8u: return q4e_matmul_f16_rows_launch<8>(o, w, xf, in_dim, out_dim);
+    case 9u: return q4e_matmul_f16_rows_launch<9>(o, w, xf, in_dim, out_dim);
+    case 10u: return q4e_matmul_f16_rows_launch<10>(o, w, xf, in_dim, out_dim);
+    case 11u: return q4e_matmul_f16_rows_launch<11>(o, w, xf, in_dim, out_dim);
+    case 12u: return q4e_matmul_f16_rows_launch<12>(o, w, xf, in_dim, out_dim);
+    case 13u: return q4e_matmul_f16_rows_launch<13>(o, w, xf, in_dim, out_dim);
+    case 14u: return q4e_matmul_f16_rows_launch<14>(o, w, xf, in_dim, out_dim);
+    case 15u: return q4e_matmul_f16_rows_launch<15>(o, w, xf, in_dim, out_dim);
+    case 16u: return q4e_matmul_f16_rows_launch<16>(o, w, xf, in_dim, out_dim);
+    default: return 0;
+    }
+}
+
 extern "C" int ds4_gpu_q4e_matmul_f16(
         ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
         uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
@@ -1517,24 +1541,23 @@ extern "C" int ds4_gpu_q4e_matmul_f16(
     if (!w) return 0;
     float *o = (float *)out->ptr;
     const float *xf = (const float *)x->ptr;
-    switch (n_tok) {
-    case 1u: return q4e_matmul_f16_rows_launch<1>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 2u: return q4e_matmul_f16_rows_launch<2>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 3u: return q4e_matmul_f16_rows_launch<3>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 4u: return q4e_matmul_f16_rows_launch<4>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 5u: return q4e_matmul_f16_rows_launch<5>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 6u: return q4e_matmul_f16_rows_launch<6>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 7u: return q4e_matmul_f16_rows_launch<7>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 8u: return q4e_matmul_f16_rows_launch<8>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 9u: return q4e_matmul_f16_rows_launch<9>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 10u: return q4e_matmul_f16_rows_launch<10>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 11u: return q4e_matmul_f16_rows_launch<11>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 12u: return q4e_matmul_f16_rows_launch<12>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 13u: return q4e_matmul_f16_rows_launch<13>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 14u: return q4e_matmul_f16_rows_launch<14>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 15u: return q4e_matmul_f16_rows_launch<15>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    case 16u: return q4e_matmul_f16_rows_launch<16>(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim);
-    default: break;
+    if (n_tok <= 16u) return q4e_matmul_f16_rows_any(o, w, xf, (uint32_t)in_dim, (uint32_t)out_dim, n_tok);
+    /* A narrow output stays on the fp32-activation kernel in 16-row passes at
+     * any row count.  The cuBLAS path below rounds the activations to fp16
+     * first, and the MoE router (512 columns) is the one place that rounding
+     * is not harmless: a top-10 expert choice a hair from its runner-up flips
+     * on it, and a flipped expert moves that token's residual by percent, not
+     * ulps.  Measured 2026-09-07: the 16-row prefill's residual left the
+     * sequential decode's by 1e-5 at layer 0 and 3e-2 after one such flip.
+     * The router's 2.6 MB of weights sits in L2 across the passes, so a
+     * 512-row chunk pays ~32 short launches per layer for it. */
+    if (out_dim <= 1024u) {
+        for (uint32_t r0 = 0; r0 < n_tok; r0 += 16u) {
+            const uint32_t nt = n_tok - r0 < 16u ? n_tok - r0 : 16u;
+            if (!q4e_matmul_f16_rows_any(o + (uint64_t)r0 * out_dim, w, xf + (uint64_t)r0 * in_dim,
+                                         (uint32_t)in_dim, (uint32_t)out_dim, nt)) return 0;
+        }
+        return 1;
     }
     if (!g_cublas_ready) return 0;
     const uint64_t n_in = (uint64_t)n_tok * in_dim;
@@ -4462,7 +4485,15 @@ extern "C" int ds4_gpu_q4e_qsa_gate(ds4_gpu_tensor *x, const ds4_gpu_tensor *gat
  * The batched entries win by a wide margin on real prefill chunks, but they
  * quantize activations differently, so a handful of tokens is not worth the
  * change in rounding -- and it keeps short prompts on exactly the kernels the
- * llama.cpp trace comparison validates. */
+ * llama.cpp trace comparison validates.
+ *
+ * The default is where the grouped path starts to win on the EXL3 experts
+ * (GB10, 2026-09-07): at 2 unrelated decode rows it loses 2%, at 3 it is a
+ * wash, at 4 it gains 2.5%; on a speculative verify's 5 consecutive rows it
+ * gains 11% and on a 3-context batched verify's 15 rows 19%, because rows of
+ * one sequence route to the same experts and the grouped kernel reads each
+ * expert once.  Single-row passes -- plain decode and the MTP draft chain --
+ * stay on the per-token path either way. */
 #define Q4E_MOE_BATCH_MIN_TOK q4e_moe_batch_min_tok()
 /* Mirrors the public `ds4_q4e_moe_map` in ds4_gpu.h.  This translation unit
  * does not include that header (project convention, see the note near the top
@@ -4501,14 +4532,20 @@ static void q4e_moe_map_import(ds4_mmq_moe_map *m, const ds4_q4e_moe_map *h) {
     m->n_expert = (int)h->n_expert;
 }
 
+static int g_q4e_moe_batch_min = -1;
 static uint32_t q4e_moe_batch_min_tok(void) {
-    static int cached = -1;
-    if (cached < 0) {
+    if (g_q4e_moe_batch_min < 0) {
         const char *env = getenv("DS4_QWEN4EXP_MOE_BATCH_MIN");
-        cached = (env && env[0]) ? atoi(env) : 32;
-        if (cached < 2) cached = 2;
+        int v = (env && env[0]) ? atoi(env) : 4;
+        if (v < 2) v = 2;
+        g_q4e_moe_batch_min = v;
     }
-    return (uint32_t)cached;
+    return (uint32_t)g_q4e_moe_batch_min;
+}
+/* Test hook: move the threshold at run time so one process can push the same
+ * rows through both routed paths and compare them.  0 restores the default. */
+extern "C" void ds4_gpu_q4e_set_moe_batch_min(uint32_t n) {
+    g_q4e_moe_batch_min = n ? (n < 2u ? 2 : (int)n) : -1;
 }
 
 /* One dequantized weight, for the register-resident batched kernel below.
