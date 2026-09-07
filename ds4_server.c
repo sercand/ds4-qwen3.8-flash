@@ -631,12 +631,27 @@ fail:
     return false;
 }
 
+/* An explicit JSON null is how a serializer says "this optional field is not
+ * set": the Responses API marks nearly every request and item field nullable,
+ * and real clients emit `"namespace": null` rather than dropping the key. Read
+ * it as absent -- leave *dst as it was so the caller's default survives -- and
+ * report success. A wrong *type* in the same slot still fails the parse. */
+static bool json_null_value(const char **p) {
+    json_ws(p);
+    return json_lit(p, "null");
+}
+
 static bool json_string_replace(const char **p, char **dst) {
     char *tmp = NULL;
     if (!json_string(p, &tmp)) return false;
     free(*dst);
     *dst = tmp;
     return true;
+}
+
+static bool json_string_replace_or_null(const char **p, char **dst) {
+    if (json_null_value(p)) return true;
+    return json_string_replace(p, dst);
 }
 
 static bool json_raw_value_replace(const char **p, char **dst) {
@@ -4500,12 +4515,12 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
             }
             (*p)++;
             if (!strcmp(key, "type")) {
-                if (!json_string_replace(p, &type)) {
+                if (!json_string_replace_or_null(p, &type)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "role")) {
-                if (!json_string_replace(p, &role)) {
+                if (!json_string_replace_or_null(p, &role)) {
                     free(key);
                     goto item_fail;
                 }
@@ -4516,28 +4531,31 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "name")) {
-                if (!json_string_replace(p, &name)) {
+                if (!json_string_replace_or_null(p, &name)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "namespace")) {
-                if (!json_string_replace(p, &namespace)) {
+                if (!json_string_replace_or_null(p, &namespace)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "call_id")) {
-                if (!json_string_replace(p, &call_id)) {
+                if (!json_string_replace_or_null(p, &call_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "id")) {
-                if (!json_string_replace(p, &item_id)) {
+                if (!json_string_replace_or_null(p, &item_id)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "arguments")) {
-                json_ws(p);
-                if (**p == '"') {
+                if (json_null_value(p)) {
+                    /* null is "not set": leave the field absent so the item
+                     * default applies, rather than handing the model the raw
+                     * four letters "null" as the value. */
+                } else if (**p == '"') {
                     if (!json_string_replace(p, &arguments)) {
                         free(key);
                         goto item_fail;
@@ -4547,8 +4565,11 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "output")) {
-                json_ws(p);
-                if (**p == '[') {
+                if (json_null_value(p)) {
+                    /* null is "not set": leave the field absent so the item
+                     * default applies, rather than handing the model the raw
+                     * four letters "null" as the value. */
+                } else if (**p == '[') {
                     if (!parse_responses_content_array_replace(p, &output)) {
                         free(key);
                         goto item_fail;
@@ -4563,8 +4584,11 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "input")) {
-                json_ws(p);
-                if (**p == '"') {
+                if (json_null_value(p)) {
+                    /* null is "not set": leave the field absent so the item
+                     * default applies, rather than handing the model the raw
+                     * four letters "null" as the value. */
+                } else if (**p == '"') {
                     if (!json_string_replace(p, &input_str)) {
                         free(key);
                         goto item_fail;
@@ -4579,13 +4603,18 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "action")) {
-                if (!json_raw_value_replace(p, &action)) {
+                if (json_null_value(p)) {
+                    /* null is "not set". */
+                } else if (!json_raw_value_replace(p, &action)) {
                     free(key);
                     goto item_fail;
                 }
             } else if (!strcmp(key, "result")) {
-                json_ws(p);
-                if (**p == '"') {
+                if (json_null_value(p)) {
+                    /* null is "not set": leave the field absent so the item
+                     * default applies, rather than handing the model the raw
+                     * four letters "null" as the value. */
+                } else if (**p == '"') {
                     if (!json_string_replace(p, &result)) {
                         free(key);
                         goto item_fail;
@@ -4595,7 +4624,7 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                     goto item_fail;
                 }
             } else if (!strcmp(key, "status")) {
-                if (!json_string_replace(p, &status_str)) {
+                if (!json_string_replace_or_null(p, &status_str)) {
                     free(key);
                     goto item_fail;
                 }
@@ -4604,7 +4633,9 @@ static bool parse_responses_input(const char **p, chat_msgs *msgs,
                  * here instead of in `output` / `result`. Keep it separate
                  * from the human-visible result body so malformed tool lists
                  * never get mistaken for normal tool output. */
-                if (!json_raw_value_replace(p, &tools_json)) {
+                if (json_null_value(p)) {
+                    /* null is "not set". */
+                } else if (!json_raw_value_replace(p, &tools_json)) {
                     free(key);
                     goto item_fail;
                 }
@@ -5132,28 +5163,40 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
             }
             r->model_from_request = true;
         } else if (!strcmp(key, "max_output_tokens") || !strcmp(key, "max_tokens")) {
-            if (!json_int(&p, &r->max_tokens)) {
+            if (json_null_value(&p)) {
+                /* Nullable in the Responses schema, and clients serialize an
+                 * unset cap as null rather than dropping the key: null keeps
+                 * the server default instead of failing the request. */
+            } else if (!json_int(&p, &r->max_tokens)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "temperature")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
+            /* null leaves temperature unset, so the server default applies. */
+            if (!json_null_value(&p)) {
+                double v = 0.0;
+                if (!json_number(&p, &v)) {
+                    free(key);
+                    goto bad;
+                }
+                r->temperature = (float)v;
+                r->temperature_set = true;
             }
-            r->temperature = (float)v;
-            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
-            double v = 0.0;
-            if (!json_number(&p, &v)) {
-                free(key);
-                goto bad;
+            /* null leaves top_p unset, so the server default applies. */
+            if (!json_null_value(&p)) {
+                double v = 0.0;
+                if (!json_number(&p, &v)) {
+                    free(key);
+                    goto bad;
+                }
+                r->top_p = (float)v;
+                r->top_p_set = true;
             }
-            r->top_p = (float)v;
-            r->top_p_set = true;
         } else if (!strcmp(key, "stream")) {
-            if (!json_bool(&p, &r->stream)) {
+            if (json_null_value(&p)) {
+                /* null keeps the non-streaming default. */
+            } else if (!json_bool(&p, &r->stream)) {
                 free(key);
                 goto bad;
             }
@@ -16867,12 +16910,15 @@ int main(int argc, char **argv) {
                    s.mixed_prefill_quantum,
                    ds4_engine_has_mtp(engine) ? " (MTP stays on)" : "");
         if (s.batched_decode) {
+            const int min_gen = server_batch_decode_min(s.batch_spec);
             server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: batched decode on: from %d generations up, one "
-                       "pass over the weights serves every generating context; "
+                       "ds4-server: batched %sdecode on: from %d generations up, one "
+                       "pass over the weights serves every generating context%s; "
                        "below that each keeps its speculative step%s",
-                       DS4_BATCH_DECODE_MIN_GENERATIONS,
-                       s.slot_count < DS4_BATCH_DECODE_MIN_GENERATIONS ?
+                       s.batch_spec ? "speculative " : "", min_gen,
+                       s.batch_spec ? " and keeps its drafts (one segmented verify)"
+                                    : " and drops the drafts",
+                       s.slot_count < min_gen ?
                            " -- which this many execution contexts can never reach,"
                            " so raise --exec-contexts to use it" : "");
         } else {
@@ -17484,6 +17530,102 @@ static void test_responses_input_function_call_namespace_round_trips_to_dsml(voi
     chat_msgs_free(&msgs);
     free(schemas);
     tool_schema_orders_free(&orders);
+}
+
+/* A JSON null is the wire form of "this optional field is not set": the
+ * Responses serializers emit `"namespace": null` / `"caller": null` on every
+ * plain function_call, `"output": null` on an empty tool result, and
+ * `"status": null` / `"id": null` on replayed items.  A real agent log 400'd
+ * with "invalid JSON request" because the item's string fields demanded a JSON
+ * string, so one null in item 74 of 119 threw away the whole 27k-token replay.
+ * null has to read as absent -- the field's default -- not as a parse error. */
+static void test_responses_input_accepts_null_optional_fields(void) {
+    const char *json =
+        "[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\","
+        "\"text\":\"think\"}],\"encrypted_content\":null},"
+        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\","
+        "\"arguments\":\"{\\\"path\\\":\\\"a.c\\\"}\",\"caller\":null,"
+        "\"namespace\":null},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_1\","
+        "\"output\":null},"
+        "{\"type\":\"message\",\"role\":\"assistant\",\"phase\":null,"
+        "\"summary\":[],\"id\":null,\"status\":null,"
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}]";
+    const char *p = json;
+    chat_msgs msgs = {0};
+    buf loaded = {0};
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, &loaded, &orders));
+    TEST_ASSERT(msgs.len == 3);
+    if (msgs.len == 3) {
+        /* namespace: null must not qualify the name, and must not be spliced
+         * in as a literal "null" prefix either. */
+        TEST_ASSERT(msgs.v[0].calls.len == 1);
+        TEST_ASSERT(msgs.v[0].calls.len == 1 &&
+                    !strcmp(msgs.v[0].calls.v[0].name, "read"));
+        TEST_ASSERT(msgs.v[0].calls.len == 1 &&
+                    !strcmp(msgs.v[0].calls.v[0].arguments,
+                            "{\"path\":\"a.c\"}"));
+        TEST_ASSERT(msgs.v[0].reasoning && !strcmp(msgs.v[0].reasoning, "think"));
+        /* output: null is an empty tool result, not the four letters "null". */
+        TEST_ASSERT(!strcmp(msgs.v[1].role, "tool"));
+        TEST_ASSERT(!strcmp(msgs.v[1].content, ""));
+        TEST_ASSERT(!strcmp(msgs.v[2].role, "assistant"));
+        TEST_ASSERT(!strcmp(msgs.v[2].content, "done"));
+    }
+    buf_free(&loaded);
+    tool_schema_orders_free(&orders);
+    chat_msgs_free(&msgs);
+
+    /* A null `type` / `role` falls back to the same defaults an absent one
+     * does: a plain message from the user. */
+    const char *defaults =
+        "[{\"type\":null,\"role\":null,\"content\":\"hi\"}]";
+    p = defaults;
+    msgs = (chat_msgs){0};
+    TEST_ASSERT(parse_responses_input(&p, &msgs, NULL, NULL));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.len == 1 && !strcmp(msgs.v[0].role, "user"));
+    TEST_ASSERT(msgs.len == 1 && !strcmp(msgs.v[0].content, "hi"));
+    chat_msgs_free(&msgs);
+
+    /* Tolerating null must not tolerate a wrong *type*: a number where a
+     * string belongs is still a bad request. */
+    const char *bad_type = "[{\"type\":\"function_call\",\"name\":7}]";
+    p = bad_type;
+    msgs = (chat_msgs){0};
+    TEST_ASSERT(!parse_responses_input(&p, &msgs, NULL, NULL));
+    chat_msgs_free(&msgs);
+}
+
+/* Same rule for the request's own optional scalars: the Responses schema marks
+ * max_output_tokens / temperature / top_p / stream nullable, and clients that
+ * serialize unset fields as null were getting a 400 for them.  A NULL engine
+ * can't run the success path (it tokenizes), so these bodies park on the
+ * previous_response_id rejection instead: reaching *that* error proves the
+ * nulls before it parsed. */
+static void test_responses_request_accepts_null_optional_scalars(void) {
+    char err[128];
+    request r;
+    err[0] = 0;
+    bool ok = parse_responses_request(NULL, NULL,
+        "{\"input\":\"hi\",\"max_output_tokens\":null,\"temperature\":null,"
+        "\"top_p\":null,\"stream\":null,"
+        "\"previous_response_id\":\"resp_1\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+    TEST_ASSERT(strstr(err, "previous_response_id") != NULL);
+
+    /* A non-null wrong type in the same slot still fails the parse. */
+    err[0] = 0;
+    ok = parse_responses_request(NULL, NULL,
+        "{\"input\":\"hi\",\"max_output_tokens\":\"lots\","
+        "\"previous_response_id\":\"resp_1\"}",
+        128, 32768, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    if (ok) request_free(&r);
+    TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
 
 static void test_responses_output_sends_tool_search_call_item(void) {
@@ -23249,6 +23391,8 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_input_tool_search_output_loads_tools();
     test_responses_input_tool_search_output_rejects_bad_tools();
     test_responses_input_function_call_namespace_round_trips_to_dsml();
+    test_responses_input_accepts_null_optional_fields();
+    test_responses_request_accepts_null_optional_scalars();
     test_responses_output_sends_tool_search_call_item();
     test_dsml_tool_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
