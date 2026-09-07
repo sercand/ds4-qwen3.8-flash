@@ -197,3 +197,31 @@ Integration (GPU + qwen4exp model, `DS4_LOCK_FILE` set; shape of
   OpenAI recommends for flex. No pause deadline or 429: flex waits until it runs or the
   client disconnects.
 - `--batched-session` and single-slot modes: flex is queue ordering only, no parking.
+
+## Implementation status (2026-09-07)
+
+Landed on `qwen3.8-flash-next`:
+- request parsing, body + header (83d83b7, e548562);
+- response echo on every OpenAI chat/completions/responses object, streaming
+  chunks included (inside 4f4d9e2, then b88c23c);
+- per-slot facts `tier`/`promoted`/`generating`/`parked` and the predicates
+  `server_normal_active_locked`, `server_slot_runnable_locked`,
+  `server_eligible_generations_locked` replacing the four `active_generations`
+  readers (2d23997);
+- admission gating with `--flex-contexts`, promotion on affinity binding,
+  queued-cancel re-dispatch, `dequeue` preferring normal, the shared
+  `server_stream_keepalive` (headers first; fires on the qwen4exp `"prefill"`
+  event), and `server_flex_pause_point` at the decode-loop top and between
+  prefill chunks (89d9cc9).
+
+Unit tests: `make ds4_server_test && ./ds4_server_test`. Integration:
+`tests/test_flex_tier.py` against `ds4-server --exec-contexts 2` (needs the GPU
+and the model; not yet run at the time of writing -- record the numbers here).
+
+Follow-ups not done: gating flex admission on KV pool headroom; evicting a
+parked flex under slot pressure; a pause deadline / 429.
+
+Fold-in for the vLLM-parity tick loop (Stage 3/4): the live set for a tick is
+`{slot : generating && server_slot_runnable_locked(s, slot)}` and the prefill
+share uses the same predicate; `server_flex_pause_point` then disappears and
+`parked` becomes what the tick computes rather than what the worker publishes.
