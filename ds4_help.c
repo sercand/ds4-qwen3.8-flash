@@ -181,6 +181,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "--kv-pool-tokens N", "Qwen3.8-Flash-Next: token positions in the shared paged KV pool, never below --ctx. Skips the pool's derivation only. Default: derived from free memory, at most 4x--ctx and 600000 (18 GB)");
         opt(fp, c, "--ssm-checkpoints N", "Qwen3.8-Flash-Next: recurrent-state checkpoints the prefix cache may hold, 113 MB each; 0 holds none. Default: derived from what the pool leaves, at most 40");
         opt(fp, c, "--exec-contexts N", "Qwen3.8-Flash-Next: concurrent execution contexts sharing the KV pool and the prefill scratch, each a live recurrent state; the server time-slices them (one speculative step each, then one prefill chunk, narrowed to --mixed-prefill-quantum while contended). Default: 2");
+        opt(fp, c, "--flex-contexts N", "Execution contexts that service_tier=flex (or X-Service-Tier: flex) requests may hold at once. Flex work runs only while no normal request is queued or running and parks mid-stream when one arrives. Capped at --exec-contexts minus one so a normal request always finds a free context. Default: --exec-contexts minus one");
     }
     if (full) {
         if (tool == DS4_HELP_EVAL || tool == DS4_HELP_BENCH) {

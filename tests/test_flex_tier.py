@@ -7,6 +7,12 @@ Scenario A: a streaming flex request is generating; a normal request arrives.
   text must equal a solo flex run.
 Scenario B: two flex requests -> the second is not admitted (flex_cap 1);
   a normal then starts within a bounded TTFT, and the queued flex runs later.
+Scenario C: a normal arrives while a flex is still PREFILLING a long prompt.
+  The flex parks between chunks (keepalives, no tokens), the normal's TTFT
+  stays bounded, and the flex completes afterwards.
+Not covered here: promotion of a flex slot by a bound follow-up turn (spec
+  test 4) and the no-flex throughput baseline (spec test 5: run
+  tests/bench_concurrency.py before and after).
 
 Usage: python3 tests/test_flex_tier.py --base http://127.0.0.1:8080 [--model NAME]
 Run the server with DS4_SERVER_BATCH_LOG=1 to see the parked/resumed lines.
@@ -28,7 +34,9 @@ def sse_stream(base, payload, headers, events):
         base + "/v1/chat/completions",
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", **headers})
-    with urllib.request.urlopen(req, timeout=900) as resp:
+    # Shorter than any park we expect: a flex that goes silent (no keepalive)
+    # must fail this test, not sit here for minutes.
+    with urllib.request.urlopen(req, timeout=60) as resp:
         for raw in resp:
             line = raw.decode(errors="replace").rstrip("\n")
             now = time.time()
@@ -75,15 +83,45 @@ def scenario_a(base, model):
     t.join()
 
     normal_first = min(ts for ts, _, _ in tokens(normal_events))
-    # Allow one flex step already granted when the normal arrived.
+    normal_last = max(ts for ts, _, _ in tokens(normal_events))
+    # Allow one flex step already granted when the normal arrived, and the
+    # resume that follows the normal's last token (its slot is released
+    # before the client reads the stream end).
     leaked = [ts for ts, _, _ in tokens(flex_events)
-              if normal_first + 0.25 < ts < t_normal1 - 0.05]
+              if normal_first + 0.25 < ts < normal_last - 0.3]
+    keepalives = [ts for ts, k, d in flex_events
+                  if k == "comment" and "keepalive" in d and normal_first < ts < normal_last]
     flex_text = "".join(d for _, _, d in tokens(flex_events))
     print(f"A: normal TTFT {normal_first - t_normal0:.2f}s, normal wall "
           f"{t_normal1 - t_normal0:.2f}s, flex tokens leaked during normal: "
-          f"{len(leaked)}, flex tokens total {len(tokens(flex_events))}")
+          f"{len(leaked)}, keepalives while parked: {len(keepalives)}, "
+          f"flex tokens total {len(tokens(flex_events))}")
     assert not leaked, f"flex emitted {len(leaked)} tokens while a normal request ran"
+    if normal_last - normal_first > 6.0:
+        assert keepalives, "flex sent no keepalive while parked"
     assert flex_text == solo_text, "flex text diverged from the solo run"
+    return True
+
+
+def scenario_c(base, model):
+    """Normal arrives during a flex prefill: the flex parks between chunks."""
+    filler = " ".join(f"item {i} of the long background document" for i in range(1400))
+    long_prompt = f"Summarise this document in three sentences.\n\n{filler}"
+    flex_events, normal_events = [], []
+    t = threading.Thread(target=sse_stream,
+                         args=(base, payload(model, long_prompt, 64, flex_body=True), {}, flex_events))
+    t.start()
+    time.sleep(1.0)                     # the flex is prefilling, no token yet
+    assert not tokens(flex_events), "long flex prompt produced a token within 1 s; lengthen it"
+    t0 = time.time()
+    sse_stream(base, payload(model, NORMAL_PROMPT, 32), {}, normal_events)
+    ttft = min(ts for ts, _, _ in tokens(normal_events)) - t0
+    t.join()
+    keepalives = [d for _, k, d in flex_events if k == "comment"]
+    print(f"C: normal TTFT during flex prefill {ttft:.2f}s, flex keepalive comments "
+          f"{len(keepalives)}, flex tokens {len(tokens(flex_events))}")
+    assert ttft < 20.0, "normal waited too long behind a flex prefill"
+    assert tokens(flex_events), "flex never completed after the normal"
     return True
 
 
@@ -116,7 +154,8 @@ def main():
     ap.add_argument("--base", default="http://127.0.0.1:8080")
     ap.add_argument("--model", default="qwen4exp")
     a = ap.parse_args()
-    ok = scenario_a(a.base, a.model) and scenario_b(a.base, a.model)
+    ok = (scenario_a(a.base, a.model) and scenario_b(a.base, a.model)
+          and scenario_c(a.base, a.model))
     print("PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 
