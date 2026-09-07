@@ -82,15 +82,29 @@ change makes the batched paths' mRoPE image-aware (`q4e_mrope_batch_row`):
 `q4e_forward_batch`/`q4e_forward_segmented` used scalar positions, which are
 wrong after an image (the temporal index runs behind the KV slot).
 
-**Lever B (register-resident, single-launch segmented GDN) is designed, not
-written:** grid (48 heads, n_seg), thread (column j, quarter) keeps its 32
-state values in registers in today's rotated order (bit-exact), shared memory
-~1 KB so two blocks fit per SM; each block walks its segment with that
-segment's state/checkpoint pointers from `batch_ptrs`.  Gate: memcmp of state
-and output against `q4e_gdn_recurrent_kernel` on the same inputs across all
-(n mod tile) classes, then `q4espec_bench`.  Expected ~-5 ms at B=3, ~-7 at
-B=4.  Build with `--resource-usage` and keep registers <= 64/thread or the
-second block does not fit.
+**Lever B (register-resident, single-launch segmented GDN) was built, gated
+and dropped (2026-09-07 evening).** The kernel was bit-identical to
+`q4e_gdn_recurrent_kernel` in 20 segment layouts (states, checkpoints and
+outputs memcmp-equal; the one trap was `rsqrtf(128.f)` constant-folding to the
+correctly rounded value while the reference's run-time `rsqrtf(head_dim)` is a
+MUFU.RSQ, one ulp apart).  It was not faster: one 5-row segment 30.7 us
+against 26.9 for the shared-memory kernel (with the two-blocks-per-SM hint it
+spills in the token loop and is slower still); the single launch only wins by
+overlapping tails (4x4 rows 129 vs 154 us, 8x1 199 vs 243).  The reason is
+that the recurrence is bound by moving the 3 MB state in and out -- ~19 us
+per one-token launch, ~2 us per further token -- so the whole recurrent phase
+is ~3 ms of the 101 ms tick at B=3 and the kernel could save under 1 ms; the
+rest of the profiler's "gated deltanet" phase is the GDN projections' weight
+traffic, at its own bandwidth floor.  Not worth a second kernel.
+
+**Where the B=3 tick (101 ms) sits now:** routed MoE for 12 verify rows ~50 ms
+(bandwidth floor for ~100 distinct experts), dense/attention weights ~9-10 ms
+(floor), drafts ~6, attention ~8, GDN recurrence ~3; the remaining ~15 ms is
+launch and host latency of the eager (graph-less) segmented verify -- CUDA
+graphs are off there because a captured launch bakes in one page table.  A
+graph keyed on the segment layout with page tables passed indirectly (the
+batched kernels already read them from `batch_ptrs`, which a graph can leave
+as a device array to rewrite) is the one lever left with several ms in it.
 
 **Numerics -- what the gates actually measure.** Multi-row passes are not
 batch-invariant: exl3's routed GEMM accumulates in an order that depends on
