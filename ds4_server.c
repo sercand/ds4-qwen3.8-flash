@@ -6840,10 +6840,12 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
     if (r->kind == REQ_CHAT) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     } else {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"text_completion\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     append_openai_usage_json(&b, r, prompt_tokens, completion_tokens);
@@ -6870,6 +6872,7 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     if (reasoning && reasoning[0]) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":");
         json_escape(&b, reasoning);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
@@ -6877,6 +6880,7 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     if (content && content[0]) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"content\":");
         json_escape(&b, content);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
@@ -6884,12 +6888,14 @@ static bool sse_chat_finish(int fd, const request *r, const char *id, const char
     if (calls && calls->len) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
     buf_puts(&b, "}]}\n\n");
@@ -7040,6 +7046,7 @@ static bool sse_chat_delta_n(int fd, const request *r, const char *id,
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{");
     json_escape(&b, field);
     buf_putc(&b, ':');
@@ -7062,6 +7069,7 @@ static bool sse_chat_tool_call_start_delta(int fd, const request *r, const char 
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
     buf_printf(&b, "%d", index);
     buf_puts(&b, ",\"id\":");
@@ -7081,6 +7089,7 @@ static bool sse_chat_tool_call_args_delta_n(int fd, const request *r, const char
     long now = (long)time(NULL);
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":");
     buf_printf(&b, "%d", index);
     buf_puts(&b, ",\"function\":{\"arguments\":");
@@ -7962,12 +7971,14 @@ static bool openai_sse_finish_live(int fd, server *s, const request *r, const ch
     if (calls && calls->len && !st->tool.emitted_any) {
         buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
         json_escape(&b, r->model);
+        append_service_tier_json(&b, r);
         buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":");
         append_tool_call_deltas_json(&b, calls, id, &r->tool_orders);
         buf_puts(&b, "},\"finish_reason\":null}]}\n\n");
     }
     buf_printf(&b, "data: {\"id\":\"%s\",\"object\":\"chat.completion.chunk\",\"created\":%ld,\"model\":", id, now);
     json_escape(&b, r->model);
+    append_service_tier_json(&b, r);
     buf_puts(&b, ",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":");
     json_escape(&b, finish);
     buf_puts(&b, "}]}\n\n");
@@ -22514,6 +22525,15 @@ static void test_flex_response_echo(void) {
     r.flex = true;
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     TEST_ASSERT(sse_chunk(sv[0], &r, "cmpl-flex", "tok", NULL));
+    shutdown(sv[0], SHUT_WR);
+    out = read_socket_text(sv[1]);
+    TEST_ASSERT(strstr(out, "\"service_tier\":\"flex\"") != NULL);
+    free(out); close(sv[0]); close(sv[1]);
+
+    r.flex = true;
+    r.stream_include_usage = true;
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    TEST_ASSERT(sse_usage_chunk(sv[0], &r, "cmpl-flex", 3, 1));
     shutdown(sv[0], SHUT_WR);
     out = read_socket_text(sv[1]);
     TEST_ASSERT(strstr(out, "\"service_tier\":\"flex\"") != NULL);
